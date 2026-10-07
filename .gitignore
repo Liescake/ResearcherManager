@@ -1,0 +1,7 @@
+# 仅提交计划表；现有需求及其他文件默认不纳入首次提交
+需求.txt
+要求.txt
+_acl-recovery/
+*
+!AI开发计划表.md
+!.gitignore
