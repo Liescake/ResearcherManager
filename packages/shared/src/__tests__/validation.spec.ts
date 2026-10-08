@@ -225,7 +225,9 @@ describe('匹配请求与推荐契约', () => {
     expect(matchingRecommendationItemSchema.safeParse({ ...valid, score: 82.5 }).success).toBe(
       false,
     );
-    expect(matchingRecommendationItemSchema.safeParse({ ...valid, reason: '' }).success).toBe(false);
+    expect(matchingRecommendationItemSchema.safeParse({ ...valid, reason: '' }).success).toBe(
+      false,
+    );
   });
 
   it('推荐文本不得携带身份证号/长数字标识/密钥等敏感内容', () => {
@@ -263,7 +265,8 @@ describe('匹配请求与推荐契约', () => {
   });
 });
 
-describe('响应信封', () => {  it('成功与失败信封结构稳定', () => {
+describe('响应信封', () => {
+  it('成功与失败信封结构稳定', () => {
     const success = ok({ id: 'x' }, { requestId: 'req-1' });
     expect(success.error).toBeNull();
     expect(success.data).toEqual({ id: 'x' });

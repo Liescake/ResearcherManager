@@ -120,8 +120,9 @@ describe('匹配请求状态机', () => {
     }
     // 只有 pending 可处理，也只有它能转入终态
     expect(isMatchingRequestProcessable(MatchingRequestStatus.Pending)).toBe(true);
-    expect(canTransitionMatchingRequest(MatchingRequestStatus.Pending, MatchingRequestStatus.Pending))
-      .toBe(false);
+    expect(
+      canTransitionMatchingRequest(MatchingRequestStatus.Pending, MatchingRequestStatus.Pending),
+    ).toBe(false);
   });
 
   it('非法转移抛出 STATE_TRANSITION_INVALID', () => {
