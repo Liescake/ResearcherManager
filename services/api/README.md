@@ -7,6 +7,8 @@ NestJS API 服务：**唯一业务规则入口**，前端不直接访问数据�
 - 统一前缀 `API_PREFIX`（默认 `/api/v1`）。
 - `GET /api/v1/health`：存活、版本、运行时长。
 - `GET /api/v1/health/ready`：依赖配置就绪情况（不返回任何密钥）。
+- `GET /api/v1/runtime-info`：运行期配置摘要，**只回** `nodeEnv`/`apiPort`/`apiPrefix`/`databaseConfigured`/`aiProvider`/`aiMatchingEnabled`
+  六个非敏感白名单字段；不返回连接串、会话密钥、AI key/base URL 或原始 `process.env`，出现白名单之外的字段即 500（`runtime-info.controller.spec.ts` 守住闭集）。
 - 统一响应信封 `{ data, meta, error }` + 稳定错误码 + 请求 ID。
 - 13 个领域模块的**空模块占位**（auth、access-control、profiles、groups、memberships、achievements、
   education、matching、statistics、exports、compliance、audit、notifications）：只声明边界，无业务实现。
@@ -24,7 +26,7 @@ NestJS API 服务：**唯一业务规则入口**，前端不直接访问数据�
 
 ```bash
 pnpm --filter @rm/api typecheck   # 直接对源码做类型检查（经 tsconfig paths 引用工作区包源码）
-pnpm --filter @rm/api test        # vitest：env 校验、信封、异常映射、健康检查、RuoYi 契约符合性
+pnpm --filter @rm/api test        # vitest：env 校验、信封、异常映射、健康检查、运维信息白名单、RuoYi 契约符合性
 pnpm --filter @rm/api build       # tsc 产出 dist（CommonJS + decorator metadata）
 pnpm --filter @rm/api start       # node dist/main.js
 ```
