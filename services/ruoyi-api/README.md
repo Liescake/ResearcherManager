@@ -91,7 +91,7 @@ node services/ruoyi-api/toolchain/check-provenance.mjs --self-test
 创建 `pom.xml` 和 Java 源码前，必须按 `toolchain/gate-manifest.json` 的 `candidate.admissionSteps` 逐项完成（步骤与前置的机器约束、每步的验收证据见 `toolchain/README.md` §3.3–§3.4）：
 
 1. **复现工具链**：用显式 `--java-home` / `--maven-home` 复现 JDK 17+ 与 Maven 3.9+ 探测（已完成，见「当前环境门禁」）。
-2. **固定候选**：固定实际 Spring Boot 3 候选 commit（40 位 SHA）并同时固定 tag，核对其 POM 与 JDK 要求。
+2. **固定候选**：固定实际 Spring Boot 3 候选 commit（40 位 SHA）并同时固定 tag，核对其 POM 与 JDK 要求。**当前状态：部分完成**——`springboot3` 分支头 `a51a838b71b446ea27256900efe7ed2faa2a02fd` 与其 POM（spring-boot 3.5.16 / JDK 17）已核验，但该提交没有任何对应 tag，故候选保持未冻结（核验记录与复现步骤见 `toolchain/candidate-metadata.json` 与 `toolchain/README.md` §10）。
 3. **许可证与 NOTICE**：保留候选原始 LICENSE/NOTICE 原文与哈希证据。
 4. **依赖清单与 SBOM**：在隔离目录生成依赖树、传递依赖许可证清单与 SBOM（记录工具、版本、生成时间）。
 5. **漏洞扫描**：完成依赖漏洞扫描并逐项记录处置结论（含扫描工具与规则版本）。
@@ -99,6 +99,6 @@ node services/ruoyi-api/toolchain/check-provenance.mjs --self-test
 7. **独立审查**：完成架构/安全独立审查与终审并保留放行结论（实施方不自证）。
 8. **门禁提升**：全部前置 `satisfied` 且合规产物就位后，才把 `stage` 提升为 `admitted`；同时把五项来源/合规证据推进到 `verified`（证据文件存在、摘要与内容标记匹配、带核验时间与署名），再把 `provenance-manifest.json` 的 `stage` 提升为 `poc-ready`。
 
-第 2–7 步尚未开始；候选 commit、许可证、SBOM、漏洞与 PostgreSQL 证据一律保持 `pending`，不预填、不推测。
+第 2 步部分完成（commit 与 POM/JDK 已核验，对应 tag 无法确认 → 候选未冻结，见 `toolchain/candidate-metadata.json`）；第 3–7 步尚未开始；许可证/NOTICE、SBOM、漏洞与 PostgreSQL 证据一律保持 `pending`，不预填、不推测。
 
 本目录当前是隔离 POC 入口，不代表 RuoYi 已采用或迁移已完成。

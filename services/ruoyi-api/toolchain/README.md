@@ -11,6 +11,7 @@
 | `gate-manifest.json`       | 工具链最低要求与可复现探测配方、禁止项、候选 commit 占位、候选准入步骤、准入前置与合规产物清单                     | 结构、占位语义、探测配方与磁盘一致性校验（§3）                              |
 | `check-provenance.mjs`     | 来源与合规证据清单检查器（仅用 Node 内置模块，不联网、不下载、不写仓库；内置纯 JavaScript SHA-256）                | 自身即检查入口，见 §6；`--self-test` 内置 48 项判定场景 + 3 项 SHA-256 向量 |
 | `provenance-manifest.json` | 候选来源与合规证据清单（候选 commit/tag、许可证/NOTICE、SBOM、漏洞、PostgreSQL 兼容性）                            | 结构、状态与磁盘事实、摘要、内容标记、与门禁交叉核验（§4）                  |
+| `candidate-metadata.json`  | 候选仓库/分支/commit/tag 的公开元数据核验记录与复现步骤（当前 tag 未确认 → 候选未冻结）                            | 不参与自动校验；它是两条闸门之外的观测记录，结论见 §10                      |
 
 ## 2. 门禁语义
 
@@ -82,7 +83,7 @@
 | 8   | `gate-promotion`        | 全部前置 `satisfied` 且合规产物就位后，才把本清单 `stage` 提升为 `admitted`                               | —（具备上述全部前置才有意义）                             |
 | 9   | `provenance-promotion`  | 五项来源/合规证据全部 `verified` 并与本清单交叉核验后，才把 `provenance-manifest.json` 提升为 `poc-ready` | —（同上）                                                 |
 
-第 2–7 步尚未开始：清单不预填任何候选 commit、许可证、SBOM、漏洞或 PostgreSQL 证据，未完成的项目一律保持 `pending`，由检查器逐次核对。
+第 2 步**部分完成**：候选 `springboot3` 分支头提交与其 POM/JDK 已核验，但该提交没有对应 tag，按「commit + tag + POM/JDK 三项同时成立」的冻结条件候选保持未冻结（核验记录与复现步骤见 §10 与 `candidate-metadata.json`）。第 3–7 步尚未开始：清单不预填任何候选 commit、许可证、SBOM、漏洞或 PostgreSQL 证据，未完成的项目一律保持 `pending`，由检查器逐次核对。
 
 ### 3.5 合规产物（`complianceArtifacts`）
 
@@ -269,3 +270,23 @@ node services/ruoyi-api/toolchain/check-provenance.mjs --self-test
 - `0.2.0` 的兼容性说明：`toolchain.probe`（可复现探测配方与实测记录）与 `candidate.admissionSteps`（候选准入步骤）成为**必需**字段，缺失即判清单非法；`admissionSteps` 必须覆盖全部必需前置。同一版本起，判定行为有两处修正并已在 §2/§3.3 记录：**未满足的前置与未就位的合规产物改为阻断项**（未准入，退出码 2；此前会被误判为「通过」），而**清单标记 `satisfied` 但本机无法复现**改为未准入（退出码 2）而不是违规（原为违规）。两处都只会让门禁更严或更准确，不放宽任何放行条件。
 - 禁止下调 `toolchain` 的最低要求（JDK 17+ / Maven 3.9+）或关闭边界开关：检查器会直接判为清单非法。
 - `provenance-manifest.json` 同样受此规则约束：必需证据 id、`pocGate` 强制开关与「非 pending 必须给出真实摘要」的语义不得弱化；证据状态只能由实际核验结果推进，不能为了过检查器而预先写成 `verified`。
+
+## 10. 候选元数据核验记录（待核验：候选未冻结）
+
+`candidate-metadata.json` 记录 RuoYi-Vue `springboot3` 候选的公开元数据核验结果与复现步骤。它与 §3.2 的 `candidate.pinned`、§4 的证据清单是**并列的观测记录**：两条闸门都不读它，判定也不因它而放宽。
+
+**冻结条件（三项必须同时成立）：** ①40 位小写 commit；②该 commit 有对应 tag；③其 POM 声明 Spring Boot 3 且 JDK 要求可核对。
+
+截至 2026-10-08 的核验结果：
+
+| 条件         | 结论                   | 依据                                                                                                                                                                                                                                                                                                                                 |
+| ------------ | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 40 位 commit | 已核验                 | `springboot3` 分支头为 `a51a838b71b446ea27256900efe7ed2faa2a02fd`；Gitee API、GitHub 镜像与仓库外只读审计副本的 `FETCH_HEAD` 三处一致；该提交在上游**未签名**（unsigned），因此只能依赖多主机一致而不能依赖签名链                                                                                                                    |
+| 对应 tag     | **未确认（关键缺口）** | Gitee 与 GitHub 的 tags 端点各返回 27 个 tag（`v1.0`…`v3.9.2`），逐个比对无一指向该 commit，只读副本内 `git tag --points-at HEAD` 也为空。最新 tag `v3.9.2` 指向 `0e2d75c2…`，其树含 `ruoyi-ui` 且根 POM 为 spring-boot 4.0.3；`springboot3` 分支树不含 `ruoyi-ui`、根 POM 为 spring-boot 3.5.16，两者不是同一条线                   |
+| POM/JDK      | 已核验（仓库外只读）   | 只读副本中 `git show HEAD:pom.xml` 给出 `<java.version>17</java.version>` 与 `<spring-boot.version>3.5.16</spring-boot.version>`；`HEAD:pom.xml` 的 blob SHA-1 `699a3bcc6a6df052525984b2a96628e3c6c5664e` 与 `HEAD:LICENSE` 的 `8564f294c7781cbbbdb22ae5927a96f859db0054` 与公共 tree 端点一致，证明读到的就是该公共提交的同一份内容 |
+
+因此候选**保持未冻结**：`gate-manifest.json` 的 `candidate.pinned`（`tag`/`commit` 为 `null`、`resolved=false`）与 `provenance-manifest.json` 的 `candidate` 均**未改动**；准入前置 `candidate-commit` 仍为 `pending`（该前置把 commit、tag 与 POM/JDK 三项绑在一起，缺 tag 即整体未满足），`stage` 仍为 `pre-poc-gate`。不预设、不推测，也不为了推进而固定一个没有 tag 的提交。
+
+复现步骤（只用公开元数据与仓库外只读查询，不下载源码本体）见 `candidate-metadata.json` 的 `reproduce`：Gitee 分支端点 → GitHub 分支端点 → Gitee/GitHub tags 端点 → 公共 tree 端点核对 blob 摘要 → 仓库外只读副本复核 POM/JDK 与 tag → 复核两条闸门仍为未准入/未就绪。
+
+边界：本次未下载、未复制 RuoYi 源码或 POM 内容进仓库，未创建 `pom.xml` 或任何 Java 源码，`apache-maven-3.9.16-bin.zip` 仍只读且不入库；本记录也不承担许可证/NOTICE、SBOM、漏洞与 PostgreSQL 兼容性证据的核验。
