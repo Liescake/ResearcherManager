@@ -1,4 +1,4 @@
-import { Logger, NotFoundException } from '@nestjs/common';
+import { HttpException, Logger, NotFoundException } from '@nestjs/common';
 import type { ArgumentsHost } from '@nestjs/common';
 import { BusinessRuleError, StateTransitionError, studentProfileInputSchema } from '@rm/shared';
 import type { ApiEnvelope } from '@rm/shared';
@@ -91,6 +91,21 @@ describe('统一异常映射', () => {
     expect(capture.status).toBe(404);
     expect(capture.body?.error?.code).toBe('NOT_FOUND');
     expect(capture.body?.error?.message).toBe('小组不存在');
+  });
+
+  it('请求体解析失败：400 与稳定错误码不变，但不回显原始请求体片段', () => {
+    const capture: Capture = {};
+    // body-parser（strict 模式）拒绝 JSON 标量时会回显原始请求体
+    const parseFailure = new HttpException(
+      'Unexpected token \'"\', ""{"api_key":"sk-abcdef123456"}"" is not valid JSON',
+      400,
+    );
+    new ApiExceptionFilter().catch(parseFailure, createHost(capture));
+
+    expect(capture.status).toBe(400);
+    expect(capture.body?.error?.code).toBe('VALIDATION_FAILED');
+    expect(capture.body?.error?.message).toBe('提交内容不合法，请检查后重试');
+    expect(JSON.stringify(capture.body)).not.toContain('sk-abcdef123456');
   });
 
   it('未知异常返回 500 且不回显内部错误细节', () => {

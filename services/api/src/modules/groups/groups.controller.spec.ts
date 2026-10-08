@@ -317,9 +317,7 @@ describe('小组：成功路径（真实 HTTP + 统一响应信封）', () => {
 
   it('负责人浏览：只看到服务端解析的 groupIds 里的开放小组（逐条资源级判定）', async () => {
     const { baseUrl, repository } = await startGroupsApp();
-    const own = repository.create(
-      fixtureGroup({ id: LEADER_OWN_GROUP_ID, name: '本人负责小组' }),
-    );
+    const own = repository.create(fixtureGroup({ id: LEADER_OWN_GROUP_ID, name: '本人负责小组' }));
     const other = repository.create(fixtureGroup({ name: '他人小组' }));
 
     const res = await call(baseUrl, 'GET', '/groups', { headers: bearer(SESSION_LEADER) });
@@ -333,9 +331,7 @@ describe('小组：成功路径（真实 HTTP + 统一响应信封）', () => {
 
   it('管理员浏览：只看到服务端分配（assignedResourceIds）的小组；系统管理员为集合级可见', async () => {
     const { baseUrl, repository } = await startGroupsApp();
-    const assigned = repository.create(
-      fixtureGroup({ id: LEADER_OWN_GROUP_ID, name: '受派小组' }),
-    );
+    const assigned = repository.create(fixtureGroup({ id: LEADER_OWN_GROUP_ID, name: '受派小组' }));
     const notAssigned = repository.create(fixtureGroup({ name: '未受派小组' }));
 
     const assignedRes = await call(baseUrl, 'GET', '/groups', {
@@ -431,9 +427,15 @@ describe('小组：输入拒绝（400 VALIDATION_FAILED，不落库）', () => {
     { name: '研究方向为空数组', body: { ...validCreateBody, researchDirections: [] } },
     {
       name: '研究方向超过 10 项',
-      body: { ...validCreateBody, researchDirections: Array.from({ length: 11 }, (_, i) => `方向${i}`) },
+      body: {
+        ...validCreateBody,
+        researchDirections: Array.from({ length: 11 }, (_, i) => `方向${i}`),
+      },
     },
-    { name: '研究方向含控制字符', body: { ...validCreateBody, researchDirections: ['方向\u0000'] } },
+    {
+      name: '研究方向含控制字符',
+      body: { ...validCreateBody, researchDirections: ['方向\u0000'] },
+    },
     {
       name: '研究方向含空串（标签最小长度为 1）',
       body: { ...validCreateBody, researchDirections: [''] },
@@ -587,7 +589,11 @@ describe('小组：输入拒绝（400 VALIDATION_FAILED，不落库）', () => {
     });
 
     expect(res.status).toBe(400);
-    expect(issuesOf(res.body).map((issue) => issue.message).join('|')).toContain('leaderUserId');
+    expect(
+      issuesOf(res.body)
+        .map((issue) => issue.message)
+        .join('|'),
+    ).toContain('leaderUserId');
     expect(storedGroups(repository)).toHaveLength(0);
   });
 });
@@ -759,9 +765,7 @@ describe('小组：越权 403（AuthorizationGuard + 服务端判定入参）', 
 describe('小组：客户端声明伪造无效（请求体 / 查询串 / 自定义头）', () => {
   it('查询串里的 groupId/scope/userId/roles 不被读取也不被信任', async () => {
     const { baseUrl, repository } = await startGroupsApp();
-    const own = repository.create(
-      fixtureGroup({ id: LEADER_OWN_GROUP_ID, name: '本人负责小组' }),
-    );
+    const own = repository.create(fixtureGroup({ id: LEADER_OWN_GROUP_ID, name: '本人负责小组' }));
     const other = repository.create(fixtureGroup({ name: '他人小组' }));
 
     const res = await call(

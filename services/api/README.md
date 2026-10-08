@@ -93,12 +93,47 @@ NestJS API 服务：**唯一业务规则入口**，前端不直接访问数据�
     违者 500 且不泄露字段取值（损坏与越界取数共用同一文案，调用方无法区分内部原因）；
   - 尚不包含：单条读取、更新与撤回、审核状态流转、附件实体（本切片只校验 `evidenceFileId`
     的 UUID 形状，不校验文件是否存在）、幂等键、审计落库、列表分页与排序。
+- **小组切片（`groups`，浏览与创建）**：`src/modules/groups/`（该模块即
+  docs/P2-架构与数据设计.md §2 声明的「小组资料、开放状态与招募要求」边界）：
+  - 路由：`GET /api/v1/groups`（浏览可见的开放小组，`group:read:open`）、
+    `POST /api/v1/groups`（创建小组，`group:manage`）；契约基线的小组详情
+    `GET /groups/{groupId}` 与修改/停用 `PATCH /groups/{groupId}` 不在本切片；
+  - 请求校验：**直接复用**共享 `researchGroupInputSchema`（`.omit({ leaderUserId, status })`），
+    因此小组名称/简介长度、研究方向标签数量与去重、招募要求（技能/年级/周投入/人数/说明）的
+    枚举与范围约束、控制字符全部由共享 schema 决定，共享 schema 变更时本接口自动跟随；
+    另有**字段闭集**：请求体出现 `leaderUserId`/`status`/`groupId`/`groupIds`/`userId`/`roles`/
+    `scope`/`id`/时间戳等**服务端独占字段**一律 400（给出可区分的拒绝原因），不是静默剥离；
+  - 主体与归属：`leaderUserId` 只来自 `SESSION_SUBJECT_RESOLVER` 解析出的服务端会话主体
+    （创建者即负责人），`status` 只由服务端常量写入（入口恒为 `open`）；自定义头
+    （`x-user-id`/`x-roles`/`x-scope`/`x-group-id`）与请求体一样不进入任何判定；
+  - 授权：两条路由都先经 `AuthorizationGuard`（`RUOYI_AUTHZ_ADAPTER` 端口），**先于任何仓储访问**。
+    创建用服务端常量 `group:manage` + `GLOBAL`（权限矩阵中该点只授予默认范围为 GLOBAL 的角色，
+    因此当前实际只对超级管理员放行；把 `group:manage` 授予小组负责人属权限目录版本变更，
+    需要同步 `services/ruoyi-api/contracts` 夹具，不在本切片）；
+    浏览则不能用单一范围表达——`group:read:open` 对全部角色开放但各角色默认范围不同
+    （学生 `SELF`、负责人 `GROUP`、管理员 `ASSIGNED`、系统管理员 `SYSTEM`、超级管理员 `GLOBAL`），
+    谓词又要求范围**精确相等**，因此 service 把服务端主体翻译成一组候选
+    （`buildGroupReadCandidates`，范围表复用共享 `DEFAULT_ROLE_DATA_SCOPE`）逐个询问端口并取并集：
+    集合级候选（SELF/SYSTEM/GLOBAL）通过即可见全部开放小组，资源级候选（GROUP/ASSIGNED）通过
+    则只可见逐条命中的小组；一个候选都不通过（如负责人没有任何 `groupIds`、管理员没有被分配的
+    资源）得到 403，而不是空列表——本端点不回答「是否存在你看不见的小组」；
+  - 输出：只暴露**开放**小组，且对外视图**不含** `leaderUserId`（数据字典标注为「内部」的负责人
+    标识）；读取契约仍校验其存储形状（违规 500）。仓储返回非开放小组、授权集合之外的小组、
+    未知状态枚举或非法时间戳一律 500，且不泄露字段取值（损坏与越权取数共用同一文案）；
+  - 已知偏差：`GET /groups` 尚未分页（契约基线的「分页浏览」需要在仓储端口上加窗口参数并把
+    列表返回改为分页包装，属后续切片），本切片固定返回服务端判定可见的全部开放小组；
+    控制器不声明任何查询参数，因此查询串里的 `groupId`/`scope`/`userId`/`roles` 既不被读取
+    也不被信任（已有真实 HTTP 回归证明其不产生任何影响）；
+  - 尚不包含：小组详情、修改/停用（含状态机与资源级 `group:manage` 判定）、成员与成员数、
+    负责人由管理员指派、分页/排序/过滤、幂等键与审计落库。
 - **存储端口（无数据库阶段）**：`EDUCATION_RECORD_REPOSITORY`、`PROFILE_REPOSITORY`、
-  `APPLICATION_REPOSITORY`、`ACHIEVEMENT_REPOSITORY` 与 `SESSION_STORE`
+  `APPLICATION_REPOSITORY`、`ACHIEVEMENT_REPOSITORY`、`GROUP_REPOSITORY` 与 `SESSION_STORE`
   都是**显式可替换端口**，默认绑定内存基线（`persistent = false`、`productionReady = false`，
-  `NODE_ENV=production` 下拒绝构造，默认不预置任何会话/记录/画像/申请/成果）；引入 PostgreSQL 时只替换
+  `NODE_ENV=production` 下拒绝构造，默认不预置任何会话/记录/画像/申请/成果/小组）；引入 PostgreSQL 时只替换
   provider 绑定，controller/service 不改动。
-- 统一响应信封 `{ data, meta, error }` + 稳定错误码 + 请求 ID。
+- 统一响应信封 `{ data, meta, error }` + 稳定错误码 + 请求 ID。请求体解析失败
+  （body-parser，例如 JSON 语法错误或 strict 模式拒绝 JSON 标量）的原始消息会**回显请求体片段**，
+  统一异常过滤器将其替换为稳定安全文案（错误码 `VALIDATION_FAILED` 与 400 状态码不变）。
 - **RuoYi 兼容适配器（可回退基线）**：`src/modules/ruoyi-adapter/`。只注册端口
   `RUOYI_AUTHZ_ADAPTER`，不注册路由、不改动现有响应，因此不改变对外行为：
   - `ruoyi-adapter.port.ts`：端口与能力声明（基线如实声明 `menuRbacBackend = false`、未接入 RuoYi）；
@@ -107,16 +142,16 @@ NestJS API 服务：**唯一业务规则入口**，前端不直接访问数据�
     （**仅测试期读取**，应用启动不依赖契约目录）。
 - 环境变量在启动时校验，非法配置立即失败。
 
-**未包含**：数据库连接、微信登录、RuoYi RBAC 实现，以及升学记录/学生画像/入组申请/成果之外的其他业务接口
+**未包含**：数据库连接、微信登录、RuoYi RBAC 实现，以及升学记录/学生画像/入组申请/成果/小组之外的其他业务接口
 （画像首次提交锁定与管理员代改、升学记录的状态流转/审核、更新与撤回、升学率统计、入组申请的审核与
-退组、成员关系联动、小组存在性与招募状态校验、成果的单条读取/更新/审核与附件实体、所有写接口的
-幂等键与审计落库）。它们属于后续切片。
+退组、成员关系联动、小组存在性与招募状态校验、小组详情与修改/停用、小组成员与负责人指派、成果的单条读取/
+更新/审核与附件实体、列表分页与排序、所有写接口的幂等键与审计落库）。它们属于后续切片。
 
 ## 命令
 
 ```bash
 pnpm --filter @rm/api typecheck   # 直接对源码做类型检查（经 tsconfig paths 引用工作区包源码）
-pnpm --filter @rm/api test        # vitest：env 校验、信封、异常映射、健康检查、运维信息白名单、RuoYi 契约、升学记录切片、学生画像切片、入组申请切片、成果切片
+pnpm --filter @rm/api test        # vitest：env 校验、信封、异常映射、健康检查、运维信息白名单、RuoYi 契约、升学记录切片、学生画像切片、入组申请切片、成果切片、小组切片（真实 HTTP）
 pnpm --filter @rm/api build       # tsc 产出 dist（CommonJS + decorator metadata）
 pnpm --filter @rm/api start       # node dist/main.js
 ```
@@ -157,7 +192,8 @@ curl http://127.0.0.1:3000/api/v1/health
 7. **认证与授权分离，主体只来自服务端**：认证（会话凭证 → 服务端主体）在 `AuthModule` 经
    `SESSION_SUBJECT_RESOLVER` 端口完成，授权（权限点 + 数据范围 + 资源归属）经
    `AuthorizationGuard` → `RUOYI_AUTHZ_ADAPTER` 端口完成。控制器不解析角色字段、不自行判断权限，
-   客户端提交的 `roles`/`scope`/`groupId`/`userId` 不进入判定（升学记录与画像切片直接以字段闭集拒绝）；
+   客户端提交的 `roles`/`scope`/`groupId`/`userId` 不进入判定（升学记录、画像、入组申请、成果与小组
+   切片直接以字段闭集拒绝，小组切片的查询串声明因控制器不声明任何查询参数而不可读取）；
    持久化一律经仓储端口注入，不用模块级/全局内存冒充生产存储。
 
 ## 依赖

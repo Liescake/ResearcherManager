@@ -72,12 +72,10 @@ export class ApiExceptionFilter implements ExceptionFilter {
       const status = exception.getStatus();
       const code = errorCodeForHttpStatus(status);
       const responseBody = exception.getResponse();
+      const rawMessage =
+        typeof responseBody === 'string' ? responseBody : readMessage(responseBody);
       const message =
-        typeof responseBody === 'string'
-          ? responseBody
-          : status >= 500
-            ? undefined
-            : readMessage(responseBody);
+        status >= 500 || isRequestBodyParseFailure(exception, rawMessage) ? undefined : rawMessage;
       return {
         status,
         body: fail(code, {
@@ -91,6 +89,28 @@ export class ApiExceptionFilter implements ExceptionFilter {
     this.logger.error(`[${requestId}] 未处理异常: ${describeError(exception)}`);
     return { status: 500, body: fail(ApiErrorCode.InternalError, { requestId }) };
   }
+}
+
+/**
+ * 请求体解析失败（body-parser）的消息会**回显原始请求体片段**，例如
+ * `Unexpected token '"', ""{"api_key":"sk-…"}"" is not valid JSON`。按 `error-codes.ts` 的
+ * 「message 必须是用户安全消息，不得泄露敏感字段原文」规则，这类消息一律替换为稳定默认文案：
+ * **错误码与状态码不变**（客户端按 code 分支，不解析 message），只去掉回显。
+ *
+ * 识别依据（任一成立即可，避免依赖 Nest 包装后是否保留 `type`）：
+ * 1. 异常自带 body-parser 的错误类型（`entity.parse.failed` / `entity.verify.failed`）；
+ * 2. 消息形如 JSON 解析失败（strict 模式拒绝 JSON 标量 / 语法错误 / 截断）。
+ */
+function isRequestBodyParseFailure(
+  exception: HttpException,
+  rawMessage: string | undefined,
+): boolean {
+  const type = (exception as { type?: unknown }).type;
+  if (type === 'entity.parse.failed' || type === 'entity.verify.failed') return true;
+  return (
+    typeof rawMessage === 'string' &&
+    /is not valid JSON|Unexpected end of JSON input|in JSON at position \d+/u.test(rawMessage)
+  );
 }
 
 function readMessage(responseBody: unknown): string | undefined {

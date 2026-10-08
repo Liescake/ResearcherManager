@@ -49,13 +49,13 @@ export class InMemoryGroupRepository implements GroupRepository {
   }
 
   listVisibleGroups(query: GroupVisibilityQuery): readonly ResearchGroup[] {
-    return [...this.groups.values()]
-      // 本端点只展示开放小组；暂停/关闭的小组不可见（复用共享 isGroupApplicable）
-      .filter((group) => isGroupApplicable(group.status))
-      .filter(
-        (group) => query.includeAllOpenGroups || query.visibleGroupIds.includes(group.id),
-      )
-      .map(cloneGroup);
+    return (
+      [...this.groups.values()]
+        // 本端点只展示开放小组；暂停/关闭的小组不可见（复用共享 isGroupApplicable）
+        .filter((group) => isGroupApplicable(group.status))
+        .filter((group) => query.includeAllOpenGroups || query.visibleGroupIds.includes(group.id))
+        .map(cloneGroup)
+    );
   }
 }
 

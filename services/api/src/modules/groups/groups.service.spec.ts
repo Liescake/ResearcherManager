@@ -334,7 +334,10 @@ describe('GroupsService：输入闭集与字段校验（fail-closed）', () => {
       { ...validBody, recruitmentRequirements: { headcount: 0 } },
       { ...validBody, recruitmentRequirements: { headcount: 201 } },
       { ...validBody, recruitmentRequirements: { minWeeklyHours: 81 } },
-      { ...validBody, recruitmentRequirements: { skills: Array.from({ length: 21 }, (_, i) => `s${i}`) } },
+      {
+        ...validBody,
+        recruitmentRequirements: { skills: Array.from({ length: 21 }, (_, i) => `s${i}`) },
+      },
       { ...validBody, recruitmentRequirements: { note: 'x'.repeat(501) } },
       { ...validBody, recruitmentRequirements: 'not-an-object' },
       ['not', 'an', 'object'],
@@ -383,9 +386,9 @@ describe('GroupsService：输入闭集与字段校验（fail-closed）', () => {
       createdAt: '2026-01-01T00:00:00.000Z',
       updatedAt: '2026-01-01T00:00:00.000Z',
     };
-    expect(researchGroupInputSchema.safeParse({ ...created, leaderUserId: LEADER_UUID }).success).toBe(
-      true,
-    );
+    expect(
+      researchGroupInputSchema.safeParse({ ...created, leaderUserId: LEADER_UUID }).success,
+    ).toBe(true);
     expect(parseStoredGroup(created).ok).toBe(false);
     expect(parseStoredGroup({ ...created, status: GroupStatus.Open }).ok).toBe(true);
     expect(storedGroupSchema.safeParse({ ...created, status: 'unknown_status' }).success).toBe(
@@ -421,13 +424,21 @@ describe('GroupsService：可见范围候选（buildGroupReadCandidates）', () 
         kind: 'resource',
         origin: 'GROUP',
         resourceId: 'g-1',
-        request: { permission: PermissionPoint.GroupReadOpen, scope: DataScope.Group, groupId: 'g-1' },
+        request: {
+          permission: PermissionPoint.GroupReadOpen,
+          scope: DataScope.Group,
+          groupId: 'g-1',
+        },
       },
       {
         kind: 'resource',
         origin: 'GROUP',
         resourceId: 'g-2',
-        request: { permission: PermissionPoint.GroupReadOpen, scope: DataScope.Group, groupId: 'g-2' },
+        request: {
+          permission: PermissionPoint.GroupReadOpen,
+          scope: DataScope.Group,
+          groupId: 'g-2',
+        },
       },
     ]);
   });
