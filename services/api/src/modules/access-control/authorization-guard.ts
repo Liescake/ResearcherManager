@@ -26,9 +26,23 @@ export class AuthorizationGuard {
   constructor(@Inject(RUOYI_AUTHZ_ADAPTER) private readonly adapter: RuoYiAuthzAdapter) {}
 
   assertAuthorized(subject: AuthorizationSubject, request: AuthorizationRequest): void {
-    if (!this.adapter.checkAuthorization(subject, request).allowed) {
+    if (!this.canAuthorize(subject, request)) {
       throw new ForbiddenException(AUTHORIZATION_FORBIDDEN_MESSAGE);
     }
+  }
+
+  /**
+   * 只读判定：与 `assertAuthorized` 走**同一个端口、同一套入参**，但不抛异常。
+   *
+   * 存在的理由只有一个：集合级列表端点的可见范围可能由**多个服务端候选范围**共同表达
+   * （例如「本人视角」+「所属小组视角」），服务需要逐个候选询问端口再取并集。
+   * 若没有本方法，调用方只能靠捕获 403 来判断，那会把「拒绝」当成控制流。
+   *
+   * 与 `assertAuthorized` 一样：不解释、不返回端口的结构化拒绝原因，
+   * 也不接受任何客户端提交的角色/范围/归属；拒绝原因只留在端口内部（供审计切片使用）。
+   */
+  canAuthorize(subject: AuthorizationSubject, request: AuthorizationRequest): boolean {
+    return this.adapter.checkAuthorization(subject, request).allowed;
   }
 
   assertCanConfigure(subject: AuthorizationSubject, grants: readonly PermissionGrant[]): void {
