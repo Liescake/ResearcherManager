@@ -108,13 +108,13 @@ node services/ruoyi-api/toolchain/check-capability.mjs --self-test
 
 1. **复现工具链**：用显式 `--java-home` / `--maven-home` 复现 JDK 17+ 与 Maven 3.9+ 探测（已完成，见「当前环境门禁」）。
 2. **固定候选**：固定实际 Spring Boot 3 候选 commit（40 位 SHA）并同时固定 tag，核对其 POM 与 JDK 要求。**当前状态：部分完成**——`springboot3` 分支头 `a51a838b71b446ea27256900efe7ed2faa2a02fd` 与其 POM（spring-boot 3.5.16 / JDK 17）已核验，但第二轮复核确认 Gitee 与 GitHub 两侧各 27 个 tag（`v1.0`…`v3.9.2`）**无一指向该提交，连其父提交 `9e3fb55f…` 也没有**，故候选保持未冻结（核验记录与复现步骤见 `toolchain/candidate-metadata.json` 与 `toolchain/README.md` §10）。
-3. **许可证与 NOTICE**：保留候选原始 LICENSE/NOTICE 原文与哈希证据。**当前状态：公开元数据已核验，证据仍未就位**——候选 commit 的 LICENSE 为 MIT（blob `8564f294c7781cbbbdb22ae5927a96f859db0054`、字节 SHA-256 `7296da00…`），根树中**不存在 NOTICE**；原文副本与再分发说明尚未登记，`provenance` 证据 `license-notice` 保持 `pending`（见 `toolchain/README.md` §10.2）。
+3. **许可证与 NOTICE**：保留候选原始 LICENSE/NOTICE 原文与哈希证据。**当前状态：公开元数据已核验，证据仍未就位（保持 `pending`）**——候选 commit `a51a838b…` 的 LICENSE 位于根目录 `LICENSE`（网页 `https://github.com/yangzongzhuan/RuoYi-Vue/blob/a51a838b71b446ea27256900efe7ed2faa2a02fd/LICENSE`；blob `8564f294c7781cbbbdb22ae5927a96f859db0054`、size 1071、字节 SHA-256 `7296da00…`），许可证类型 MIT；全树 477 个条目（334 blob）中**不存在 `NOTICE`/`COPYING`/`COPYRIGHT`**，Gitee 主仓库与 GitHub 镜像的全树逐条目比对一致（单侧独有 0、sha 不一致 0）。第三轮只用公开 API 即可复现上述摘要（不克隆、不落盘，命令见 `toolchain/candidate-metadata.json` 的 `reproduce` 第 6–8 步）；原文副本与再分发说明仍未登记，`provenance` 证据 `license-notice` 保持 `pending`，理由与解除条件见 `toolchain/README.md` §10.2–§10.3。
 4. **依赖清单与 SBOM**：在隔离目录生成依赖树、传递依赖许可证清单与 SBOM（记录工具、版本、生成时间）。
 5. **漏洞扫描**：完成依赖漏洞扫描并逐项记录处置结论（含扫描工具与规则版本）。
 6. **PostgreSQL 验证**：在隔离 PostgreSQL 实例中验证 DDL、分页、时间、事务、索引和迁移回滚。
 7. **独立审查**：完成架构/安全独立审查与终审并保留放行结论（实施方不自证）。
 8. **门禁提升**：全部前置 `satisfied` 且合规产物就位后，才把 `stage` 提升为 `admitted`；同时把五项来源/合规证据推进到 `verified`（证据文件存在、摘要与内容标记匹配、带核验时间与署名），再把 `provenance-manifest.json` 的 `stage` 提升为 `poc-ready`。
 
-第 2 步部分完成（commit 与 POM/JDK 已第二轮核验，对应 tag 无法确认 → 候选未冻结，见 `toolchain/candidate-metadata.json`）；第 3 步的公开元数据与摘要已核验，但原文副本与再分发说明未登记，证据仍为 `pending`；第 4–7 步尚未开始，且 2026-10-08 的能力探测确认 SBOM、漏洞扫描与 PostgreSQL 三项证据当前均无法在本机产出（缺前置工具，见 `toolchain/README.md` §11）。许可证/NOTICE、SBOM、漏洞与 PostgreSQL 证据一律保持 `pending`，不预填、不推测，工具不可用时只记录公开的待办与可复现步骤。
+第 2 步部分完成（commit 与 POM/JDK 已第二轮核验，对应 tag 无法确认 → 候选未冻结，见 `toolchain/candidate-metadata.json`）；第 3 步的公开元数据与摘要已核验，第三轮进一步把复现方式收敛为**只用公开 API**（LICENSE 字节在内存中摘要、全树 NOTICE 存在性与两主机树一致性均可公开复现），但原文副本与再分发说明未登记，证据仍为 `pending`（见 `toolchain/README.md` §10.2–§10.3）；第 4–7 步尚未开始，且 2026-10-08 的能力探测确认 SBOM、漏洞扫描与 PostgreSQL 三项证据当前均无法在本机产出（缺前置工具，见 `toolchain/README.md` §11）。许可证/NOTICE、SBOM、漏洞与 PostgreSQL 证据一律保持 `pending`，不预填、不推测，工具不可用时只记录公开的待办与可复现步骤。
 
 本目录当前是隔离 POC 入口，不代表 RuoYi 已采用或迁移已完成。

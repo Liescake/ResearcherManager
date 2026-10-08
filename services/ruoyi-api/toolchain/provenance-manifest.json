@@ -1,6 +1,6 @@
 {
   "contract": "ruoyi-provenance-manifest",
-  "manifestVersion": "0.1.0",
+  "manifestVersion": "0.1.1",
   "stage": "pre-poc",
   "purpose": "在真实 RuoYi POC 之前，逐项记录候选来源与合规证据（候选 commit/tag、许可证/NOTICE、SBOM、漏洞、PostgreSQL 兼容性）的收集状态。只有当五项证据全部 verified 且证据文件存在、摘要与内容标记匹配时，才允许把 stage 提升为 poc-ready。本清单当前保持 pending，不预填任何证据。",
   "pocGate": {
@@ -34,7 +34,7 @@
       "status": "pending",
       "path": "services/ruoyi-api/compliance/provenance/license-notice.md",
       "requiredMarkers": ["spdx-license-identifier:", "license-file-sha256:", "notice:"],
-      "howToObtain": "在本地审计目录核对候选仓库根目录的 LICENSE/NOTICE 原文，记录 SPDX 标识与原文摘要；NOTICE 存在性要按整个提交树核验（上游可能只有一个根 LICENSE），原文副本按准入门禁的合规产物清单另行登记。记录 sha256 时必须写明字节流：公共提交的 blob 字节（`git cat-file blob <sha>` 后用 sha256sum）与 core.autocrlf=true 的工作区检出字节会得到不同摘要，两者不得混用。"
+      "howToObtain": "只用公开仓库 API/网页元数据即可复现摘要，不需要把上游原文带进本仓库：①公共递归 tree 端点（`https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/git/trees/a51a838b71b446ea27256900efe7ed2faa2a02fd?recursive=1`，truncated=false）统计全树 477 个条目 / 334 个 blob，并按精确文件名确认许可类文件只有根 `LICENSE`（`NOTICE`/`NOTICE.txt`/`COPYING`/`COPYRIGHT` 均不存在；含 “notice” 的 11 条路径逐条核对都是 RuoYi 业务类）；②blob 端点 `git/blobs/8564f294c7781cbbbdb22ae5927a96f859db0054` 取回 base64 字节，在内存中解码后按 git 对象格式（`blob <长度>\\0` + 内容）重算 blob SHA-1（与 tree 端点一致，证明是同一份字节）并计算 SHA-256，字节不落盘；③许可证类型用仓库端点 `license.spdx_id` 与该提交的单文件 license 端点（`?ref=<commit>`，path=LICENSE、sha=8564f294…）交叉印证，得到 MIT；④在 Gitee 主仓库用 `contents/LICENSE?ref=springboot3` 与递归 tree 端点交叉核验同一 blob 与同一棵树。复现命令与实测输出见 `candidate-metadata.json` 的 `reproduce` 第 6–8 步（本机 curl 与 Invoke-RestMethod 不可用，命令写成 `node -e`；raw.githubusercontent.com 在本机 DNS 不可解析，取字节以 API blob 端点为准）。记录 sha256 时必须写明字节流：公共提交 blob 字节（LF、1071 B）为 7296da00…，core.autocrlf=true 的工作区检出（CRLF、1090 B）为 46973d26…，两者不得混用。**该项保持 pending**：证据项要求原文证据与再分发说明，而本仓库明确不保存上游原文副本（准入门禁的合规产物 `services/ruoyi-api/compliance/LICENSE` 因此无法登记），且 verified 还要求核验署名并与门禁候选固定值交叉核验（当前候选未冻结）；理由与解除条件见 `toolchain/README.md` §10.3。"
     },
     {
       "id": "sbom",
@@ -87,7 +87,7 @@
         "id": "vulnerability-scan",
         "status": "blocked",
         "missing": [
-          "没有可扫描的依赖清单：pom.xml 与 compliance/sbom.cyclonedx.json 均不存在",
+          "没有可扫描的依赖清单：pom.xml 与 compliance/provenance/sbom.cyclonedx.json 均不存在",
           "PATH 上未发现 trivy / grype / osv-scanner / dependency-check 任一扫描器，也没有本地规则库/漏洞库版本可记录"
         ],
         "nextSteps": [

@@ -206,7 +206,7 @@
     },
     {
       "id": "sbom",
-      "path": "services/ruoyi-api/compliance/sbom.cyclonedx.json",
+      "path": "services/ruoyi-api/compliance/provenance/sbom.cyclonedx.json",
       "status": "pending",
       "description": "依赖 SBOM（含工具与版本）"
     },

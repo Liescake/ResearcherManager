@@ -1,12 +1,12 @@
 {
   "contract": "ruoyi-candidate-metadata",
-  "manifestVersion": "0.2.0",
+  "manifestVersion": "0.3.0",
   "status": "pending-verification",
   "frozen": false,
   "recordedAt": "2026-10-08T20:20:47+08:00",
-  "lastVerifiedAt": "2026-10-08T21:07:00+08:00",
-  "verificationRounds": 2,
-  "purpose": "记录 RuoYi-Vue spring-boot-3 候选仓库/分支/commit/tag 的公开元数据核验结果，以及候选 LICENSE/NOTICE 的公开元数据与摘要。候选被冻结只有一种条件：同一个提交同时满足「40 位小写 commit + 该 commit 有对应 tag + 其 POM 声明 Spring Boot 3 与 JDK 17」。截至本次（第二轮）核验，commit 与 POM/JDK 已再次核验，但该 commit 仍然没有任何对应 tag，因此候选保持未冻结，status 恒为 pending-verification。本文件只记录观测值、摘要与核验方法，不保存 RuoYi 源码、POM 副本、LICENSE 原文或构建产物，也不是工具链门禁与来源证据检查器的输入（两条闸门只读 gate-manifest.json 与 provenance-manifest.json，见 README §3.2、§4）。",
+  "lastVerifiedAt": "2026-10-08T21:41:49+08:00",
+  "verificationRounds": 3,
+  "purpose": "记录 RuoYi-Vue spring-boot-3 候选仓库/分支/commit/tag 的公开元数据核验结果，以及候选 LICENSE/NOTICE 的公开元数据与摘要。候选被冻结只有一种条件：同一个提交同时满足「40 位小写 commit + 该 commit 有对应 tag + 其 POM 声明 Spring Boot 3 与 JDK 17」。截至本次（第三轮）核验，commit 与 POM/JDK 已再次核验，但该 commit 仍然没有任何对应 tag，因此候选保持未冻结，status 恒为 pending-verification。第三轮的核验范围集中在许可证/NOTICE 准入：只用公开仓库 API/网页元数据（不克隆、不下载源码本体）核验 LICENSE/NOTICE 的存在性、路径、公开 URL、blob 摘要与许可证类型。本文件只记录观测值、摘要与核验方法，不保存 RuoYi 源码、POM 副本、LICENSE 原文或构建产物，也不是工具链门禁与来源证据检查器的输入（两条闸门只读 gate-manifest.json 与 provenance-manifest.json，见 README §3.2、§4）。",
   "candidate": {
     "project": "RuoYi-Vue",
     "line": "spring-boot-3",
@@ -115,28 +115,67 @@
     {
       "id": "license-notice-metadata",
       "status": "verified-public-metadata",
+      "statusScope": "本状态只描述本文件内的观测（公开元数据 + 摘要已核验），不是闸门状态：provenance-manifest.json 的 license-notice 证据仍为 pending，gate-manifest.json 的 license-notice 准入前置也仍为 pending。",
       "value": {
         "spdxLicenseIdentifier": "MIT",
-        "spdxSource": "GitHub 仓库元数据 license.spdx_id（仓库级、启发式识别）",
+        "spdxSource": "GitHub 仓库元数据 license.spdx_id（仓库级、启发式识别），并以 LICENSE 首行与 GitHub 单文件 license 端点交叉印证",
+        "licensePath": "LICENSE（候选提交根目录，精确文件名；根树 16 个条目里唯一的许可类文件）",
         "licenseFirstLine": "The MIT License (MIT)",
         "licenseBlobSha1": "8564f294c7781cbbbdb22ae5927a96f859db0054",
         "licenseBlobSize": 1071,
         "licenseContentSha256": "7296da00ac5dfc56c36e6ac10ce5abdb2900898c101d5c4720d7b6c1254dd993",
         "noticePresentAtCandidate": false,
-        "noticeCheckedScope": "整个候选提交树（334 个文件，`git ls-tree -r --name-only` 全量列出）",
-        "noticeExpectedPath": "NOTICE / NOTICE.txt / COPYING / COPYRIGHT：整个树中均不存在；唯一的许可类文件是根目录 LICENSE（全树大小写不敏感检索到的其余 “notice” 命中都是 RuoYi 业务的 SysNotice 类与映射文件，与 NOTICE 合规文件无关）",
-        "licenseByteStreamNote": "记录 SHA-256 时必须写明字节流：公共提交 blob 字节（LF、1071 B）为 7296da00…，而 core.autocrlf=true 的工作区检出（CRLF、1090 B）为 46973d26…；本文件两个值都记录，引用时以其一为准并注明来源"
+        "noticeCheckedScope": "整个候选提交树：公开递归 tree 端点给出 477 个条目（其中 blob 334 个、tree 143 个，truncated=false），许可类文件名精确匹配（LICENSE/LICENCE/NOTICE/COPYING/COPYRIGHT）只有根 LICENSE；先前用仓库外只读副本 `git ls-tree -r --name-only HEAD` 得到的 334 个文件与公开端点的 blob 数一致",
+        "noticeExpectedPath": "NOTICE / NOTICE.txt / COPYING / COPYRIGHT：整个树中均不存在；唯一的许可类文件是根目录 LICENSE（全树大小写不敏感检索命中 11 条含 “notice” 的路径，逐条核对全部是 RuoYi 业务的 SysNotice 类与映射文件，与 NOTICE 合规文件无关）",
+        "licenseByteStreamNote": "记录 SHA-256 时必须写明字节流：公共提交 blob 字节（LF、1071 B）为 7296da00…，而 core.autocrlf=true 的工作区检出（CRLF、1090 B）为 46973d26…；本文件两个值都记录，引用时以其一为准并注明来源",
+        "publicUrls": {
+          "人类可读网页": "https://github.com/yangzongzhuan/RuoYi-Vue/blob/a51a838b71b446ea27256900efe7ed2faa2a02fd/LICENSE（HTTP 200）",
+          "镜像仓库树（网页）": "https://github.com/yangzongzhuan/RuoYi-Vue/tree/a51a838b71b446ea27256900efe7ed2faa2a02fd（HTTP 200）",
+          "镜像仓库根树（API）": "https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/git/trees/a51a838b71b446ea27256900efe7ed2faa2a02fd（HTTP 200）",
+          "镜像仓库全树（API，recursive=1）": "https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/git/trees/a51a838b71b446ea27256900efe7ed2faa2a02fd?recursive=1（HTTP 200，truncated=false）",
+          "镜像仓库 LICENSE 字节（API，base64）": "https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/git/blobs/8564f294c7781cbbbdb22ae5927a96f859db0054（HTTP 200）",
+          "镜像仓库单文件 license 端点": "https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/license?ref=a51a838b71b446ea27256900efe7ed2faa2a02fd（HTTP 200，path=LICENSE、sha=8564f294…、size=1071、spdx_id=MIT）",
+          "主仓库 LICENSE（网页）": "https://gitee.com/y_project/RuoYi-Vue/blob/springboot3/LICENSE（HTTP 200）",
+          "主仓库 LICENSE（API）": "https://gitee.com/api/v5/repos/y_project/RuoYi-Vue/contents/LICENSE?ref=springboot3（HTTP 200，path=LICENSE、sha=8564f294…、size=1071）",
+          "主仓库 LICENSE 字节（网页 raw）": "https://gitee.com/y_project/RuoYi-Vue/raw/springboot3/LICENSE（HTTP 200，1071 B、LF、不含 CR；内存计算 SHA-256=7296da00…、git blob SHA-1=8564f294…，与 GitHub API blob 端点逐字节一致）",
+          "主仓库全树（API）": "https://gitee.com/api/v5/repos/y_project/RuoYi-Vue/git/trees/springboot3?recursive=1（HTTP 200，477 个条目，许可类文件只有 LICENSE）",
+          "本机不可达的候选托管端点": "https://raw.githubusercontent.com/yangzongzhuan/RuoYi-Vue/a51a838b71b446ea27256900efe7ed2faa2a02fd/LICENSE —— 本机 DNS 不可解析（getaddrinfo ENOENT），因此本轮不把它算作已核验端点，改用 API blob 端点取字节"
+        },
+        "round3PublicApiVerification": {
+          "verifiedAt": "2026-10-08T21:41:49+08:00",
+          "scope": "只读公开 API/网页元数据；不克隆、不下载源码本体、不把上游字节写入磁盘（base64 解码与摘要都在内存中完成后立即丢弃）",
+          "licenseBlobSha1RecomputedInMemory": "8564f294c7781cbbbdb22ae5927a96f859db0054",
+          "licenseContentSha256RecomputedInMemory": "7296da00ac5dfc56c36e6ac10ce5abdb2900898c101d5c4720d7b6c1254dd993",
+          "licenseByteStream": "公共提交 blob 字节，LF、1071 B、不含 CR；由 git 对象格式（blob <长度>\\0 + 内容）重算的 SHA-1 与 tree 端点给出的 blob SHA-1 相同，证明取到的就是该公共提交的同一份字节",
+          "secondHostByteSource": "Gitee 网页 raw 端点（https://gitee.com/y_project/RuoYi-Vue/raw/springboot3/LICENSE）在本机可达：取回 1071 B（不含 CR），内存计算 SHA-256 = 7296da00…、git blob SHA-1 = 8564f294…，与 GitHub API blob 端点完全一致——同一摘要由两个独立主机各自的字节复现；GitHub raw（raw.githubusercontent.com）在本机 DNS 不可解析，因此第二字节来源用 Gitee raw 而不是 GitHub raw",
+          "treeEntryCount": 477,
+          "treeBlobCount": 334,
+          "treeTruncated": false,
+          "licenseClassFileCount": 1,
+          "noticeComplianceFileCount": 0,
+          "pathsContainingNoticeCount": 11,
+          "pathsContainingNoticeNature": "全部为 RuoYi 业务类（SysNoticeController/SysNotice/SysNoticeRead/SysNoticeMapper 等），不是 NOTICE 合规文件",
+          "twoHostTreeEquality": "GitHub 镜像与 Gitee 主仓库的全树逐条目比对（type:path → sha）：两侧各 477 个条目，单侧独有 0 个，sha 不一致 0 个",
+          "reproduceCommandVerifiedOnThisHost": "见本文件 reproduce 第 6、7 步；两条命令均在本机用 node 内置 fetch 实测通过（curl.exe 与 Invoke-RestMethod 在本机不可用）",
+          "notTheGateVerified": "本轮不写证据文件、不改任何闸门状态，也不声明 provenance 证据 verified；gate-manifest.json 的候选固定值仍为 tag=null/commit=null/resolved=false，因此按 check-provenance.mjs 的交叉核验规则，此时也不可能诚实成立 verified。"
+        }
       },
-      "method": "只取公开元数据与摘要，不复制原文：①公共 tree 端点列出候选 commit 根树，确认存在 LICENSE（blob 8564f294…，size 1071）；②再在仓库外只读副本里对同一提交做全树列举（`git ls-tree -r --name-only`，334 个文件），确认整个树中没有任何 NOTICE/COPYING/COPYRIGHT 类文件；③GitHub 仓库端点给出 license.spdx_id=MIT；④只读副本中读取 LICENSE 首行（仅首行，用于标识）并按 git 对象格式重算 blob SHA-1，与公共 tree 端点一致；⑤对同一份字节（blob 字节，LF）计算 SHA-256，并另测工作区检出（core.autocrlf=true 的 CRLF 字节）的 SHA-256，两者一并记录以避免字节流混用。",
+      "method": "只取公开元数据与摘要，不复制原文：①公共 tree 端点列出候选 commit 根树，确认存在 LICENSE（blob 8564f294…，size 1071）；②公共递归 tree 端点（truncated=false）列出全树 477 个条目/334 个 blob，按文件名精确匹配确认没有任何 NOTICE/COPYING/COPYRIGHT 类文件，并把 11 条含 “notice” 的业务路径排除；③GitHub 仓库端点给出 license.spdx_id=MIT，单文件 license 端点（?ref=候选提交）给出 path=LICENSE、sha=8564f294…、size=1071；④公共 blob 端点取回 base64 字节，在内存中解码后按 git 对象格式重算 blob SHA-1（与 tree 端点一致）并计算 SHA-256，全程不落盘；⑤Gitee 主仓库的 contents 端点与递归 tree 端点交叉核验同一 blob 与同一棵树；⑥逐个条目比对两主机全树（path→sha）一致。第三轮不再依赖仓库外只读副本即可复现全部摘要。",
       "sources": [
         "https://api.github.com/repos/yangzongzhuan/RuoYi-Vue",
         "https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/git/trees/a51a838b71b446ea27256900efe7ed2faa2a02fd",
-        "<audit-root>/RuoYi-Vue-springboot3-current（只读 `git cat-file blob 8564f294…` 与首行读取）"
+        "https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/git/trees/a51a838b71b446ea27256900efe7ed2faa2a02fd?recursive=1",
+        "https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/git/blobs/8564f294c7781cbbbdb22ae5927a96f859db0054",
+        "https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/license?ref=a51a838b71b446ea27256900efe7ed2faa2a02fd",
+        "https://gitee.com/api/v5/repos/y_project/RuoYi-Vue/contents/LICENSE?ref=springboot3",
+        "https://gitee.com/api/v5/repos/y_project/RuoYi-Vue/git/trees/springboot3?recursive=1",
+        "<audit-root>/RuoYi-Vue-springboot3-current（第一/二轮只读副本；第三轮已不需要它即可复现摘要）"
       ],
-      "caveat": "只覆盖「公开元数据 + 字节摘要 + NOTICE 存在性」。GitHub 的 license 字段是启发式识别，不能替代人工逐条复核原文；原文副本（compliance/LICENSE、compliance/NOTICE）与再分发说明尚未登记，因此 provenance 证据 license-notice 保持 pending，本轮不推进其状态。另需注意：本机克隆 core.autocrlf=true，LICENSE 的工作区文件是 CRLF（1090 B，SHA-256 46973d26…），与公共提交 blob 字节（LF，1071 B，7296da00…）不同——将来登记 license-file-sha256 时必须写明采用哪一种字节流，否则可从公共提交复现的只有 blob 那一份摘要。",
+      "caveat": "只覆盖「公开元数据 + blob 摘要 + NOTICE 存在性 + 两主机树一致性」。GitHub 的 license 字段是启发式识别，不能替代人工逐条复核原文；本轮没有创建证据文件，也没有把原文副本登记到 compliance/LICENSE 或 compliance/NOTICE，因此 provenance 证据 license-notice 保持 pending，见 toolchain/README.md §10.3 的「保持 pending 的理由与解除条件」。另需注意：本机克隆 core.autocrlf=true，LICENSE 的工作区文件是 CRLF（1090 B，SHA-256 46973d26…），与公共提交 blob 字节（LF，1071 B，7296da00…）不同——将来登记 license-file-sha256 时必须写明采用哪一种字节流，否则可从公共提交复现的只有 blob 那一份摘要；另外 raw.githubusercontent.com 在本机 DNS 不可解析，取字节要走 API blob 端点。",
       "notClaimed": [
-        "未把 LICENSE 原文、NOTICE 内容或任何 RuoYi 文件复制进本仓库",
-        "不声明许可证/NOTICE 证据已就位，也不声明依赖许可证清单已核验"
+        "未把 LICENSE 原文、NOTICE 内容或任何 RuoYi 文件复制进本仓库（blob 字节只在内存中摘要后丢弃）",
+        "不声明许可证/NOTICE 证据已就位，也不声明依赖许可证清单已核验",
+        "不声明闸门状态发生变化：gate-manifest.json 与 provenance-manifest.json 的 license-notice 均仍为 pending"
       ]
     },
     {
@@ -160,7 +199,7 @@
             "id": "vulnerability-scan",
             "status": "blocked",
             "reasons": [
-              "没有可扫描的依赖清单：pom.xml 与 compliance/sbom.cyclonedx.json 均不存在",
+              "没有可扫描的依赖清单：pom.xml 与 compliance/provenance/sbom.cyclonedx.json 均不存在",
               "PATH 上未发现 trivy / grype / osv-scanner / dependency-check 任一扫描器，也没有本地漏洞库/规则库版本可记录"
             ]
           },
@@ -218,6 +257,7 @@
       "不声明「已核验许可证原文」：本轮只核验公开元数据、blob 摘要与 NOTICE 存在性"
     ]
   },
+  "reproduceEnvironment": "本机复现环境（2026-10-08 实测）：curl.exe 不可用（HTTP 000）、Invoke-RestMethod 因 TLS 失败，只有 Node 内置 fetch 能访问公共 API（HTTP 200）；raw.githubusercontent.com 在本机 DNS 不可解析（getaddrinfo ENOENT）。因此第 1–5 步的 curl 形式在本机需替换为等价的 node fetch 命令，而聚焦许可证/NOTICE 的第 6–8 步直接给出经本机实测通过的 node 命令；第 9–11 步是仓库外只读副本的 git 命令，第 12–13 步是 node 命令。",
   "reproduce": [
     {
       "step": 1,
@@ -247,45 +287,66 @@
       "step": 5,
       "title": "核验 POM/JDK 与许可证摘要且不下载源码本体",
       "command": "curl -s https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/git/trees/a51a838b71b446ea27256900efe7ed2faa2a02fd",
-      "expect": "pom.xml 条目 sha=699a3bcc6a6df052525984b2a96628e3c6c5664e（size=8513）、LICENSE 条目 sha=8564f294c7781cbbbdb22ae5927a96f859db0054（size=1071），根树中不存在 NOTICE；如需读 POM 内容，必须在仓库外的审计目录内只读进行（见步骤 6），不得复制进本仓库"
+      "expect": "pom.xml 条目 sha=699a3bcc6a6df052525984b2a96628e3c6c5664e（size=8513）、LICENSE 条目 sha=8564f294c7781cbbbdb22ae5927a96f859db0054（size=1071），根树中不存在 NOTICE；如需读 POM 内容，必须在仓库外的审计目录内只读进行（见步骤 9），不得复制进本仓库"
     },
     {
       "step": 6,
+      "title": "用公开 API 核验许可证类型（仓库级元数据 + 该提交的单文件 license 端点）",
+      "command": "node -e \"const H={'user-agent':'rm-repro','accept':'application/vnd.github+json'};(async()=>{const j=await(await fetch('https://api.github.com/repos/yangzongzhuan/RuoYi-Vue',{headers:H})).json();console.log('spdx='+j.license.spdx_id,'name='+j.license.name);const l=await(await fetch('https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/license?ref=a51a838b71b446ea27256900efe7ed2faa2a02fd',{headers:H})).json();console.log('license-file path='+l.path,'sha1='+l.sha,'size='+l.size,'spdx='+l.license.spdx_id);})()\"",
+      "expect": "spdx=MIT name=MIT License；license-file path=LICENSE sha1=8564f294c7781cbbbdb22ae5927a96f859db0054 size=1071 spdx=MIT。注意：仓库级 license 字段是启发式识别，必须与 LICENSE 首行 The MIT License (MIT) 一起看，不能替代人工逐条复核原文"
+    },
+    {
+      "step": 7,
+      "title": "只用公开 API 复算 LICENSE 字节摘要与全树 NOTICE 存在性（不克隆、不落盘）",
+      "command": "node -e \"const H={'user-agent':'rm-repro','accept':'application/vnd.github+json'},R='yangzongzhuan/RuoYi-Vue',C='a51a838b71b446ea27256900efe7ed2faa2a02fd',K=require('crypto');(async()=>{const T=await(await fetch('https://api.github.com/repos/'+R+'/git/trees/'+C+'?recursive=1',{headers:H})).json();const cls=T.tree.filter(e=>{const b=e.path.split('/').pop().toLowerCase();return ['license','licence','notice','copying','copyright'].some(k=>b===k||b.indexOf(k+'.')===0)});console.log('entries='+T.tree.length,'blobs='+T.tree.filter(e=>e.type==='blob').length,'truncated='+T.truncated);console.log('license-class='+JSON.stringify(cls.map(e=>e.path+' '+e.sha+' '+e.size)));const loose=T.tree.filter(e=>/notice/i.test(e.path));console.log('paths-containing-notice='+loose.length);console.log('sample='+JSON.stringify(loose.map(e=>e.path).slice(0,4)));const B=await(await fetch('https://api.github.com/repos/'+R+'/git/blobs/8564f294c7781cbbbdb22ae5927a96f859db0054',{headers:H})).json();const X=Buffer.from(B.content,'base64');console.log('bytes='+X.length,'gitBlobSha1='+K.createHash('sha1').update(Buffer.concat([Buffer.from('blob '+X.length+String.fromCharCode(0)),X])).digest('hex'),'sha256='+K.createHash('sha256').update(X).digest('hex'));})()\"",
+      "expect": "entries=477 blobs=334 truncated=false；license-class 只有一个条目 LICENSE sha1=8564f294c7781cbbbdb22ae5927a96f859db0054 size=1071；paths-containing-notice=11（逐条核对全部是 SysNotice 业务类与映射文件，不是 NOTICE 合规文件）；bytes=1071 gitBlobSha1=8564f294c7781cbbbdb22ae5927a96f859db0054 sha256=7296da00ac5dfc56c36e6ac10ce5abdb2900898c101d5c4720d7b6c1254dd993。blob 字节只在内存中解码并摘要，不写入任何文件；原文副本若要保留只能放在仓库外的审计目录，不得进入本仓库"
+    },
+    {
+      "step": 8,
+      "title": "Gitee 主仓库交叉核验同一 blob、同一棵树与网页 raw 字节",
+      "command": "node -e \"const H={'user-agent':'rm-repro'},U='https://gitee.com/api/v5/repos/y_project/RuoYi-Vue';(async()=>{const c=await(await fetch(U+'/contents/LICENSE?ref=springboot3',{headers:H})).json();console.log('gitee-LICENSE path='+c.path,'sha1='+c.sha,'size='+c.size,'url='+c.download_url);const T=await(await fetch(U+'/git/trees/springboot3?recursive=1',{headers:H})).json();const cls=T.tree.filter(e=>{const b=e.path.split('/').pop().toLowerCase();return ['license','licence','notice','copying','copyright'].some(k=>b===k||b.indexOf(k+'.')===0)});console.log('gitee-entries='+T.tree.length,'license-class='+JSON.stringify(cls.map(e=>e.path+' '+e.sha+' '+e.size)));})()\"; node -e \"const K=require('crypto');(async()=>{const r=await fetch('https://gitee.com/y_project/RuoYi-Vue/raw/springboot3/LICENSE',{headers:{'user-agent':'rm-repro'}});const b=Buffer.from(await r.arrayBuffer());console.log('gitee-raw status='+r.status,'bytes='+b.length,'hasCR='+b.includes(13),'sha256='+K.createHash('sha256').update(b).digest('hex'));})()\"",
+      "expect": "gitee-LICENSE path=LICENSE sha1=8564f294c7781cbbbdb22ae5927a96f859db0054 size=1071 url=https://gitee.com/y_project/RuoYi-Vue/raw/springboot3/LICENSE；gitee-entries=477，许可类文件同样只有 LICENSE（同一 blob 摘要）。两主机全树逐条目（type:path 对应 sha）比对：各 477 个条目、单侧独有 0 个、sha 不一致 0 个。gitee-raw status=200 bytes=1071 hasCR=false sha256=7296da00ac5dfc56c36e6ac10ce5abdb2900898c101d5c4720d7b6c1254dd993 —— Gitee 网页 raw 端点的字节摘要与 GitHub API blob 端点完全一致，构成第二个独立字节来源（GitHub raw 在本机不可达，Gitee raw 可达）；两个主机各自的字节都只在内存中摘要，不落盘"
+    },
+    {
+      "step": 9,
       "title": "复用仓库外只读审计副本（本机为 D:\\ruoyi-audit\\RuoYi-Vue-springboot3-current）",
       "command": "git -C <audit-root>/RuoYi-Vue-springboot3-current rev-parse HEAD; git -C <audit-root>/RuoYi-Vue-springboot3-current show HEAD:pom.xml | Select-String 'java.version|spring-boot.version'; git -C <audit-root>/RuoYi-Vue-springboot3-current tag --points-at HEAD",
       "expect": "HEAD=a51a838b…；committed POM 行为 <java.version>17</java.version> 与 <spring-boot.version>3.5.16</spring-boot.version>；`tag --points-at HEAD` 输出为空"
     },
     {
-      "step": 7,
+      "step": 10,
       "title": "复算 LICENSE/POM 的字节摘要（证明读到的就是该公共提交的同一份字节）",
       "command": "git -C <audit-root>/RuoYi-Vue-springboot3-current cat-file blob 8564f294c7781cbbbdb22ae5927a96f859db0054 > %TEMP%\\license.blob; node -e \"const fs=require('fs'),c=require('crypto');const b=fs.readFileSync(process.env.TEMP+'/license.blob');console.log(c.createHash('sha1').update(Buffer.concat([Buffer.from('blob '+b.length+String.fromCharCode(0)),b])).digest('hex'),c.createHash('sha256').update(b).digest('hex'))\"",
       "expect": "重算的 git blob SHA-1 与公共 tree 端点一致（8564f294…），SHA-256 为 7296da00ac5dfc56c36e6ac10ce5abdb2900898c101d5c4720d7b6c1254dd993；对 pom.xml（blob 699a3bcc…）同理，SHA-256 为 16bf030a8e4c79c978bbf11eb6f6e18475771c10f4708d9e62e219480a172c9a。注意字节流：同一 LICENSE 在工作区检出（core.autocrlf=true，CRLF、1090 B）的 SHA-256 是 46973d26…，与 blob 字节不同，登记证据时必须写明采用哪一种。临时字节文件不得留在本仓库"
     },
     {
-      "step": 8,
+      "step": 11,
       "title": "核验 NOTICE 全树存在性，并界定 tag 关系的证据范围",
       "command": "git -C <audit-root>/RuoYi-Vue-springboot3-current ls-tree -r --name-only HEAD | Select-String -Pattern 'NOTICE|COPYING|COPYRIGHT|LICENSE'; git -C <audit-root>/RuoYi-Vue-springboot3-current rev-parse --is-shallow-repository; git -C <audit-root>/RuoYi-Vue-springboot3-current describe --tags --exact-match HEAD",
       "expect": "全树 334 个文件中许可类文件只有根 LICENSE（大小写不敏感检索到的其余 “notice” 命中都是 SysNotice 业务类）；`--is-shallow-repository` 输出 true（浅克隆，本地祖先/包含关系不作为 tag 关系证据），`describe --tags --exact-match HEAD` 报 no tag exactly matches —— tag 关系以两个公共主机的 27 条 refs 为唯一证据"
     },
     {
-      "step": 9,
+      "step": 12,
       "title": "复核当前环境能否产出真实证据（SBOM / 漏洞扫描 / PostgreSQL）",
       "command": "node services/ruoyi-api/toolchain/check-capability.mjs --report; node services/ruoyi-api/toolchain/check-capability.mjs --java-home \"C:\\Program Files\\Java\\jdk-17\" --maven-home \"<仓库外临时目录>/apache-maven-3.9.16\"",
       "expect": "默认探测三项能力全部被阻断（退出码 2），逐项列出缺失的工具与前置；带显式工具链参数时 build-toolchain 前置变为 ok，但门禁未 admitted、无 pom.xml、无扫描器/PostgreSQL 运行时，结论仍是 0/3 就绪"
     },
     {
-      "step": 10,
+      "step": 13,
       "title": "复核两条闸门仍是未准入/未就绪（本文件不参与判定）",
       "command": "node services/ruoyi-api/toolchain/check-gate.mjs --report; node services/ruoyi-api/toolchain/check-provenance.mjs --report",
       "expect": "两份报告都保持阻断：候选未冻结、准入前置未满足、五项证据仍 pending；两条闸门都不读本文件，判定不因本文件而放宽"
     }
   ],
   "boundaries": [
-    "本次未下载、未解包、未复制 RuoYi 源码、POM 内容或 LICENSE 原文进本仓库；仓库外只读审计副本与系统临时目录中的核对字节不属于本仓库产物。",
+    "本次（含第三轮公开 API 核验）未下载、未解包、未复制 RuoYi 源码、POM 内容或 LICENSE/NOTICE 原文进本仓库：第三轮的 LICENSE 字节只经公开 blob 端点取回、在内存中解码与摘要后立即丢弃，未写入任何文件；仓库外只读审计副本与系统临时目录中的核对字节不属于本仓库产物。",
     "本次未创建 pom.xml、Maven 包装脚本或任何 Java/Kotlin 源码；本地 Maven 压缩包（apache-maven-3.9.16-bin.zip）保持只读、不入库，解压只发生在仓库外系统临时目录，解压前后其 SHA-256 不变。",
     "本文件只记录公开可复核的元数据、blob 摘要与核验方法，不替代真实 POC 前的许可证/NOTICE 原文复核、SBOM、漏洞扫描、PostgreSQL 兼容性与独立安全评审。",
     "本文件不是 gate-manifest.json 或 provenance-manifest.json 的替代或预填：两条闸门不读它，候选固定值仍以门禁清单为准；能力评估结论也不是证据。",
     "仓库外只读审计副本是浅克隆（depth=1），因此本文件不用它的 `git tag --contains` / `merge-base` 结果推断 tag 关系；tag 关系只以两个公共主机的 refs 为证据，浅克隆只用于读取该提交自身的字节与全树清单。",
-    "本文件记录的 SHA-256 明确区分字节流：默认指公共提交的 blob 字节；core.autocrlf=true 的工作区检出字节另记一值，两者不混用、不互相替代。"
+    "本文件记录的 SHA-256 明确区分字节流：默认指公共提交的 blob 字节；core.autocrlf=true 的工作区检出字节另记一值，两者不混用、不互相替代。",
+    "第三轮的公开元数据核验不推进任何证据状态：provenance-manifest.json 的 license-notice 与 gate-manifest.json 的 license-notice 前置均保持 pending，也没有创建 compliance/ 下的任何证据文件或原文副本。",
+    "保持 pending 的理由与解除条件见 toolchain/README.md §10.3：本仓库明确不保存上游 LICENSE 原文副本，而 verified 还要求核验时间、核验署名并与门禁候选固定值交叉核验（当前候选未冻结），因此本轮不声明许可证/NOTICE 证据已就位。",
+    "raw.githubusercontent.com 在本机 DNS 不可解析，属于本机网络限制而非上游事实；本文件不把该端点计为已核验来源，取字节以 API blob 端点为准。"
   ]
 }

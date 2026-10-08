@@ -37,13 +37,29 @@
  *   node check-capability.mjs --report      # 信息性运行：始终以退出码 0 结束
  *   node check-capability.mjs --self-test   # 用合成输入验证判定规则（不读磁盘、不探测）
  *   node check-capability.mjs --java-home "C:\Program Files\Java\jdk-17" --maven-home "<仓库外>/apache-maven-3.9.16"
+ *   node check-capability.mjs --audit-root "<仓库外绝对路径>" --audit-commit "<40 位小写 SHA>"
+ *   node check-capability.mjs --audit-root="<仓库外绝对路径>" --audit-commit="<40 位小写 SHA>"
+ *                                            # 外部审计模式：只读核验仓库外的固定 commit 检出
  *
  * 退出码：0 就绪；1 违规；2 被阻断；64 用法错误。
+ * 审计模式（`--audit-root` + `--audit-commit`，空格与 `=` 两种写法等价）只回答一个问题：**这个仓库外的
+ * 固定 commit 检出能否作为真实证据的来源**。verdict 只有两个取值：`external-audit-ready`（退出码 0）
+ * 与 `blocked`（1 隔离/事实违规，2 前置未满足）；报告里 `admitted` 与 `verified` 恒为 false，并且不读取
+ * 仓库内 `gate-manifest.json` 的 stage，因此仓库内门禁状态不可能影响本判定。
+ * 详见「外部审计模式」一节。
  */
-import { existsSync, openSync, closeSync, readFileSync, unlinkSync } from 'node:fs';
+import {
+  existsSync,
+  lstatSync,
+  openSync,
+  closeSync,
+  readFileSync,
+  realpathSync,
+  unlinkSync,
+} from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
+import { delimiter, dirname, isAbsolute, join, parse, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /* ------------------------------------------------------------------ *
@@ -61,7 +77,7 @@ const ADMITTED_STAGE = 'admitted';
 
 const CAPABILITY_IDS = ['sbom', 'vulnerability-scan', 'postgresql-compatibility'];
 const RELATIVE_POM = 'services/ruoyi-api/pom.xml';
-const RELATIVE_SBOM = 'services/ruoyi-api/compliance/sbom.cyclonedx.json';
+const RELATIVE_SBOM = 'services/ruoyi-api/compliance/provenance/sbom.cyclonedx.json';
 
 const MIN_JDK_MAJOR = 17;
 const MIN_MAVEN_VERSION = '3.9.0';
@@ -158,6 +174,7 @@ function firstLine(text) {
  *   ServerVersion（允许 Docker 常见后缀），出现任何垃圾或错误文本即判守护进程不可达（fail-closed）。
  */
 const PROBE_TIMEOUT_MS = 15000;
+// eslint-disable-next-line no-control-regex -- 安全判定：必须识别控制字符（NUL/CR/LF/TAB/DEL）并拒绝
 const UNSAFE_PATH_CHARS = /["'\u0000-\u001f\u007f]/;
 const SHELL_META_CHARS = /[&|<>^()%!]/;
 
@@ -718,6 +735,850 @@ function validateExplicitHome(kind, value, label, deps) {
 }
 
 /* ------------------------------------------------------------------ *
+ * SHA-256（纯 JavaScript；仅用于外部审计模式的输入摘要核验）
+ *
+ * 与本目录 check-provenance.mjs 同一实现口径：不导入 node:crypto（它不在
+ * boundary.allowedImportSpecifiers 白名单内），也不调用任何外部命令。两个文件各自内联一份
+ * 是刻意为之——本目录的检查器都是「可单独分发的单文件 CLI」，跨文件 import 一个自身即入口的
+ * 兄弟脚本会在导入时执行对方的检查流程。
+ * ------------------------------------------------------------------ */
+
+const SHA256_K = [
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+function rotateRight(value, shift) {
+  return ((value >>> shift) | (value << (32 - shift))) >>> 0;
+}
+
+/** 计算 SHA-256 十六进制摘要；接受字符串（UTF-8）或字节数组。 */
+function sha256Hex(input) {
+  const bytes =
+    typeof input === 'string'
+      ? new Uint8Array(Buffer.from(input, 'utf8'))
+      : input instanceof Uint8Array
+        ? input
+        : new Uint8Array(0);
+  const bitLength = bytes.length * 8;
+  const paddedLength = (((bytes.length + 8) >> 6) + 1) << 6;
+  const padded = new Uint8Array(paddedLength);
+  padded.set(bytes);
+  padded[bytes.length] = 0x80;
+  const view = new DataView(padded.buffer, padded.byteOffset, padded.byteLength);
+  view.setUint32(paddedLength - 8, Math.floor(bitLength / 0x100000000), false);
+  view.setUint32(paddedLength - 4, bitLength % 0x100000000, false);
+  const state = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+  ];
+  const schedule = new Uint32Array(64);
+  for (let offset = 0; offset < paddedLength; offset += 64) {
+    for (let index = 0; index < 16; index += 1) {
+      schedule[index] = view.getUint32(offset + index * 4, false);
+    }
+    for (let index = 16; index < 64; index += 1) {
+      const w15 = schedule[index - 15];
+      const w2 = schedule[index - 2];
+      const s0 = (rotateRight(w15, 7) ^ rotateRight(w15, 18) ^ (w15 >>> 3)) >>> 0;
+      const s1 = (rotateRight(w2, 17) ^ rotateRight(w2, 19) ^ (w2 >>> 10)) >>> 0;
+      schedule[index] = (schedule[index - 16] + s0 + schedule[index - 7] + s1) >>> 0;
+    }
+    let [a, b, c, d, e, f, g, h] = state;
+    for (let index = 0; index < 64; index += 1) {
+      const sigma1 = (rotateRight(e, 6) ^ rotateRight(e, 11) ^ rotateRight(e, 25)) >>> 0;
+      const choose = ((e & f) ^ (~e & g)) >>> 0;
+      const temp1 = (h + sigma1 + choose + SHA256_K[index] + schedule[index]) >>> 0;
+      const sigma0 = (rotateRight(a, 2) ^ rotateRight(a, 13) ^ rotateRight(a, 22)) >>> 0;
+      const majority = ((a & b) ^ (a & c) ^ (b & c)) >>> 0;
+      const temp2 = (sigma0 + majority) >>> 0;
+      h = g;
+      g = f;
+      f = e;
+      e = (d + temp1) >>> 0;
+      d = c;
+      c = b;
+      b = a;
+      a = (temp1 + temp2) >>> 0;
+    }
+    state[0] = (state[0] + a) >>> 0;
+    state[1] = (state[1] + b) >>> 0;
+    state[2] = (state[2] + c) >>> 0;
+    state[3] = (state[3] + d) >>> 0;
+    state[4] = (state[4] + e) >>> 0;
+    state[5] = (state[5] + f) >>> 0;
+    state[6] = (state[6] + g) >>> 0;
+    state[7] = (state[7] + h) >>> 0;
+  }
+  return state.map((value) => value.toString(16).padStart(8, '0')).join('');
+}
+
+/* ------------------------------------------------------------------ *
+ * 外部审计模式（--audit-root / --audit-commit）：仓库外固定 commit 检出的只读前置核验
+ *
+ * 目的：打破「证据要先有门禁 admitted、门禁又要先有证据」的循环——先在**仓库之外**的隔离检出目录里
+ * 对固定 commit 生成真实证据（许可证/NOTICE、SBOM、漏洞扫描、PostgreSQL 兼容性），再把「证据文件」
+ * 回填到 services/ruoyi-api/compliance/provenance/ 下，由 check-provenance.mjs 判定；只有真实外部
+ * 审计产物就位后，才谈得上仓库内的准入门禁（stage=admitted）。
+ *
+ * 本模式**只做只读前置核验**，逐条对应契约：
+ *   1. 路径与隔离：审计根必须绝对、无引号/控制字符、无 `..` 段、不是文件系统根；其 realpath 必须
+ *      **完全位于仓库边界根目录（services/ruoyi-api）之外**——拒绝边界根本身与边界内任意子路径、
+ *      仓库工作树内任意路径、仓库的上级目录与文件系统根；realpath 经符号链接/联接逃逸回仓库同样被拦；
+ *   2. 固定提交：`--audit-commit` 必须是 40 位小写十六进制 SHA（短 SHA、分支名、占位词一律拒绝）；
+ *   3. 检出：`<审计根>/.git` 必须存在，`git rev-parse --is-inside-work-tree` 必须严格输出 `true`；
+ *   4. 外部事实：`git rev-parse HEAD` 必须**完全等于**固定 commit；`git status --porcelain` 必须没有
+ *      任何条目（工作树干净：已跟踪改动与未跟踪文件都不算干净，生成物必须写到检出目录之外）；
+ *   5. 输入与摘要：`git cat-file -e HEAD:pom.xml` 必须成功；可选读取 `git show HEAD:pom.xml` 的内存
+ *      摘要（字节数、行数、artifactId、java.version、spring-boot.version 与内容 SHA-256），用于与
+ *      可选的 `--audit-pom-sha256` 比对——**不复制、不落盘任何文件**。
+ *
+ * 本模式**不**做的事（与默认的能力探测刻意区分）：
+ *   - 不要求仓库内 gate admitted，也**不读**、不改 gate-manifest.json：仓库内的 gate stage 不可能
+ *     改变本判定（stage=admitted 也不会让本模式变成 ready）；
+ *   - 不创建、不复制、不移动任何源码或证据文件（既不写仓库，也不写审计目录）；
+ *   - 不联网、不安装、不下载依赖，也不执行任何构建目标；
+ *   - 不生成、不预填、不伪造证据，不推进 provenance 清单的任何状态。
+ * 判定只有两个 verdict 取值：`external-audit-ready`（退出码 0）与 `blocked`（退出码 1 违规 / 2 前置
+ * 未满足）；报告里 `admitted` 与 `verified` **恒为 false**，且不出现「准入通过」「已核验」这类字样。
+ *
+ * Git 只读保证：所有 git 调用都带 `-C <审计根>` 与 `GIT_OPTIONAL_LOCKS=0`，因此 git 不会去抢
+ * 索引锁、不会刷新或写回 .git/index；`--porcelain` 只读工作树状态。本模式也不执行任何写命令。
+ * ------------------------------------------------------------------ */
+
+/** 固定 commit：只接受 40 位小写十六进制（与 gate-manifest.json 的 commitFormat 同口径）。 */
+const AUDIT_COMMIT_PATTERN = /^[0-9a-f]{40}$/;
+const AUDIT_SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const AUDIT_ROOT_POM = 'pom.xml';
+/** porcelain v1 的真实条目形状（`XY <路径>`）；git 打到 stderr 的告警行不匹配，因而不会被误当变更。 */
+const AUDIT_PORCELAIN_ENTRY = /^[ MADRCU?!]{2} /;
+
+/**
+ * 外部审计模式的 verdict **只有两个取值**（契约要求）：`external-audit-ready` 与 `blocked`。
+ * 隔离被破坏（审计根落在仓库边界根目录内、realpath 经符号链接/联接逃逸回仓库）或外部事实与固定
+ * commit 矛盾（HEAD 不一致、工作树不干净）都归入 `blocked`：它们只作为诊断明细保留在 `violations`
+ * 里，**绝不**产生第三个 verdict 取值。退出码仍分别报告 1（违规）与 2（前置未满足）以便定位原因。
+ */
+const AUDIT_VERDICT = {
+  ready: 'external-audit-ready',
+  blocked: 'blocked',
+  blockedByViolation: 'blocked',
+};
+
+function realpathOrNull(target) {
+  try {
+    return realpathSync(target);
+  } catch {
+    return null;
+  }
+}
+
+function lstatOrMissing(target) {
+  try {
+    const info = lstatSync(target);
+    return {
+      exists: true,
+      isSymbolicLink: info.isSymbolicLink(),
+      isDirectory: info.isDirectory(),
+      isFile: info.isFile(),
+    };
+  } catch {
+    return { exists: false, isSymbolicLink: false, isDirectory: false, isFile: false };
+  }
+}
+
+/** 严格取一条 40 位小写 SHA：输出必须**整段就是**它（不做「在文本里任意搜 SHA」的宽松匹配）。 */
+function strictSha(text) {
+  const value = String(text ?? '')
+    .replace(/\r/g, '')
+    .trim();
+  return AUDIT_COMMIT_PATTERN.test(value) ? value : null;
+}
+
+/**
+ * 严格解析 `git status --porcelain`（fail-closed）：返回 `{ entries }`。
+ * 输出里只要出现**非 porcelain 条目**的行（git 告警、诊断文本、进度信息），或本次探测本身失败，
+ * 一律返回 `null`，由调用方按「工作树状态不可读」处理——绝不在不可信文本里挑几行当作「干净」。
+ */
+function strictPorcelain(text, ok) {
+  if (ok !== true) return null;
+  const lines = String(text ?? '')
+    .split(/\r?\n/)
+    .filter((line) => line !== '');
+  if (lines.some((line) => !AUDIT_PORCELAIN_ENTRY.test(line))) return null;
+  return { entries: lines };
+}
+
+/**
+ * 从 `git show HEAD:pom.xml` 的**内存文本**取摘要：只记录统计量与声明值，**不落盘、不复制任何文件**。
+ * `contentCopied` 恒为 false，作为「本模式没有把上游文件写进仓库或输出目录」的机器可读标记。
+ */
+function summarizePomText(text) {
+  const source = typeof text === 'string' ? text : '';
+  const pick = (pattern) => {
+    const match = pattern.exec(source);
+    return match === null ? null : match[1].trim().slice(0, 64);
+  };
+  return {
+    bytes: Buffer.byteLength(source, 'utf8'),
+    lines: source === '' ? 0 : source.split(/\r?\n/).length,
+    artifactId: pick(/<artifactId>\s*([^<]{1,64})\s*<\/artifactId>/),
+    javaVersion: pick(/<java\.version>\s*([^<]{1,64})\s*<\/java\.version>/),
+    springBootVersion: pick(/<spring-boot\.version>\s*([^<]{1,64})\s*<\/spring-boot\.version>/),
+    contentCopied: false,
+  };
+}
+/** 路径比较基线：Windows 上大小写不敏感（同一目录不得因大小写被判成两个位置）。 */
+function comparablePath(target, platform = process.platform) {
+  const value = resolve(String(target ?? ''));
+  return platform === 'win32' ? value.toLowerCase() : value;
+}
+
+/** child 是否等于 parent 或位于 parent 之下；两者都必须已经过 realpath 解析。 */
+function pathIsInside(child, parent, platform = process.platform) {
+  if (typeof child !== 'string' || child === '' || typeof parent !== 'string' || parent === '') {
+    return false;
+  }
+  const inner = comparablePath(child, platform);
+  const outer = comparablePath(parent, platform);
+  if (inner === outer) return true;
+  const diff = relative(outer, inner);
+  return diff !== '' && !diff.startsWith('..') && !isAbsolute(diff);
+}
+
+/** 是否是文件系统根（驱动器根 / POSIX 根）：dirname(x) === x。 */
+function isFileSystemRoot(target) {
+  const value = resolve(String(target ?? ''));
+  return value !== '' && dirname(value) === value;
+}
+
+/** 路径里是否含 `..` 段（拒绝随工作目录漂移的写法）。 */
+function hasParentSegment(target) {
+  return String(target ?? '')
+    .split(/[\\/]+/)
+    .includes('..');
+}
+
+/**
+ * 隔离判定（纯函数）：审计根的 realpath 必须真实位于**仓库边界根目录（services/ruoyi-api）之外**，
+ * 且不能是仓库的上级目录。规则按「最贴近的边界」排序，先判边界再判仓库：
+ *   1. 解析到文件系统根 → 违规（整盘/POSIX 根不是隔离审计目录）；
+ *   2. 就是边界根目录本身 → 违规（拒绝把边界目录当作外部审计目录）；
+ *   3. 位于边界根目录之内（任意子路径）→ 违规；
+ *   4. 位于仓库工作树内（边界之外但在仓库内）→ 违规（外部审计必须在仓库之外隔离进行）；
+ *   5. 是仓库的上级目录 → 违规（`git -C <上级目录>` 会沿父目录找到仓库自身的 .git，隔离不可靠）。
+ *
+ * 由于符号链接/联接已由调用方用 realpathSync 解析，**符号链接逃逸回仓库**会在这里按真实路径被拦下，
+ * 与「给定路径看起来在仓库外」无关。`boundaryReal` 缺省回落到 `repoReal`（旧调用点语义不变）；
+ * realpath 不可得时返回空数组，由调用方另行按「被阻断」fail-closed 处理。
+ */
+function auditIsolationViolations(
+  rootReal,
+  repoReal,
+  boundaryReal = null,
+  platform = process.platform,
+) {
+  const violations = [];
+  if (typeof rootReal !== 'string' || rootReal === '') return violations;
+  const boundary =
+    typeof boundaryReal === 'string' && boundaryReal !== '' ? boundaryReal : repoReal;
+  if (isFileSystemRoot(rootReal)) {
+    violations.push(`审计根解析到文件系统根 ${rootReal}：拒绝以整盘/POSIX 根作为隔离审计目录`);
+    return violations;
+  }
+  if (comparablePath(rootReal, platform) === comparablePath(boundary, platform)) {
+    violations.push(
+      `审计根 ${rootReal} 就是仓库边界根目录本身：拒绝把边界目录当作外部审计目录，也拒绝在边界内生成证据`,
+    );
+    return violations;
+  }
+  if (pathIsInside(rootReal, boundary, platform)) {
+    violations.push(
+      `审计根 ${rootReal} 位于仓库边界根目录 ${boundary} 内：外部审计必须在边界之外隔离进行，仓库内不得生成证据`,
+    );
+    return violations;
+  }
+  if (pathIsInside(rootReal, repoReal, platform)) {
+    violations.push(
+      `审计根 ${rootReal} 位于仓库 ${repoReal} 内：外部审计必须在仓库之外隔离进行，仓库内不得生成证据`,
+    );
+  } else if (pathIsInside(repoReal, rootReal, platform)) {
+    violations.push(
+      `审计根 ${rootReal} 是仓库 ${repoReal} 的上级目录：git -C 会沿父目录找到仓库自身的 .git，隔离不可靠`,
+    );
+  }
+  return violations;
+}
+
+/**
+ * 外部审计前置判定（纯函数：不读磁盘、不执行命令；磁盘与 Git 事实由 collectAuditFacts 或自检注入）。
+ *
+ * 判定顺序与语义（与 `--audit-root` / `--audit-commit` 契约逐条对应）：
+ *   1. 路径与隔离：审计根的 realpath 必须真实位于**仓库边界根目录之外**——拒绝边界根本身、边界内任意
+ *      子路径、仓库工作树内任意路径、仓库的上级目录与文件系统根；realpath 与给定路径不一致时按解析后的
+ *      真实路径判定，因此**符号链接/联接逃逸回仓库**同样会被拦下；
+ *   2. 固定提交：`--audit-commit` 必须是 40 位小写十六进制 SHA（短 SHA、分支名、占位词一律拒绝）；
+ *   3. 检出：`<审计根>/.git` 必须存在，且 `git rev-parse --is-inside-work-tree` 必须严格输出 `true`；
+ *   4. 外部事实：`git rev-parse HEAD` 必须**完全等于**固定 commit；`git status --porcelain` 必须没有任何
+ *      条目（工作树干净：已跟踪改动与未跟踪文件都不允许，生成物必须写到检出目录之外）；
+ *   5. 输入：`git cat-file -e HEAD:pom.xml` 必须成功（固定 commit 的根 pom 存在）；可选读取
+ *      `git show HEAD:pom.xml` 的**内存摘要**（字节数、行数、artifactId、java.version、
+ *      spring-boot.version 与内容 SHA-256），用于与可选的 `--audit-pom-sha256` 比对——**不复制文件**。
+ *
+ * verdict 只有两个取值（契约要求）：
+ *   - `external-audit-ready`（退出码 0）：以上全部成立；
+ *   - `blocked`（退出码 1 违规 / 2 前置未满足）：任一不成立。
+ * `admitted` 与 `verified` **恒为 false**：本模式不读取 `gate-manifest.json`，仓库内的 gate stage 不可能
+ * 改变本判定（stage=admitted 也不会让本模式变成 ready）。
+ */
+function evaluateAudit(input) {
+  const platform = typeof input?.platform === 'string' ? input.platform : process.platform;
+  const auditRoot = typeof input?.auditRoot === 'string' ? input.auditRoot : '';
+  const auditCommit = typeof input?.auditCommit === 'string' ? input.auditCommit : '';
+  const declaredSha256 =
+    typeof input?.auditPomSha256 === 'string' && input.auditPomSha256 !== ''
+      ? input.auditPomSha256
+      : null;
+  const realpath = typeof input?.realpath === 'function' ? input.realpath : realpathOrNull;
+  const statPath = typeof input?.statPath === 'function' ? input.statPath : lstatOrMissing;
+  const git = isPlainObject(input?.git) ? input.git : {};
+  const repoReal =
+    typeof input?.repoReal === 'string' && input.repoReal !== ''
+      ? input.repoReal
+      : (realpathOrNull(REPO_ROOT) ?? REPO_ROOT);
+  const boundaryReal =
+    typeof input?.boundaryReal === 'string' && input.boundaryReal !== ''
+      ? input.boundaryReal
+      : (realpathOrNull(BOUNDARY_ROOT) ?? BOUNDARY_ROOT);
+
+  const blocked = [];
+  const report = {
+    mode: 'external-audit',
+    audit: {
+      root: auditRoot,
+      rootRealPath: null,
+      rootSymlinked: false,
+      repoRealPath: repoReal,
+      boundaryRealPath: boundaryReal,
+      commit: auditCommit,
+      declaredPomSha256: declaredSha256,
+      gitDir: { path: join(auditRoot, '.git'), present: false, isDirectory: false, isFile: false },
+      git: {},
+      pom: {},
+    },
+    statements: {
+      admitted: false,
+      verified: false,
+      evidenceGenerated: false,
+      inRepoGateEvaluated: false,
+      gateStageConsulted: false,
+      note: '本模式只报告「外部审计前置可执行（external-audit-ready）」：不要求也不声称仓库内 gate admitted，不声称 verified，不生成、不复制、不下载任何证据或源码；仓库内 gate-manifest.json 的 stage 不参与本判定。',
+    },
+    preconditions: [],
+    violations: [],
+    blocked: [],
+    nextSteps: [],
+  };
+
+  // 1) 固定 commit 形状（preflight 已拦一次；这里再 fail-closed 拦一次，防绕过）
+  const commitOk = AUDIT_COMMIT_PATTERN.test(auditCommit);
+  if (!commitOk) {
+    report.violations.push(
+      `固定 commit 必须是 40 位小写十六进制 SHA（当前 ${formatValue(auditCommit)}）：不接受短 SHA、分支名或占位词`,
+    );
+  }
+  let declaredSha256Ok = true;
+  if (declaredSha256 !== null && !AUDIT_SHA256_PATTERN.test(declaredSha256)) {
+    declaredSha256Ok = false;
+    report.violations.push(
+      `声明的根 pom 内容摘要必须是 64 位小写十六进制 SHA-256（当前 ${formatValue(declaredSha256)}）`,
+    );
+  }
+
+  // 2) 隔离：realpath 的真实位置必须在仓库边界之外，且不能是仓库的上级目录
+  const rootReal =
+    typeof input?.rootReal === 'string' && input.rootReal !== ''
+      ? input.rootReal
+      : realpath(auditRoot);
+  const rootStat = statPath(auditRoot);
+  const rootDirectoryOk = rootStat.exists === true && rootStat.isDirectory === true;
+  report.audit.rootRealPath = rootReal;
+  report.audit.rootSymlinked =
+    rootReal !== null && comparablePath(rootReal, platform) !== comparablePath(auditRoot, platform);
+  const isolationViolations = auditIsolationViolations(rootReal, repoReal, boundaryReal, platform);
+  report.violations.push(...isolationViolations);
+  if (rootReal === null) {
+    blocked.push(`审计根无法解析真实路径（realpathSync 失败）：${auditRoot}`);
+  } else if (!rootDirectoryOk) {
+    blocked.push(`审计根不是可读目录：${auditRoot}`);
+  }
+
+  // 3) 审计根必须是 Git 工作树检出：<审计根>/.git 必须存在（目录，或 worktree/submodule 的 .git 文件）
+  const gitDirPath = join(auditRoot, '.git');
+  const gitDirStat = statPath(gitDirPath);
+  const gitDirPresent =
+    gitDirStat.exists === true && (gitDirStat.isDirectory === true || gitDirStat.isFile === true);
+  report.audit.gitDir = {
+    path: gitDirPath,
+    present: gitDirPresent,
+    isDirectory: gitDirStat.isDirectory === true,
+    isFile: gitDirStat.isFile === true,
+  };
+  if (!gitDirPresent) {
+    blocked.push(
+      `审计根下缺少 ${gitDirPath}：外部审计根必须是一个 Git 工作树检出（缺少 .git 无法把证据归属到固定 commit）`,
+    );
+  }
+
+  // 4) 外部 Git 事实：HEAD 完全相等、工作树干净、固定 commit 的根 pom 存在
+  const insideWorkTree = git.insideWorkTree === true;
+  const gitHead = typeof git.head === 'string' && git.head !== '' ? git.head : null;
+  const statusEntries = Array.isArray(git.statusEntries) ? git.statusEntries : null;
+  const headMatches = gitHead !== null && gitHead === auditCommit;
+  const worktreeClean = statusEntries !== null && statusEntries.length === 0;
+  const pomAtHead = git.pomAtHead === true;
+  const pomContentSha256 = typeof git.pomContentSha256 === 'string' ? git.pomContentSha256 : null;
+  const pomSummary = isPlainObject(git.pomSummary) ? git.pomSummary : null;
+  let digestMatches = null;
+  if (declaredSha256 !== null && declaredSha256Ok && pomContentSha256 !== null) {
+    digestMatches = declaredSha256 === pomContentSha256;
+    if (!digestMatches) {
+      report.violations.push(
+        `固定 commit 根 ${AUDIT_ROOT_POM} 的内容摘要与声明值不一致：声明 ${declaredSha256}，实际 ${pomContentSha256}`,
+      );
+    }
+  }
+  if (git.skipped === true) {
+    blocked.push(`未执行外部 Git 核验：${git.skippedReason ?? '隔离判定未通过'}`);
+  } else if (git.available !== true) {
+    blocked.push(`外部 Git 核验不可用：${git.error ?? '未找到 git 或目标目录不是 Git 仓库'}`);
+  } else {
+    if (!insideWorkTree) {
+      blocked.push(
+        `外部目录未被 git 认定为工作树：git rev-parse --is-inside-work-tree 未严格输出 true（输出 ${formatValue(git.insideWorkTreeRaw ?? null)}）`,
+      );
+    }
+    if (gitHead === null) {
+      blocked.push(
+        `无法读取外部 HEAD：${git.headError ?? 'git rev-parse HEAD 未给出严格的 40 位小写 SHA'}`,
+      );
+    } else if (!headMatches) {
+      report.violations.push(
+        `外部 HEAD（${gitHead}）与固定 commit（${auditCommit}）不一致：该目录不是这个提交的检出`,
+      );
+    }
+    if (statusEntries === null) {
+      blocked.push(
+        `无法严格解析工作树状态：${git.statusError ?? 'git status --porcelain 输出不可用或含非 porcelain 行'}`,
+      );
+    } else if (statusEntries.length > 0) {
+      const shown = statusEntries.slice(0, 3).join(' / ');
+      report.violations.push(
+        `工作树不干净：${statusEntries.length} 个条目相对该提交发生变化（${shown}${statusEntries.length > 3 ? ' …' : ''}），证据无法归属到 ${auditCommit}；请把生成物写到检出目录之外`,
+      );
+    }
+    if (git.pomAtHeadError) {
+      blocked.push(`无法判定固定 commit 的根 ${AUDIT_ROOT_POM} 是否存在：${git.pomAtHeadError}`);
+    } else if (!pomAtHead) {
+      blocked.push(
+        `固定 commit ${auditCommit} 的根 ${AUDIT_ROOT_POM} 不存在（git cat-file -e HEAD:${AUDIT_ROOT_POM} 非 0 退出）：没有可生成 SBOM/依赖许可证清单的输入`,
+      );
+    }
+  }
+
+  report.audit.git = {
+    available: git.available === true,
+    skipped: git.skipped === true,
+    insideWorkTree,
+    insideWorkTreeRaw: typeof git.insideWorkTreeRaw === 'string' ? git.insideWorkTreeRaw : null,
+    head: gitHead,
+    headMatches,
+    statusReadable: statusEntries !== null,
+    statusEntries: statusEntries === null ? null : statusEntries.length,
+    pomAtHead,
+    pomContentSha256,
+    pomSummary,
+  };
+  report.audit.pom = {
+    path: `HEAD:${AUDIT_ROOT_POM}`,
+    presentAtHead: pomAtHead,
+    contentSha256: pomContentSha256,
+    summary: pomSummary,
+    declaredSha256,
+    declaredSha256Matches: digestMatches,
+  };
+
+  report.preconditions = [
+    precondition(
+      'audit-root-isolated',
+      '审计根真实位于仓库边界根目录（services/ruoyi-api）之外，且不是仓库的上级目录或文件系统根',
+      rootReal !== null && isolationViolations.length === 0 && rootDirectoryOk,
+      [
+        `realpath=${rootReal ?? 'null'}`,
+        `boundary=${boundaryReal}`,
+        `repo=${repoReal}`,
+        report.audit.rootSymlinked
+          ? '给定路径是符号链接/联接，已按解析后的真实路径判定'
+          : '给定路径即真实路径',
+        rootDirectoryOk ? '目录可读' : `不是可读目录（${auditRoot}）`,
+      ].join('；'),
+    ),
+    precondition(
+      'audit-commit-format',
+      '固定 commit 是 40 位小写十六进制 SHA',
+      commitOk,
+      commitOk ? auditCommit : `非法取值 ${formatValue(auditCommit)}`,
+    ),
+    precondition(
+      'audit-git-dir',
+      '审计根下存在 .git（Git 工作树检出）',
+      gitDirPresent,
+      gitDirPresent ? `${gitDirPath} 存在` : `${gitDirPath} 不存在`,
+    ),
+    precondition(
+      'audit-worktree-inside',
+      'git rev-parse --is-inside-work-tree 严格输出 true',
+      insideWorkTree,
+      insideWorkTree
+        ? 'true'
+        : `不是 true（输出 ${formatValue(git.insideWorkTreeRaw ?? null)}）`,
+    ),
+    precondition(
+      'audit-git-head',
+      '外部 git rev-parse HEAD 完全等于固定 commit',
+      headMatches,
+      gitHead === null
+        ? '未取得外部 HEAD（见阻断项）'
+        : headMatches
+          ? `${gitHead}`
+          : `HEAD=${gitHead}，固定 commit=${auditCommit}`,
+    ),
+    precondition(
+      'audit-worktree-clean',
+      '工作树干净（git status --porcelain 无任何条目：已跟踪改动与未跟踪文件都不允许）',
+      worktreeClean,
+      statusEntries === null
+        ? '未取得工作树状态（见阻断项）'
+        : statusEntries.length === 0
+          ? '条目 0 个'
+          : `条目 ${statusEntries.length} 个：${statusEntries.slice(0, 3).join(' / ')}`,
+    ),
+    precondition(
+      'audit-head-pom',
+      `固定 commit 的根 ${AUDIT_ROOT_POM} 存在（git cat-file -e HEAD:${AUDIT_ROOT_POM}）`,
+      pomAtHead,
+      pomAtHead
+        ? `HEAD:${AUDIT_ROOT_POM} 存在${
+            pomSummary === null ? '（未取摘要）' : `（${pomSummary.bytes} 字节、${pomSummary.lines} 行）`
+          }`
+        : `HEAD:${AUDIT_ROOT_POM} 不存在或探测失败`,
+    ),
+    precondition(
+      'audit-input-digest',
+      `可选的根 pom 内容摘要比对（git show HEAD:${AUDIT_ROOT_POM} 的内存摘要，不复制文件）`,
+      declaredSha256 === null ? true : declaredSha256Ok && digestMatches === true,
+      declaredSha256 === null
+        ? `未声明 --audit-pom-sha256（只记录实际内容摘要 sha256=${pomContentSha256 ?? 'null'}）`
+        : digestMatches === null
+          ? `声明值形状非法或实际摘要不可得（实际 ${pomContentSha256 ?? 'null'}）`
+          : digestMatches
+            ? '与声明值一致'
+            : '与声明值不一致',
+    ),
+  ];
+  const unmet = report.preconditions.filter((item) => item.ok !== true);
+  const ready = report.violations.length === 0 && unmet.length === 0;
+
+  // 违规优先：出现违规时不再重复罗列阻断项（前置明细仍完整保留在 preconditions 里）
+  report.blocked = report.violations.length === 0 ? blocked : [];
+  report.summary = {
+    mode: 'external-audit',
+    verdict: ready ? AUDIT_VERDICT.ready : AUDIT_VERDICT.blocked,
+    ready,
+    executable: ready,
+    blockedBy: ready
+      ? null
+      : report.violations.length > 0
+        ? AUDIT_VERDICT.blockedByViolation
+        : 'precondition-unmet',
+    admitted: false,
+    verified: false,
+    evidenceGenerated: false,
+    gateStageConsulted: false,
+    commit: auditCommit,
+    root: auditRoot,
+    rootRealPath: rootReal,
+    boundaryRealPath: boundaryReal,
+    gitDirPresent,
+    insideWorkTree,
+    head: gitHead,
+    headMatches,
+    worktreeClean,
+    statusEntries: statusEntries === null ? null : statusEntries.length,
+    pomAtHead,
+    pomContentSha256,
+    preconditions: report.preconditions.length,
+    met: report.preconditions.length - unmet.length,
+  };
+  // 顶层直接给出契约要求的三个字段（JSON 与 text 输出都可直接核对）
+  report.verdict = report.summary.verdict;
+  report.admitted = false;
+  report.verified = false;
+  report.gateStageConsulted = false;
+  report.nextSteps = [
+    `在隔离检出目录**之外**准备输出目录（例如 ${auditRoot} 的同级 output/ 目录）：审计检出必须保持工作树干净，生成物不得写进检出目录`,
+    `在该输出目录内用已锁定的 Maven 与本地工具对 ${auditRoot} 的固定 commit 生成真实证据：SBOM、漏洞扫描、依赖许可证清单、PostgreSQL 兼容性记录`,
+    '证据回填前统一路径：SBOM → services/ruoyi-api/compliance/provenance/sbom.cyclonedx.json；漏洞扫描 → services/ruoyi-api/compliance/provenance/vulnerability-scan.md；PostgreSQL → services/ruoyi-api/compliance/provenance/postgresql-compatibility.md；许可证/NOTICE → services/ruoyi-api/compliance/provenance/license-notice.md；候选来源 → services/ruoyi-api/compliance/provenance/candidate-commit-tag.md',
+    '回填时逐项给出 fileSha256 与内容标记，再由 check-provenance.mjs 判定；本模式不生成证据、不推进任何证据状态，也不改变 gate-manifest.json 的 stage',
+  ];
+  report.exitCode =
+    report.violations.length > 0 ? EXIT.VIOLATION : ready ? EXIT.READY : EXIT.BLOCKED;
+  return report;
+}
+
+/** 只读执行 git（不经 shell；带 -C 与 GIT_OPTIONAL_LOCKS=0，git 不会写 .git/index）。 */
+function captureGit(auditRoot, args, located) {
+  return captureOutput(located, ['-C', auditRoot, ...args], {
+    ...process.env,
+    GIT_OPTIONAL_LOCKS: '0',
+  });
+}
+
+/**
+ * 采集外部审计目录的 Git 事实。**只读**，每条探测都走 captureOutput（15 秒超时、拒绝含引号/控制字符
+ * 的路径、不经 shell 拼接），失败一律 fail-closed 记为不可用或不可读。固定执行四条只读命令：
+ *   1. `git rev-parse --is-inside-work-tree` —— 必须严格输出 `true`；
+ *   2. `git rev-parse HEAD`                  —— 必须严格输出 40 位小写 SHA；
+ *   3. `git status --porcelain`              —— 只接受 porcelain 条目行，出现其它文本即判不可读；
+ *   4. `git cat-file -e HEAD:pom.xml`        —— 退出码 0 才算固定 commit 的根 pom 存在。
+ * 另加两条**可选**只读命令，仅用于摘要（不复制任何文件）：
+ *   5. `git rev-parse HEAD:pom.xml`          —— blob SHA-1；
+ *   6. `git show HEAD:pom.xml`               —— 仅在内存中取字节数/行数/声明值与内容 SHA-256。
+ */
+function collectAuditGit(auditRoot, located) {
+  const base = {
+    available: false,
+    error: null,
+    skipped: false,
+    skippedReason: null,
+    insideWorkTree: false,
+    insideWorkTreeRaw: null,
+    head: null,
+    headError: null,
+    statusEntries: null,
+    statusError: null,
+    pomAtHead: false,
+    pomAtHeadError: null,
+    pomBlobSha1: null,
+    pomContentSha256: null,
+    pomSummary: null,
+  };
+  if (located === null) {
+    return { ...base, error: 'PATH 上未找到 git 可执行文件' };
+  }
+
+  const insideRun = captureGit(auditRoot, ['rev-parse', '--is-inside-work-tree'], located);
+  const insideRaw = insideRun.ok
+    ? String(insideRun.text ?? '')
+        .replace(/\r/g, '')
+        .trim()
+    : null;
+  if (!insideRun.ok || insideRaw !== 'true') {
+    return {
+      ...base,
+      available: true,
+      insideWorkTree: false,
+      insideWorkTreeRaw: insideRaw,
+      error: `git rev-parse --is-inside-work-tree 未严格输出 true（${
+        insideRun.ok
+          ? `输出 ${formatValue(insideRaw)}，退出码 ${insideRun.status}`
+          : insideRun.reason
+      }）`,
+    };
+  }
+
+  const headRun = captureGit(auditRoot, ['rev-parse', 'HEAD'], located);
+  const head = headRun.ok && headRun.status === 0 ? strictSha(headRun.text) : null;
+  const headError =
+    head === null
+      ? `git rev-parse HEAD 未给出严格的 40 位小写 SHA（${
+          headRun.ok
+            ? `退出码 ${headRun.status}，输出 ${formatValue(firstLine(headRun.text))}`
+            : headRun.reason
+        }）`
+      : null;
+
+  const statusRun = captureGit(auditRoot, ['status', '--porcelain'], located);
+  const porcelain = strictPorcelain(statusRun.text, statusRun.ok && statusRun.status === 0);
+  const statusError =
+    porcelain === null
+      ? `git status --porcelain 输出不可用或含非 porcelain 行（${
+          statusRun.ok
+            ? `退出码 ${statusRun.status}，输出 ${formatValue(firstLine(statusRun.text))}`
+            : statusRun.reason
+        }）`
+      : null;
+
+  const catRun = captureGit(auditRoot, ['cat-file', '-e', `HEAD:${AUDIT_ROOT_POM}`], located);
+  const pomAtHead = catRun.ok === true && catRun.status === 0;
+  const pomAtHeadError =
+    catRun.ok === true
+      ? null
+      : `git cat-file -e HEAD:${AUDIT_ROOT_POM} 未能执行（${catRun.reason}）`;
+
+  let pomBlobSha1 = null;
+  let pomContentSha256 = null;
+  let pomSummary = null;
+  if (pomAtHead) {
+    const blobRun = captureGit(auditRoot, ['rev-parse', `HEAD:${AUDIT_ROOT_POM}`], located);
+    if (blobRun.ok && blobRun.status === 0) pomBlobSha1 = strictSha(blobRun.text);
+    const showRun = captureGit(auditRoot, ['show', `HEAD:${AUDIT_ROOT_POM}`], located);
+    if (showRun.ok && showRun.status === 0) {
+      const text = String(showRun.text ?? '');
+      pomContentSha256 = sha256Hex(text);
+      pomSummary = summarizePomText(text);
+    }
+  }
+
+  return {
+    ...base,
+    available: true,
+    insideWorkTree: true,
+    insideWorkTreeRaw: insideRaw,
+    head,
+    headError,
+    statusEntries: porcelain === null ? null : porcelain.entries,
+    statusError,
+    pomAtHead,
+    pomAtHeadError,
+    pomBlobSha1,
+    pomContentSha256,
+    pomSummary,
+  };
+}
+
+/**
+ * 采集外部审计目录的磁盘事实。**先判隔离再执行任何 git**：realpath 失败、隔离不通过或缺少 `.git` 时
+ * 都不执行 git，避免 `git -C` 沿父目录误触仓库自身的 .git（也避免对非检出目录白跑 6 条探测）。
+ */
+function collectAuditFacts(prepared) {
+  const auditRoot = prepared.auditRoot;
+  const repoReal = realpathOrNull(REPO_ROOT) ?? resolve(REPO_ROOT);
+  const boundaryReal = realpathOrNull(BOUNDARY_ROOT) ?? resolve(BOUNDARY_ROOT);
+  const rootReal = realpathOrNull(auditRoot);
+  if (rootReal === null) {
+    return {
+      repoReal,
+      boundaryReal,
+      rootReal: null,
+      git: { skipped: true, skippedReason: '审计根无法解析真实路径（realpathSync 失败）' },
+    };
+  }
+  const isolation = auditIsolationViolations(rootReal, repoReal, boundaryReal, process.platform);
+  if (isolation.length > 0) {
+    return {
+      repoReal,
+      boundaryReal,
+      rootReal,
+      git: {
+        skipped: true,
+        skippedReason: '隔离判定未通过，未执行任何 git 命令（避免误触仓库或父目录的 .git）',
+      },
+    };
+  }
+  const gitDir = join(auditRoot, '.git');
+  if (lstatOrMissing(gitDir).exists !== true) {
+    return {
+      repoReal,
+      boundaryReal,
+      rootReal,
+      git: { skipped: true, skippedReason: `审计根下缺少 ${gitDir}：未执行任何 git 命令` },
+    };
+  }
+  return { repoReal, boundaryReal, rootReal, git: collectAuditGit(auditRoot, findOnPath('git')) };
+}
+
+function renderAuditText(report, context) {
+  const audit = report.audit;
+  const lines = [];
+  lines.push('RuoYi 外部审计检查（--audit-root / --audit-commit；只读、不生成证据、不复制文件）');
+  lines.push('- 模式: external-audit（verdict 只有两个取值：external-audit-ready / blocked）');
+  lines.push(`- 审计根目录: ${audit.root}`);
+  lines.push(
+    `- 审计根真实路径: ${audit.rootRealPath ?? 'null'}${audit.rootSymlinked ? '（给定路径是符号链接/联接，已按 realpath 判定）' : ''}`,
+  );
+  lines.push(`- 仓库边界根目录: ${audit.boundaryRealPath}`);
+  lines.push(`- 仓库真实路径: ${audit.repoRealPath}`);
+  lines.push(`- 固定 commit: ${audit.commit}`);
+  lines.push(
+    `- .git: ${audit.gitDir.present ? `${audit.gitDir.path} 存在` : `${audit.gitDir.path} 不存在`}`,
+  );
+  lines.push(
+    `- git rev-parse --is-inside-work-tree: ${
+      audit.git.skipped === true
+        ? '未执行（见阻断项）'
+        : audit.git.insideWorkTree
+          ? 'true'
+          : `不是 true（${formatValue(audit.git.insideWorkTreeRaw ?? null)}）`
+    }`,
+  );
+  lines.push(
+    `- 外部 HEAD: ${audit.git.head ?? 'null'}（${audit.git.headMatches ? '与固定 commit 完全一致' : '不一致或未取得'}）`,
+  );
+  lines.push(
+    `- 工作树: ${
+      audit.git.statusEntries === null
+        ? '状态不可读'
+        : audit.git.statusEntries === 0
+          ? '干净（git status --porcelain 无条目）'
+          : `${audit.git.statusEntries} 个条目（已跟踪改动或未跟踪文件都算不干净）`
+    }`,
+  );
+  lines.push(
+    `- 固定 commit 根 ${AUDIT_ROOT_POM}: ${
+      audit.pom.presentAtHead
+        ? `HEAD:${AUDIT_ROOT_POM} 存在`
+        : `HEAD:${AUDIT_ROOT_POM} 不存在或探测失败`
+    }`,
+  );
+  if (audit.pom.summary !== null) {
+    lines.push(
+      `- 根 ${AUDIT_ROOT_POM} 摘要（内存读取，未复制文件）: ${audit.pom.summary.bytes} 字节、${audit.pom.summary.lines} 行、artifactId=${audit.pom.summary.artifactId ?? 'null'}、java.version=${audit.pom.summary.javaVersion ?? 'null'}、spring-boot.version=${audit.pom.summary.springBootVersion ?? 'null'}、sha256=${audit.pom.contentSha256 ?? 'null'}`,
+    );
+  } else {
+    lines.push(`- 根 ${AUDIT_ROOT_POM} 摘要: 未取得（sha256=${audit.pom.contentSha256 ?? 'null'}）`);
+  }
+  lines.push(
+    `- 前置: ${report.summary.met}/${report.summary.preconditions} 满足（verdict=${report.summary.verdict}${
+      report.summary.blockedBy === null ? '' : `，blockedBy=${report.summary.blockedBy}`
+    }）`,
+  );
+  for (const item of report.preconditions) {
+    lines.push(`    ${item.ok ? 'ok ' : 'x  '} ${item.id}: ${item.detail}`);
+  }
+  lines.push(
+    '- 声明: admitted=false、verified=false；本模式不读取 gate-manifest.json，仓库内 stage 不可能改变本判定',
+  );
+  lines.push(
+    '- 声明: 不生成、不预填、不复制、不下载任何证据或源码；审计检出必须保持工作树干净，生成物写到检出目录之外',
+  );
+  lines.push(
+    `- 结论: ${
+      report.summary.ready
+        ? 'external-audit-ready（外部审计前置可执行；不等于 admitted，也不等于 verified）'
+        : `blocked（${report.exitCode === EXIT.VIOLATION ? '违规' : '前置未满足'}）`
+    }（退出码 ${report.exitCode}）`,
+  );
+  lines.push(`- 上下文: 仓库根 ${context.repoRoot}`);
+  return lines.join('\n');
+}
+
+/* ------------------------------------------------------------------ *
  * 能力判定
  * ------------------------------------------------------------------ */
 
@@ -1063,15 +1924,22 @@ function renderText(report, context) {
 function printUsage() {
   console.log(
     [
-      'RuoYi 证据生成能力探测（SBOM / 漏洞扫描 / PostgreSQL 兼容性）',
+      'RuoYi 证据生成能力探测（SBOM / 漏洞扫描 / PostgreSQL）与外部审计前置核验',
       '用法: node check-capability.mjs [--json] [--report] [--self-test] [--help]',
       '      [--java-home <绝对路径>] [--maven-home <绝对路径>]',
+      '      --audit-root <仓库外绝对路径> --audit-commit <40 位小写 SHA> [--audit-pom-sha256 <64 位小写 SHA-256>]',
+      '      --audit-root=<路径> --audit-commit=<SHA>（等价的 = 内联写法）',
       '  --json                   以 JSON 输出判定结果（机器可读）',
       '  --report                 信息性运行：始终以退出码 0 结束',
       '  --self-test              用合成输入验证判定规则（不读磁盘、不执行探测）',
       '  --java-home <绝对路径>   显式指定 JDK home（优先于 JAVA_HOME 与 PATH）',
       '  --maven-home <绝对路径>  显式指定 Maven home（优先于 MAVEN_HOME/M2_HOME 与 PATH）',
-      '退出码: 0 就绪 / 1 违规 / 2 被阻断 / 64 用法错误',
+      '  --audit-root <绝对路径>  外部审计模式：仓库之外的固定 commit 检出（必须完全位于仓库边界 services/ruoyi-api 之外，且 .git 存在）',
+      '  --audit-commit <SHA>     外部审计模式：固定 40 位小写十六进制 commit，必须与外部 git rev-parse HEAD 完全相等',
+      '  --audit-pom-sha256 <SHA> 可选：声明固定 commit 的 pom.xml 内容（git show HEAD:pom.xml，内存读取）的 SHA-256，64 位小写',
+      '审计模式 verdict 只有两个取值：external-audit-ready（退出码 0）/ blocked（1 违规、2 前置未满足）',
+      '审计模式只做只读前置核验：不读取仓库内 gate-manifest.json 的 stage，不生成/复制/下载任何证据或源码，',
+      'admitted 与 verified 恒为 false。退出码: 0 就绪 / 1 违规 / 2 被阻断 / 64 用法错误',
     ].join('\n'),
   );
 }
@@ -1085,8 +1953,17 @@ function parseArgs(argv) {
     error: null,
     javaHome: null,
     mavenHome: null,
+    auditRoot: null,
+    auditCommit: null,
+    auditPomSha256: null,
   };
-  const valueFlags = { '--java-home': 'javaHome', '--maven-home': 'mavenHome' };
+  const valueFlags = {
+    '--java-home': 'javaHome',
+    '--maven-home': 'mavenHome',
+    '--audit-root': 'auditRoot',
+    '--audit-commit': 'auditCommit',
+    '--audit-pom-sha256': 'auditPomSha256',
+  };
   const fail = (message) => ({ ...flags, error: message });
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -1110,11 +1987,79 @@ function parseArgs(argv) {
   return flags;
 }
 
+/**
+ * 审计模式的参数校验（只看参数形状与本机目录事实，不判定隔离——隔离属「违规」而非「用法错误」）：
+ * 用法错误一律 64；`..` 段、相对路径、文件系统根、含引号/控制字符、目录不存在都在这里拦住。
+ */
+function validateAuditInvocation(flags, deps) {
+  const directoryExists = deps?.directoryExists ?? defaultDirectoryExists;
+  if (flags.auditRoot === null) {
+    return { error: '--audit-commit 需要与 --audit-root 同时给出（审计模式要求显式的仓库外目录）' };
+  }
+  if (flags.auditCommit === null) {
+    return { error: '--audit-root 需要与 --audit-commit 同时给出（40 位小写十六进制 SHA）' };
+  }
+  if (flags.javaHome !== null || flags.mavenHome !== null) {
+    return {
+      error:
+        '外部审计模式与 --java-home/--maven-home 不能同时使用：审计模式只核验外部目录前置，不探测本机工具链',
+    };
+  }
+  const target = flags.auditRoot.trim();
+  if (target === '') return { error: '--audit-root 需要一个非空路径值' };
+  if (!isSafeExecutablePath(target)) {
+    return { error: `--audit-root 路径含引号或控制字符（拒绝以防命令注入）：${target}` };
+  }
+  if (!isAbsolute(target)) {
+    return { error: `--audit-root 必须是绝对路径（可复现核验不接受相对路径）：${target}` };
+  }
+  if (hasParentSegment(target)) {
+    return { error: `--audit-root 不得包含 .. 路径段（避免随工作目录漂移）：${target}` };
+  }
+  if (isFileSystemRoot(target)) {
+    return { error: `--audit-root 不能是文件系统根（整盘根不是隔离审计目录）：${target}` };
+  }
+  const home = resolve(target);
+  if (!directoryExists(home)) {
+    return { error: `--audit-root 指向的目录不存在或不可读：${home}` };
+  }
+  if (!AUDIT_COMMIT_PATTERN.test(flags.auditCommit)) {
+    return {
+      error: `--audit-commit 必须是 40 位小写十六进制 SHA（当前 ${formatValue(flags.auditCommit)}）：不接受短 SHA、分支名或占位词`,
+    };
+  }
+  if (flags.auditPomSha256 !== null && !AUDIT_SHA256_PATTERN.test(flags.auditPomSha256)) {
+    return {
+      error: `--audit-pom-sha256 必须是 64 位小写十六进制 SHA-256（当前 ${formatValue(flags.auditPomSha256)}）`,
+    };
+  }
+  return {
+    values: {
+      auditRoot: home,
+      auditCommit: flags.auditCommit,
+      auditPomSha256: flags.auditPomSha256,
+    },
+  };
+}
+
 function preflight(argv, deps) {
   const flags = parseArgs(argv);
   if (flags.error) return { exitCode: EXIT.USAGE, error: flags.error, flags };
   if (flags.help || flags.selfTest)
-    return { exitCode: null, flags, javaHome: null, mavenHome: null };
+    return {
+      exitCode: null,
+      flags,
+      javaHome: null,
+      mavenHome: null,
+      auditRoot: null,
+      auditCommit: null,
+      auditPomSha256: null,
+    };
+  if (flags.auditRoot !== null || flags.auditCommit !== null || flags.auditPomSha256 !== null) {
+    const audit = validateAuditInvocation(flags, deps);
+    if (audit.error) return { exitCode: EXIT.USAGE, error: audit.error, flags };
+    return { exitCode: null, flags, javaHome: null, mavenHome: null, ...audit.values };
+  }
   const java =
     flags.javaHome === null
       ? {}
@@ -1125,7 +2070,15 @@ function preflight(argv, deps) {
       ? {}
       : validateExplicitHome('mavenHome', flags.mavenHome, 'Maven home', deps);
   if (maven.error) return { exitCode: EXIT.USAGE, error: maven.error, flags };
-  return { exitCode: null, flags, javaHome: java.home ?? null, mavenHome: maven.home ?? null };
+  return {
+    exitCode: null,
+    flags,
+    javaHome: java.home ?? null,
+    mavenHome: maven.home ?? null,
+    auditRoot: null,
+    auditCommit: null,
+    auditPomSha256: null,
+  };
 }
 
 /* ------------------------------------------------------------------ *
@@ -1337,6 +2290,37 @@ function probeUnitChecks() {
     }).version,
     '16.4',
   );
+  // 逐工具验收：四款 SBOM 工具、四款扫描器与三款 PostgreSQL 客户端各取一条真实输出形态，
+  // 成功的探测都必须解析出语义版本（缺任何一款的验收，工具标识正则写错就不会被发现）
+  for (const [tool, text, expected] of [
+    ['cyclonedx', 'cyclonedx-cli 0.27.2\n', '0.27.2'],
+    ['cyclonedx', '5.1.0\n', '5.1.0'],
+    ['syft', 'syft 1.14.0\n', '1.14.0'],
+    ['syft', 'Application: syft\nVersion: 1.14.0\nBuildDate: 2024-01-01\n', '1.14.0'],
+    ['cdxgen', 'cdxgen 11.5.1\n', '11.5.1'],
+    ['cdxgen', '11.5.1\n', '11.5.1'],
+    ['jbom', 'jbom version 1.2.3\n', '1.2.3'],
+    ['trivy', 'trivy version 0.58.0\n', '0.58.0'],
+    ['trivy', 'Version: 0.58.0\nVulnerability DB:\n  Version: 2\n', '0.58.0'],
+    ['grype', 'grype 0.90.0\n', '0.90.0'],
+    ['grype', 'Application: grype\nVersion: 0.90.0\nBuildDate: 2024-01-01\n', '0.90.0'],
+    ['osv-scanner', 'osv-scanner version: 1.9.0\ncommit: 0123456789abcdef\n', '1.9.0'],
+    ['dependency-check', 'Dependency-Check Core version 12.1.0\n', '12.1.0'],
+    ['psql', 'psql (PostgreSQL) 16.4\n', '16.4'],
+    ['pg_ctl', 'pg_ctl (PostgreSQL) 16.4\n', '16.4'],
+    ['pg_isready', 'pg_isready (PostgreSQL) 16.4\n', '16.4'],
+  ]) {
+    check(
+      `逐工具验收 ${tool}「${text.trim().split('\n')[0]}」→ 解析出 ${expected}`,
+      classifyProbe({
+        name: tool,
+        located: true,
+        path: `fixture/${tool}`,
+        captured: { ...good, text },
+      }).version,
+      expected,
+    );
+  }
   /*
    * 严格版本解析（本 BLOCK 的修复点）：只在「该工具自己的版本行」上取版本号，绝不在垃圾文本里
    * 任意搜「数字.数字」；两段数字（0.0 / 1.2 / 999.999）不构成语义版本，一律不可解析。
@@ -1403,6 +2387,8 @@ function probeUnitChecks() {
     ['带标签而非纯版本 ServerVersion: 27.3.1', 'ServerVersion: 27.3.1'],
     ['版本后夹带说明 27.3.1 (build abcdef)', '27.3.1 (build abcdef)'],
     ['版本后跟警告行', '27.3.1\nWARNING: No swap limit support'],
+    ['连接地址而非版本 tcp://127.0.0.1:2375', 'tcp://127.0.0.1:2375'],
+    ['日志前缀夹版本 INFO[0000] 29.8.0', 'INFO[0000] 29.8.0'],
     ['空输出', '   '],
   ]) {
     check(`Docker 非法输出「${label}」→ 不算可用`, withDocker(text).usable, false);
@@ -1509,6 +2495,654 @@ function probeUnitChecks() {
       'unsafe-path',
     );
   }
+  return { checks, failures };
+}
+
+/* ------------------------------------------------------------------ *
+ * 自检：外部审计模式的合成输入（纯函数；不读磁盘、不执行任何命令）
+ * ------------------------------------------------------------------ */
+
+/** SHA-256 向量（NIST）：空串 / abc / 448 位两分组。 */
+const AUDIT_SHA256_VECTORS = [
+  ['', 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'],
+  ['abc', 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'],
+  [
+    'abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq',
+    '248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1',
+  ],
+];
+
+/**
+ * 合成的仓库/边界/审计根路径与合成 pom 文本。**这些只是字符串常量**：自检不会创建任何目录、
+ * 源码、pom 或证据文件，也不会读磁盘、不会执行 git（契约要求「不得为测试创建源码/pom」）。
+ */
+const AUDIT_FIXTURE_REPO = join(tmpdir(), 'rm-audit-fixture-repo');
+const AUDIT_FIXTURE_BOUNDARY = join(AUDIT_FIXTURE_REPO, 'services', 'ruoyi-api');
+const AUDIT_FIXTURE_ROOT = join(tmpdir(), 'rm-audit-fixture-external', 'RuoYi-Vue-pinned');
+const AUDIT_FIXTURE_GIT_DIR = join(AUDIT_FIXTURE_ROOT, '.git');
+const AUDIT_FIXTURE_LINK = join(tmpdir(), 'rm-audit-fixture-link');
+const AUDIT_FIXTURE_COMMIT = '0123456789abcdef0123456789abcdef01234567';
+const AUDIT_FIXTURE_OTHER_COMMIT = 'fedcba9876543210fedcba9876543210fedcba98';
+const AUDIT_FIXTURE_POM_TEXT =
+  '<project><modelVersion>4.0.0</modelVersion><artifactId>ruoyi</artifactId><properties><java.version>17</java.version><spring-boot.version>3.5.16</spring-boot.version></properties></project>';
+const AUDIT_FIXTURE_POM_SHA256 = sha256Hex(AUDIT_FIXTURE_POM_TEXT);
+const AUDIT_FIXTURE_POM_BLOB_SHA1 = 'abcdef0123456789abcdef0123456789abcdef01';
+
+function auditDirStat(exists) {
+  return { exists, isDirectory: exists, isFile: false, isSymbolicLink: false };
+}
+
+function auditFileStat(exists) {
+  return { exists, isDirectory: false, isFile: exists, isSymbolicLink: false };
+}
+
+/** 覆盖值取用：显式给出 null 也按「显式覆盖」处理（`??` 会把 null 当缺省，这里不允许）。 */
+function auditOverride(overrides, key, fallback) {
+  return Object.prototype.hasOwnProperty.call(overrides, key) ? overrides[key] : fallback;
+}
+
+/**
+ * 合成一次外部审计判定所需的全部输入（realpath / stat / Git 事实都由本函数注入），因此自检
+ * **不会读磁盘、不会执行 git、不会创建任何文件**：这正是「判定规则」与「磁盘事实采集」分离的目的。
+ */
+function auditFixtureInput(overrides = {}) {
+  const root = overrides.root ?? AUDIT_FIXTURE_ROOT;
+  const realpaths =
+    overrides.realpaths ??
+    new Map([
+      [root, overrides.rootReal ?? root],
+      [join(root, '.git'), join(root, '.git')],
+    ]);
+  const stats =
+    overrides.stats ??
+    new Map([
+      [root, auditDirStat(true)],
+      [
+        join(root, '.git'),
+        overrides.gitDirPresent === false ? auditDirStat(false) : auditDirStat(true),
+      ],
+    ]);
+  return {
+    auditRoot: root,
+    auditCommit: overrides.commit ?? AUDIT_FIXTURE_COMMIT,
+    auditPomSha256: overrides.declaredSha256 ?? null,
+    repoReal: overrides.repoReal ?? AUDIT_FIXTURE_REPO,
+    boundaryReal: overrides.boundaryReal ?? AUDIT_FIXTURE_BOUNDARY,
+    platform: process.platform,
+    realpath: (target) => realpaths.get(target) ?? null,
+    statPath: (target) => stats.get(target) ?? auditFileStat(false),
+    git: overrides.git ?? {
+      available: true,
+      insideWorkTree: overrides.insideWorkTree ?? true,
+      insideWorkTreeRaw: overrides.insideWorkTree === false ? 'false' : 'true',
+      head: overrides.head ?? overrides.commit ?? AUDIT_FIXTURE_COMMIT,
+      headError: overrides.headError ?? null,
+      statusEntries: auditOverride(overrides, 'statusEntries', []),
+      statusError: overrides.statusError ?? null,
+      pomAtHead: overrides.pomAtHead ?? true,
+      pomAtHeadError: overrides.pomAtHeadError ?? null,
+      pomBlobSha1: overrides.pomBlobSha1 ?? AUDIT_FIXTURE_POM_BLOB_SHA1,
+      pomContentSha256: auditOverride(
+        overrides,
+        'pomContentSha256',
+        AUDIT_FIXTURE_POM_SHA256,
+      ),
+      pomSummary: auditOverride(
+        overrides,
+        'pomSummary',
+        summarizePomText(AUDIT_FIXTURE_POM_TEXT),
+      ),
+    },
+  };
+}
+
+function runAuditScenario(scenario) {
+  const report = evaluateAudit({
+    ...auditFixtureInput(scenario.input ?? {}),
+    ...(scenario.extraInput ?? {}),
+  });
+  const messages = [...report.violations, ...report.blocked].join('\n');
+  const failures = [];
+  if (report.exitCode !== scenario.expectCode) {
+    failures.push(`退出码期望 ${scenario.expectCode}，实际 ${report.exitCode}`);
+  }
+  if (scenario.expectVerdict && report.summary.verdict !== scenario.expectVerdict) {
+    failures.push(`verdict 期望 ${scenario.expectVerdict}，实际 ${report.summary.verdict}`);
+  }
+  if (![AUDIT_VERDICT.ready, AUDIT_VERDICT.blocked].includes(report.summary.verdict)) {
+    failures.push(`verdict 只有两个合法取值，实际 ${report.summary.verdict}`);
+  }
+  if (report.verdict !== report.summary.verdict) {
+    failures.push('顶层 verdict 必须与 summary.verdict 一致');
+  }
+  for (const needle of scenario.expect ?? []) {
+    if (!messages.includes(needle)) failures.push(`期望信息包含「${needle}」`);
+  }
+  for (const [id, ok] of Object.entries(scenario.expectPrecondition ?? {})) {
+    const item = report.preconditions.find((entry) => entry.id === id);
+    if (!item) failures.push(`缺少前置 ${id}`);
+    else if (item.ok !== ok) failures.push(`前置 ${id} 期望 ${ok}，实际 ${item.ok}`);
+  }
+  for (const [key, value] of Object.entries(scenario.expectSummary ?? {})) {
+    if (report.summary[key] !== value) {
+      failures.push(`summary.${key} 期望 ${value}，实际 ${report.summary[key]}`);
+    }
+  }
+  if (
+    typeof scenario.expectBlockedCount === 'number' &&
+    report.blocked.length !== scenario.expectBlockedCount
+  ) {
+    failures.push(`阻断项数量期望 ${scenario.expectBlockedCount}，实际 ${report.blocked.length}`);
+  }
+  if (
+    report.statements.admitted !== false ||
+    report.statements.verified !== false ||
+    report.admitted !== false ||
+    report.verified !== false ||
+    report.summary.admitted !== false ||
+    report.summary.verified !== false
+  ) {
+    failures.push('审计模式不得把结果标为 admitted/verified');
+  }
+  if (report.statements.gateStageConsulted !== false || report.gateStageConsulted !== false) {
+    failures.push('审计模式不得读取仓库内 gate 清单的 stage');
+  }
+  return { name: scenario.name, failures, report };
+}
+
+function buildAuditScenarios() {
+  const shortSha = AUDIT_FIXTURE_COMMIT.slice(0, 12);
+  return [
+    {
+      name: '合法外部路径（40 位 SHA + .git + HEAD 完全相等 + 工作树干净 + HEAD:pom.xml + 摘要一致）→ external-audit-ready',
+      input: { declaredSha256: AUDIT_FIXTURE_POM_SHA256 },
+      expectCode: 0,
+      expectVerdict: 'external-audit-ready',
+      expectPrecondition: {
+        'audit-root-isolated': true,
+        'audit-commit-format': true,
+        'audit-git-dir': true,
+        'audit-worktree-inside': true,
+        'audit-git-head': true,
+        'audit-worktree-clean': true,
+        'audit-head-pom': true,
+        'audit-input-digest': true,
+      },
+      expectSummary: {
+        ready: true,
+        executable: true,
+        admitted: false,
+        verified: false,
+        gateStageConsulted: false,
+        pomAtHead: true,
+      },
+    },
+    {
+      name: '仓库内路径（边界之外但在仓库工作树内）→ blocked（违规）',
+      input: { root: join(AUDIT_FIXTURE_REPO, 'tmp', 'audit') },
+      expectCode: 1,
+      expectVerdict: 'blocked',
+      expect: ['位于仓库'],
+      expectPrecondition: { 'audit-root-isolated': false },
+    },
+    {
+      name: '同路径：审计根 realpath 就是仓库边界根目录本身 → blocked（违规）',
+      input: { root: AUDIT_FIXTURE_BOUNDARY },
+      expectCode: 1,
+      expectVerdict: 'blocked',
+      expect: ['就是仓库边界根目录本身'],
+      expectPrecondition: { 'audit-root-isolated': false },
+    },
+    {
+      name: 'boundary 子路径：审计根位于 services/ruoyi-api 之内 → blocked（违规）',
+      input: { root: join(AUDIT_FIXTURE_BOUNDARY, 'compliance', 'external') },
+      expectCode: 1,
+      expectVerdict: 'blocked',
+      expect: ['位于仓库边界根目录'],
+      expectPrecondition: { 'audit-root-isolated': false },
+    },
+    {
+      name: '同路径：审计根 realpath 就是仓库工作树根目录本身 → blocked（违规）',
+      input: { root: AUDIT_FIXTURE_REPO },
+      expectCode: 1,
+      expectVerdict: 'blocked',
+      expect: ['位于仓库'],
+      expectPrecondition: { 'audit-root-isolated': false },
+    },
+    {
+      name: '符号链接逃逸：给定路径在仓库外，realpath 解析回仓库内 → blocked（违规）',
+      input: {
+        root: AUDIT_FIXTURE_LINK,
+        realpaths: new Map([
+          [AUDIT_FIXTURE_LINK, join(AUDIT_FIXTURE_REPO, 'escaped')],
+          [join(AUDIT_FIXTURE_LINK, '.git'), join(AUDIT_FIXTURE_REPO, 'escaped', '.git')],
+        ]),
+      },
+      expectCode: 1,
+      expectVerdict: 'blocked',
+      expect: ['位于仓库'],
+      expectPrecondition: { 'audit-root-isolated': false },
+    },
+    {
+      name: '短 SHA（12 位）→ blocked（固定 commit 形状非法）',
+      input: { commit: shortSha, head: shortSha },
+      expectCode: 1,
+      expectVerdict: 'blocked',
+      expect: ['40 位'],
+      expectPrecondition: { 'audit-commit-format': false },
+    },
+    {
+      name: 'HEAD mismatch：外部 HEAD 与固定 commit 不一致 → blocked（违规）',
+      input: { head: AUDIT_FIXTURE_OTHER_COMMIT },
+      expectCode: 1,
+      expectVerdict: 'blocked',
+      expect: ['不一致'],
+      expectPrecondition: { 'audit-git-head': false },
+    },
+    {
+      name: 'dirty：工作树有已跟踪变更 → blocked（违规）',
+      input: { statusEntries: [' M pom.xml'] },
+      expectCode: 1,
+      expectVerdict: 'blocked',
+      expect: ['工作树不干净'],
+      expectPrecondition: { 'audit-worktree-clean': false },
+    },
+    {
+      name: 'dirty：未跟踪生成物同样算不干净（生成物必须写到检出目录之外）→ blocked（违规）',
+      input: { statusEntries: ['?? sbom.cyclonedx.json', '?? target/'] },
+      expectCode: 1,
+      expectVerdict: 'blocked',
+      expect: ['工作树不干净'],
+      expectPrecondition: { 'audit-worktree-clean': false },
+    },
+    {
+      name: 'missing pom：固定 commit 的根 pom.xml 不存在 → blocked（前置未满足）',
+      input: {
+        pomAtHead: false,
+        pomContentSha256: null,
+        pomSummary: null,
+        declaredSha256: AUDIT_FIXTURE_POM_SHA256,
+      },
+      expectCode: 2,
+      expectVerdict: 'blocked',
+      expect: ['cat-file -e HEAD:pom.xml'],
+      expectPrecondition: { 'audit-head-pom': false, 'audit-input-digest': false },
+    },
+    {
+      name: '缺少 .git（不是 Git 工作树检出）→ blocked（前置未满足）',
+      input: { gitDirPresent: false },
+      expectCode: 2,
+      expectVerdict: 'blocked',
+      expect: ['缺少'],
+      expectPrecondition: { 'audit-git-dir': false },
+    },
+    {
+      name: 'git rev-parse --is-inside-work-tree 不是 true → blocked（前置未满足）',
+      input: { insideWorkTree: false },
+      expectCode: 2,
+      expectVerdict: 'blocked',
+      expect: ['--is-inside-work-tree'],
+      expectPrecondition: { 'audit-worktree-inside': false },
+    },
+    {
+      name: 'Git 核验不可用（不是仓库或未找到 git）→ blocked（前置未满足）',
+      input: { git: { available: false, error: '目标目录不是 Git 仓库（fixture）' } },
+      expectCode: 2,
+      expectVerdict: 'blocked',
+      expect: ['不是 Git 仓库'],
+      expectPrecondition: { 'audit-git-head': false },
+    },
+    {
+      name: '工作树状态含非 porcelain 行（不可严格解析）→ blocked（fail-closed，不当作干净）',
+      input: { statusEntries: null, statusError: 'git status --porcelain 含非 porcelain 行' },
+      expectCode: 2,
+      expectVerdict: 'blocked',
+      expect: ['无法严格解析工作树状态'],
+      expectPrecondition: { 'audit-worktree-clean': false },
+    },
+    {
+      name: '隔离判定未通过时不执行 git（skipped）：只报违规、不重复罗列阻断项',
+      input: {
+        root: join(AUDIT_FIXTURE_REPO, 'external'),
+        git: { skipped: true, skippedReason: '隔离判定未通过，未执行任何 git 命令' },
+      },
+      expectCode: 1,
+      expectVerdict: 'blocked',
+      expect: ['位于仓库'],
+      expectBlockedCount: 0,
+    },
+    {
+      name: '审计根无法解析真实路径（realpathSync 失败）→ blocked（前置未满足）',
+      input: {
+        realpaths: new Map([
+          [AUDIT_FIXTURE_ROOT, null],
+          [AUDIT_FIXTURE_GIT_DIR, null],
+        ]),
+      },
+      expectCode: 2,
+      expectVerdict: 'blocked',
+      expect: ['真实路径'],
+      expectPrecondition: { 'audit-root-isolated': false },
+    },
+    {
+      name: '声明的根 pom 内容摘要与实际不一致 → blocked（违规）',
+      input: { declaredSha256: 'f'.repeat(64) },
+      expectCode: 1,
+      expectVerdict: 'blocked',
+      expect: ['内容摘要与声明值不一致'],
+      expectPrecondition: { 'audit-input-digest': false },
+    },
+    {
+      name: '声明摘要形状非法（非 64 位小写）→ blocked（违规）',
+      input: { declaredSha256: 'ABC' },
+      expectCode: 1,
+      expectVerdict: 'blocked',
+      expect: ['64 位'],
+      expectPrecondition: { 'audit-input-digest': false },
+    },
+    {
+      name: '审计根是仓库的上级目录（git -C 会找到仓库自身的 .git）→ blocked（违规）',
+      input: { root: tmpdir(), repoReal: AUDIT_FIXTURE_REPO },
+      expectCode: 1,
+      expectVerdict: 'blocked',
+      expect: ['上级目录'],
+    },
+    {
+      name: '审计根解析到文件系统根 → blocked（违规）',
+      input: {
+        root: join(tmpdir(), 'rm-audit-fixture-drive-root'),
+        realpaths: new Map([
+          [join(tmpdir(), 'rm-audit-fixture-drive-root'), parse(tmpdir()).root],
+          [
+            join(tmpdir(), 'rm-audit-fixture-drive-root', '.git'),
+            join(tmpdir(), 'rm-audit-fixture-drive-root', '.git'),
+          ],
+        ]),
+      },
+      expectCode: 1,
+      expectVerdict: 'blocked',
+      expect: ['文件系统根'],
+    },
+    {
+      name: '同一份输入叠加仓库内 gate stage=admitted 不改变外部审计判定（verdict 仍为 blocked）',
+      input: { head: AUDIT_FIXTURE_OTHER_COMMIT },
+      extraInput: { gateStage: 'admitted' },
+      expectCode: 1,
+      expectVerdict: 'blocked',
+      expectSummary: { gateStageConsulted: false, admitted: false, verified: false },
+    },
+  ];
+}
+
+/** 审计模式的参数处理场景（只走 preflight，不读磁盘、不执行命令）。 */
+function buildAuditPreflightScenarios() {
+  const commit = AUDIT_FIXTURE_COMMIT;
+  const root = join(tmpdir(), 'rm-audit-preflight');
+  return [
+    {
+      name: '审计模式：--audit-root 相对路径被拒绝',
+      argv: ['--audit-root', 'audit-dir', '--audit-commit', commit],
+      expectCode: 64,
+      expectError: '绝对路径',
+    },
+    {
+      name: '审计模式：只给 --audit-root（缺 --audit-commit）被拒绝',
+      argv: ['--audit-root', root],
+      directories: [root],
+      expectCode: 64,
+      expectError: '同时给出',
+    },
+    {
+      name: '审计模式：只给 --audit-commit（缺 --audit-root）被拒绝',
+      argv: ['--audit-commit', commit],
+      expectCode: 64,
+      expectError: '同时给出',
+    },
+    {
+      name: '审计模式：--audit-commit 为短 SHA（12 位）被拒绝',
+      argv: ['--audit-root', root, '--audit-commit', commit.slice(0, 12)],
+      directories: [root],
+      expectCode: 64,
+      expectError: '40 位',
+    },
+    {
+      name: '审计模式：--audit-commit 为分支名被拒绝',
+      argv: ['--audit-root', root, '--audit-commit', 'springboot3'],
+      directories: [root],
+      expectCode: 64,
+      expectError: '40 位',
+    },
+    {
+      name: '审计模式：--audit-commit 含大写十六进制被拒绝（只接受小写）',
+      argv: ['--audit-root', root, '--audit-commit', commit.toUpperCase()],
+      directories: [root],
+      expectCode: 64,
+      expectError: '40 位',
+    },
+    {
+      name: '审计模式：--audit-root 含引号/控制字符被拒绝（命令注入守卫）',
+      argv: ['--audit-root', 'C:\\x" & echo pwned & "', '--audit-commit', commit],
+      expectCode: 64,
+      expectError: '引号或控制字符',
+    },
+    {
+      name: '审计模式：--audit-pom-sha256 形状非法被拒绝',
+      argv: ['--audit-root', root, '--audit-commit', commit, '--audit-pom-sha256', 'abc'],
+      directories: [root],
+      expectCode: 64,
+      expectError: '64 位',
+    },
+    {
+      name: '审计模式：与 --java-home 同时使用被拒绝（语义不混用）',
+      argv: ['--audit-root', root, '--audit-commit', commit, '--java-home', 'C:\\jdk'],
+      directories: [root],
+      expectCode: 64,
+      expectError: '不能同时使用',
+    },
+    {
+      name: '审计模式：--audit-root 含 .. 路径段被拒绝',
+      argv: ['--audit-root', 'C:\\a\\..\\b', '--audit-commit', commit],
+      expectCode: 64,
+      expectError: '..',
+    },
+    {
+      name: '审计模式：--audit-root 为文件系统根被拒绝',
+      argv: ['--audit-root', parse(root).root, '--audit-commit', commit],
+      expectCode: 64,
+      expectError: '文件系统根',
+    },
+    {
+      name: '审计模式：--audit-root 目录不存在被拒绝',
+      argv: ['--audit-root', join(tmpdir(), 'rm-audit-absent'), '--audit-commit', commit],
+      expectCode: 64,
+      expectError: '不存在',
+    },
+    {
+      name: '审计模式：--audit-commit 缺值被拒绝',
+      argv: ['--audit-root', root, '--audit-commit'],
+      expectCode: 64,
+      expectError: '缺少路径值',
+    },
+    {
+      name: '审计模式：--audit-root 重复指定被拒绝',
+      argv: ['--audit-root', root, '--audit-root', root, '--audit-commit', commit],
+      expectCode: 64,
+      expectError: '只能指定一次',
+    },
+    {
+      name: '审计模式：合法的 --audit-root/--audit-commit/--audit-pom-sha256 组合（含 = 内联形式）',
+      argv: [
+        `--audit-root=${root}`,
+        `--audit-commit=${commit}`,
+        `--audit-pom-sha256=${AUDIT_FIXTURE_POM_SHA256}`,
+      ],
+      directories: [root],
+      expectCode: 'pass',
+    },
+  ];
+}
+
+/** 外部审计模式的单元检查：路径隔离、严格解析、verdict 取值与探测超时（全部纯函数）。 */
+function auditUnitChecks() {
+  const failures = [];
+  let checks = 0;
+  const check = (label, actual, expected) => {
+    checks += 1;
+    if (actual !== expected) failures.push(`${label}：期望 ${expected}，实际 ${actual}`);
+  };
+  const fsRoot = parse(process.cwd()).root;
+  const repo = join(tmpdir(), 'rm-audit-unit-repo');
+  const boundary = join(repo, 'services', 'ruoyi-api');
+  const outside = join(tmpdir(), 'rm-audit-unit-external');
+
+  for (const [text, digest] of AUDIT_SHA256_VECTORS) {
+    check(`SHA-256 向量「${text.slice(0, 12)}」`, sha256Hex(text), digest);
+  }
+  check(
+    'UTF-8 中文输入的摘要与字节数组一致',
+    sha256Hex('摘要'),
+    sha256Hex(Buffer.from('摘要', 'utf8')),
+  );
+  check('路径位于仓库内 → pathIsInside 为真', pathIsInside(join(repo, 'services'), repo), true);
+  check('路径等于仓库根 → pathIsInside 为真', pathIsInside(repo, repo), true);
+  check('同前缀的兄弟目录（rm-repo 与 rm-repo-x）→ 为假', pathIsInside(`${repo}-x`, repo), false);
+  check('仓库外兄弟目录 → 为假', pathIsInside(outside, repo), false);
+  check('上级目录不算位于下级内 → 为假', pathIsInside(repo, outside), false);
+  check('空路径 → 为假（fail-closed）', pathIsInside('', repo), false);
+  check('文件系统根 → isFileSystemRoot 为真', isFileSystemRoot(fsRoot), true);
+  check('普通目录 → isFileSystemRoot 为假', isFileSystemRoot(join(fsRoot, 'x')), false);
+  check('含 .. 段 → 为真', hasParentSegment('C:\\a\\..\\b'), true);
+  check('含 .. 段（正斜杠）→ 为真', hasParentSegment('/a/../b'), true);
+  check('不含 .. 段 → 为假', hasParentSegment(join(fsRoot, 'a', 'b')), false);
+  check(
+    'win32 路径比较大小写不敏感',
+    comparablePath(join(fsRoot, 'AbC'), 'win32'),
+    comparablePath(join(fsRoot, 'abc'), 'win32'),
+  );
+  check('隔离：仓库内子目录 → 1 条违规', auditIsolationViolations(join(repo, 'x'), repo).length, 1);
+  check('隔离：仓库根自身 → 1 条违规', auditIsolationViolations(repo, repo).length, 1);
+  check('隔离：仓库的上级目录 → 1 条违规', auditIsolationViolations(tmpdir(), repo).length, 1);
+  check('隔离：文件系统根 → 1 条违规', auditIsolationViolations(fsRoot, repo).length, 1);
+  check('隔离：仓库外兄弟目录 → 0 条违规', auditIsolationViolations(outside, repo).length, 0);
+  check('隔离：realpath 不可得 → 不误判违规', auditIsolationViolations(null, repo).length, 0);
+  check(
+    '隔离：仓库内违规信息含「位于仓库」',
+    auditIsolationViolations(join(repo, 'x'), repo)[0].includes('位于仓库'),
+    true,
+  );
+  check(
+    '隔离：上级违规信息含「上级目录」',
+    auditIsolationViolations(tmpdir(), repo)[0].includes('上级目录'),
+    true,
+  );
+  check(
+    '隔离：边界根目录本身 → 1 条违规且说明「边界根目录本身」',
+    auditIsolationViolations(boundary, repo, boundary).length === 1 &&
+      auditIsolationViolations(boundary, repo, boundary)[0].includes('边界根目录本身'),
+    true,
+  );
+  check(
+    '隔离：边界根目录内的子路径 → 1 条违规且说明「边界根目录」',
+    auditIsolationViolations(join(boundary, 'x'), repo, boundary).length === 1 &&
+      auditIsolationViolations(join(boundary, 'x'), repo, boundary)[0].includes('边界根目录'),
+    true,
+  );
+  check(
+    '隔离：仓库内但在边界之外 → 1 条违规且说明「位于仓库」',
+    auditIsolationViolations(join(repo, 'tmp'), repo, boundary)[0].includes('位于仓库'),
+    true,
+  );
+  check(
+    '隔离：边界之外的仓库外目录 → 0 条违规',
+    auditIsolationViolations(outside, repo, boundary).length,
+    0,
+  );
+  check(
+    '隔离：符号链接逃逸（realpath 落在边界内）→ 1 条违规',
+    auditIsolationViolations(join(boundary, 'escaped'), repo, boundary).length,
+    1,
+  );
+  check(
+    '固定 commit 形状：40 位小写 → 接受',
+    AUDIT_COMMIT_PATTERN.test(AUDIT_FIXTURE_COMMIT),
+    true,
+  );
+  check(
+    '固定 commit 形状：短 SHA → 拒绝',
+    AUDIT_COMMIT_PATTERN.test(AUDIT_FIXTURE_COMMIT.slice(0, 12)),
+    false,
+  );
+  check(
+    '固定 commit 形状：大写 → 拒绝',
+    AUDIT_COMMIT_PATTERN.test(AUDIT_FIXTURE_COMMIT.toUpperCase()),
+    false,
+  );
+  check('固定 commit 形状：分支名 → 拒绝', AUDIT_COMMIT_PATTERN.test('springboot3'), false);
+  check(
+    '固定 commit 形状：占位词 → 拒绝',
+    AUDIT_COMMIT_PATTERN.test('latest'.padEnd(40, '0')),
+    false,
+  );
+  check(
+    '输入摘要形状：64 位小写 → 接受',
+    AUDIT_SHA256_PATTERN.test(AUDIT_FIXTURE_POM_SHA256),
+    true,
+  );
+  check(
+    '输入摘要形状：63 位 → 拒绝',
+    AUDIT_SHA256_PATTERN.test(AUDIT_FIXTURE_POM_SHA256.slice(0, 63)),
+    false,
+  );
+  check('verdict 只有两个取值', new Set(Object.values(AUDIT_VERDICT)).size, 2);
+  check('ready verdict 名称', AUDIT_VERDICT.ready, 'external-audit-ready');
+  check('blocked verdict 名称', AUDIT_VERDICT.blocked, 'blocked');
+  check('违规同样归入 blocked（不产生第三个 verdict）', AUDIT_VERDICT.blockedByViolation, 'blocked');
+  check('单次探测超时为 15 秒', PROBE_TIMEOUT_MS, 15000);
+  check('HEAD 严格解析：整段 40 位小写 → 接受', strictSha('a'.repeat(40)), 'a'.repeat(40));
+  check('HEAD 严格解析：带前后噪声 → 拒绝', strictSha(`head is ${'a'.repeat(40)}`), null);
+  check('HEAD 严格解析：大写 → 拒绝', strictSha('A'.repeat(40)), null);
+  check('HEAD 严格解析：短 SHA → 拒绝', strictSha('a'.repeat(12)), null);
+  check('porcelain 严格解析：空输出 → 0 条目', strictPorcelain('', true).entries.length, 0);
+  check('porcelain 严格解析：未跟踪+已跟踪两条 → 2', strictPorcelain('?? a\n M b\n', true).entries.length, 2);
+  check(
+    'porcelain 严格解析：含非条目行 → null（fail-closed）',
+    strictPorcelain('warning: LF will be replaced\n', true),
+    null,
+  );
+  check('porcelain 严格解析：探测失败 → null', strictPorcelain('', false), null);
+  check('porcelain 条目：已跟踪修改被识别', AUDIT_PORCELAIN_ENTRY.test(' M pom.xml'), true);
+  check('porcelain 条目：未跟踪生成物被识别', AUDIT_PORCELAIN_ENTRY.test('?? target/'), true);
+  check(
+    'porcelain 条目：git 告警行不被误判为变更',
+    AUDIT_PORCELAIN_ENTRY.test('warning: LF will be replaced by CRLF'),
+    false,
+  );
+  check('porcelain 条目：空行不被识别', AUDIT_PORCELAIN_ENTRY.test(''), false);
+  check('pom 摘要：读取 artifactId', summarizePomText(AUDIT_FIXTURE_POM_TEXT).artifactId, 'ruoyi');
+  check('pom 摘要：读取 java.version', summarizePomText(AUDIT_FIXTURE_POM_TEXT).javaVersion, '17');
+  check(
+    'pom 摘要：读取 spring-boot.version',
+    summarizePomText(AUDIT_FIXTURE_POM_TEXT).springBootVersion,
+    '3.5.16',
+  );
+  check(
+    'pom 摘要：contentCopied 恒为 false（不复制文件）',
+    summarizePomText(AUDIT_FIXTURE_POM_TEXT).contentCopied,
+    false,
+  );
+  check('pom 摘要：空文本仍返回结构化摘要', summarizePomText('').lines, 0);
+  const baseVerdict = evaluateAudit(auditFixtureInput({}));
+  check('合法合成输入的 verdict 为 external-audit-ready', baseVerdict.summary.verdict, 'external-audit-ready');
+  check('合法合成输入的退出码为 0', baseVerdict.exitCode, 0);
+  const withStage = evaluateAudit({ ...auditFixtureInput({}), gateStage: 'admitted' });
+  check(
+    '仓库内 stage=admitted 不改变外部审计判定',
+    `${withStage.summary.verdict}|${withStage.exitCode}`,
+    `${baseVerdict.summary.verdict}|${baseVerdict.exitCode}`,
+  );
+  check('外部审计判定声明不读取门禁清单', withStage.gateStageConsulted, false);
+  check('external-audit-ready 时 admitted 仍为 false', baseVerdict.admitted, false);
+  check('external-audit-ready 时 verified 仍为 false', baseVerdict.verified, false);
   return { checks, failures };
 }
 
@@ -1854,6 +3488,30 @@ function selfTest() {
     console.error(`  x ${scenario.name}：${result.failures.join('；')}`);
   }
 
+  const auditPreflightScenarios = buildAuditPreflightScenarios();
+
+  for (const scenario of auditPreflightScenarios) {
+    const result = runPreflightScenario(scenario);
+    if (result.failures.length === 0) {
+      console.log(`  ok ${scenario.name}（${scenario.expectCode}）`);
+      continue;
+    }
+    failed += 1;
+    console.error(`  x ${scenario.name}：${result.failures.join('；')}`);
+  }
+
+  const auditScenarios = buildAuditScenarios();
+
+  for (const scenario of auditScenarios) {
+    const result = runAuditScenario(scenario);
+    if (result.failures.length === 0) {
+      console.log(`  ok ${scenario.name}（退出码 ${result.report.exitCode}）`);
+      continue;
+    }
+    failed += 1;
+    console.error(`  x ${scenario.name}：${result.failures.join('；')}`);
+  }
+
   const unit = probeUnitChecks();
   if (unit.failures.length === 0) {
     console.log(`  ok 探针判定与路径安全单元检查（${unit.checks} 项）`);
@@ -1862,7 +3520,21 @@ function selfTest() {
     for (const message of unit.failures) console.error(`  x 探针判定与路径安全：${message}`);
   }
 
-  const total = scenarios.length + preflightScenarios.length + unit.checks;
+  const auditUnit = auditUnitChecks();
+  if (auditUnit.failures.length === 0) {
+    console.log(`  ok 外部审计模式单元检查（${auditUnit.checks} 项）`);
+  } else {
+    failed += auditUnit.failures.length;
+    for (const message of auditUnit.failures) console.error(`  x 外部审计模式：${message}`);
+  }
+
+  const total =
+    scenarios.length +
+    preflightScenarios.length +
+    auditPreflightScenarios.length +
+    auditScenarios.length +
+    unit.checks +
+    auditUnit.checks;
   console.log(`\n自检: ${total - failed}/${total} 通过`);
   return failed === 0 ? EXIT.READY : EXIT.VIOLATION;
 }
@@ -1884,6 +3556,44 @@ function main(argv) {
     return EXIT.READY;
   }
   if (flags.selfTest) return selfTest();
+
+  // 外部审计模式：只核验仓库外固定 commit 目录的前置，不读门禁清单、不探测本机工具链
+  if (prepared.auditRoot !== null) {
+    const collected = collectAuditFacts(prepared);
+    const report = evaluateAudit({
+      auditRoot: prepared.auditRoot,
+      auditCommit: prepared.auditCommit,
+      auditPomSha256: prepared.auditPomSha256,
+      repoReal: collected.repoReal,
+      boundaryReal: collected.boundaryReal,
+      rootReal: collected.rootReal,
+      platform: process.platform,
+      git: collected.git,
+    });
+    const auditContext = {
+      mode: 'external-audit',
+      repoRoot: REPO_ROOT,
+      auditRoot: prepared.auditRoot,
+      auditCommit: prepared.auditCommit,
+      auditPomSha256: prepared.auditPomSha256,
+    };
+    if (flags.json) {
+      console.log(JSON.stringify({ ...report, context: auditContext }, null, 2));
+    } else {
+      console.log(renderAuditText(report, auditContext));
+      if (report.violations.length > 0) {
+        console.error(`\n违规 (${report.violations.length})`);
+        for (const message of report.violations) console.error(`  x ${message}`);
+      }
+      if (report.blocked.length > 0) {
+        console.error(`\n被阻断 (${report.blocked.length})`);
+        for (const message of report.blocked) console.error(`  ! ${message}`);
+        console.error('\n可复现的下一步（不在本脚本内执行）：');
+        for (const step of report.nextSteps) console.error(`  - ${step}`);
+      }
+    }
+    return flags.report ? EXIT.READY : report.exitCode;
+  }
 
   const loaded = loadGateManifest();
   const collected = collectProbes(prepared);
