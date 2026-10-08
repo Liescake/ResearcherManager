@@ -25,8 +25,9 @@ import { StatisticsModule } from './statistics/statistics.module';
  * `GroupsModule`（小组最小垂直切片：浏览可见的开放小组 / 创建小组）、
  * `MatchingModule`（匹配最小垂直切片：发起本人匹配请求 / 本人列表与状态）、
  * `StatisticsModule`（本人统计：四类记录计数）、`NotificationsModule`
- * （本人通知箱：列表 / 标记已读）与 `AuditModule`
- * （本人审计摘要：本人可查看事件的脱敏摘要 + 该请求自身的服务端审计写入），其余仍为占位。
+ * （本人通知箱：列表 / 标记已读）、`AuditModule`
+ * （本人审计摘要：本人可查看事件的脱敏摘要 + 该请求自身的服务端审计写入）与 `ExportsModule`
+ * （本人导出请求：服务端白名单资源/字段的受理与状态，文件生成与下载属后续切片），其余仍为占位。
  */
 @Module({
   imports: [
