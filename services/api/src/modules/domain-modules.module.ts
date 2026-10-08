@@ -21,8 +21,11 @@ import { StatisticsModule } from './statistics/statistics.module';
  * P3 期间各模块只有边界声明；自 P4 起逐个填充 controller/service/repository，
  * 当前已有业务实现的是 `EducationModule`（升学记录学生自服务切片）、
  * `ProfilesModule`（学生画像自服务）、`MembershipsModule`（入组申请自服务）、
- * `AchievementsModule`（成果学生自服务：创建 / 本人列表）与
- * `GroupsModule`（小组最小垂直切片：浏览可见的开放小组 / 创建小组），其余仍为占位。
+ * `AchievementsModule`（成果学生自服务：创建 / 本人列表）、
+ * `GroupsModule`（小组最小垂直切片：浏览可见的开放小组 / 创建小组）、
+ * `MatchingModule`（匹配最小垂直切片：发起本人匹配请求 / 本人列表与状态）、
+ * `StatisticsModule`（本人统计：四类记录计数）与 `NotificationsModule`
+ * （本人通知箱：列表 / 标记已读），其余仍为占位。
  */
 @Module({
   imports: [
