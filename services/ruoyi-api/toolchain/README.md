@@ -11,7 +11,7 @@
 | `gate-manifest.json`       | 工具链最低要求与可复现探测配方、禁止项、候选 commit 占位、候选准入步骤、准入前置与合规产物清单                       | 结构、占位语义、探测配方与磁盘一致性校验（§3）                                                                  |
 | `check-provenance.mjs`     | 来源与合规证据清单检查器（仅用 Node 内置模块，不联网、不下载、不写仓库；内置纯 JavaScript SHA-256）                  | 自身即检查入口，见 §6；`--self-test` 内置 48 项判定场景 + 3 项 SHA-256 向量                                     |
 | `provenance-manifest.json` | 候选来源与合规证据清单（候选 commit/tag、许可证/NOTICE、SBOM、漏洞、PostgreSQL 兼容性）                              | 结构、状态与磁盘事实、摘要、内容标记、与门禁交叉核验（§4）                                                      |
-| `check-capability.mjs`     | 证据生成能力探测（SBOM / 漏洞扫描 / PostgreSQL）＋外部审计前置核验（`--audit-root`）：只读探测与核验，不生成任何证据 | 自身即检查入口，见 §11、§12；`--self-test` 内置 182 项自检（含 89 项探针判定与路径安全、35 项外部审计单元检查） |
+| `check-capability.mjs`     | 证据生成能力探测（SBOM / 漏洞扫描 / PostgreSQL）＋外部审计前置核验（`--audit-root`）：只读探测与核验，不生成任何证据 | 自身即检查入口，见 §11、§12；`--self-test` 内置 221 项自检（含 89 项探针判定与路径安全、64 项外部审计单元检查） |
 | `candidate-metadata.json`  | 候选仓库/分支/commit/tag 的公开元数据核验记录与复现步骤（当前 tag 未确认 → 候选未冻结）                              | 不参与自动校验；它是两条闸门之外的观测记录，结论见 §10                                                          |
 
 ## 2. 门禁语义
@@ -89,6 +89,8 @@
 ### 3.5 合规产物（`complianceArtifacts`）
 
 每一项声明仓库内相对路径与状态 `pending`/`present`/`verified`，且必须与磁盘一致：标记 `pending` 却已存在、或标记 `present`/`verified` 却不存在，都判违规。路径不得为绝对路径，也不得包含 `..`。仍为 `pending` 的产物会让整次判定停在**未准入**（退出码 2）。
+
+`pending` 的语义是「尚未取得可核验的合规产物」，因此**不能靠标签推进**：公开摘要显示「上游不存在该文件」（`absent-upstream`）或「本项不适用」（`not-applicable`）都只是观测结论，**不等于**产物已 `present`/`verified`，也不能替代证据文件——上游没有 `NOTICE` 时该项仍保持 `pending`，不得为了推进而伪造文件（理由与解除条件见 §10.3）。
 
 ### 3.6 源码自审（公开材料的机器约束）
 
@@ -245,7 +247,7 @@ node services/ruoyi-api/toolchain/check-capability.mjs \
   --java-home "C:\Program Files\Java\jdk-17" \
   --maven-home "<仓库外临时目录>/apache-maven-3.9.16"
 
-# 6.12 能力探测的判定规则自检：182 项（合成场景 + 探针判定、路径安全与严格版本解析 + 外部审计模式单元检查），不读磁盘、不执行探测
+# 6.12 能力探测与外部审计的判定规则自检：221 项（合成场景 + 探针判定、路径安全与严格版本解析 + 外部审计模式单元检查），不读磁盘、不执行探测
 node services/ruoyi-api/toolchain/check-capability.mjs --self-test
 
 # 6.13 外部审计前置核验：仓库外固定 commit 的隔离检出（本机实测 verdict=external-audit-ready，退出码 0，见 §12）
@@ -297,6 +299,7 @@ node services/ruoyi-api/toolchain/check-capability.mjs --audit-root "<仓库外�
 - `provenance-manifest.json` 本轮只新增非证据字段 `capabilityAssessment`（能力评估，见 §11），`manifestVersion` 保持 `0.1.0`：该字段不参与判定，也不改变五项证据的状态；一旦它被用作证据来源或改变判定语义，必须提升版本并在本文件记录。`0.1.1` 只澄清 `license-notice` 的 `howToObtain`（补公开 API 可复现步骤、字节流口径与保持 `pending` 的解除条件，见 §10.3），不改变判定语义、证据状态或必需标记：五项证据仍全部 `pending`。
 - `candidate-metadata.json` 属观测记录，`0.2.0` 新增「LICENSE/NOTICE 公开元数据与摘要」与「证据生成能力评估」两项观测，并把第二轮复核结论写入：候选仍未冻结（缺对应 tag），两条闸门不读该文件。
 - `check-capability.mjs` 本轮新增 `--audit-root` / `--audit-commit` / `--audit-pom-sha256` 外部审计前置模式（§12），属**非破坏性新增**：默认能力探测的判定、退出码语义与两份清单（`gate-manifest.json`、`provenance-manifest.json`）都未改动，两个清单的 `manifestVersion` 也不变；新增的隔离与摘要判定只会额外拦下「在仓库内生成证据」「把证据归属到另一个提交」这类既已禁止的行为，不放宽任何放行条件。`0.3.0`（第三轮，聚焦许可证/NOTICE 准入）只增强观测与可复现性：`license-notice-metadata` 补齐路径、公开 URL、blob 摘要的内存复算与两主机全树一致性，`reproduce` 新增第 6–8 步的 `node -e` 命令并新增 `reproduceEnvironment`；本次不推进任何闸门状态，候选仍未冻结，`license-notice` 仍为 `pending`。
+- 本轮把 `gate-manifest.json` 的 `complianceArtifacts` 中 `sbom` 的路径统一为 `services/ruoyi-api/compliance/provenance/sbom.cyclonedx.json`，与 `provenance-manifest.json` 的 `evidence[].path` 及 `check-capability.mjs` 探测依赖清单时读取的路径一致（见 §12.6）：这是路径纠错，既不放宽也不收紧任何判定，判定语义与退出码不变，`gate-manifest.json` 的 `manifestVersion` 因此保持 `0.2.0`；`complianceArtifacts` 其余四项与证据清单的路径差异仍未裁定（见 §12.6）。
 
 ## 10. 候选元数据核验记录（第三轮复核：候选仍未冻结）
 
@@ -335,15 +338,15 @@ node services/ruoyi-api/toolchain/check-capability.mjs --audit-root "<仓库外�
 | LICENSE 路径               | `LICENSE`（候选提交**根目录**，精确文件名；根树 16 个条目中唯一的许可类文件）                                                                                           | 公共根 tree 端点 ＋ 全树递归端点                                                                                                                            |
 | LICENSE 网页 URL           | `https://github.com/yangzongzhuan/RuoYi-Vue/blob/a51a838b71b446ea27256900efe7ed2faa2a02fd/LICENSE`（HTTP 200）                                                          | 浏览器可读；Gitee 侧对应 `https://gitee.com/y_project/RuoYi-Vue/blob/springboot3/LICENSE`（HTTP 200）                                                       |
 | LICENSE blob               | `8564f294c7781cbbbdb22ae5927a96f859db0054`（size 1071）                                                                                                                 | 公共 tree 端点；blob 端点 `git/blobs/8564f294…`（base64）                                                                                                   |
-| LICENSE 字节 SHA-256       | `7296da00ac5dfc56c36e6ac10ce5abdb2900898c101d5c4720d7b6c1254dd993`                                                                                                      | blob 端点在内存中取回 base64 字节后本地计算（只记录摘要，不落盘）                                                                                           |
+| LICENSE 字节 SHA-256       | `7296da00ac5dfc56c36e6ac10ce5abdb2900898c101d5c4720d7b6c1254dd993`                                                                                                      | GitHub API blob 端点与 Gitee 网页 raw 端点**各自**取回字节后内存计算，两主机摘要逐字节一致（只记录摘要，不落盘）                                            |
 | NOTICE 存在性              | **不存在**：全树 477 个条目（334 blob + 143 tree，`truncated=false`）中，精确文件名的许可类文件只有根 `LICENSE`；`NOTICE` / `NOTICE.txt` / `COPYING` / `COPYRIGHT` 均无 | 公共递归 tree 端点；11 条含 “notice” 的路径逐条核对全部是 RuoYi 业务类（`SysNotice`、`SysNoticeController` 等），与 NOTICE 合规文件无关                     |
 | 两主机一致性               | Gitee 主仓库与 GitHub 镜像的全树逐条目（`type:path` → `sha`）比对：各 477 个条目、单侧独有 0 个、sha 不一致 0 个                                                        | 两主机的递归 tree 端点 ＋ Gitee `contents/LICENSE?ref=springboot3`（`sha=8564f294…`、size 1071）                                                            |
 | POM blob / 字节 SHA-256    | `699a3bcc6a6df052525984b2a96628e3c6c5664e`（size 8513） / `16bf030a8e4c79c978bbf11eb6f6e18475771c10f4708d9e62e219480a172c9a`                                            | 公共 tree 端点（本轮核对 blob sha/size）＋ 第一/二轮的仓库外只读副本字节摘要（本轮未重算 SHA-256）                                                          |
 | LICENSE 工作区字节 SHA-256 | `46973d260eabeaf43df2478bf00dacf862911988eba72387596fcafbc4888cab`（1090 B、19 组 CRLF）                                                                                | 本机 `core.autocrlf=true` 检出后的工作区文件；与上一行的 blob 字节摘要**不同**，登记 `license-file-sha256` 时必须写明采用哪一种字节流                       |
 
-复现方式（本机实测通过，命令见 `candidate-metadata.json` 的 `reproduce` 第 6–8 步）：`node -e` 一行命令访问公开 API → 递归 tree 端点统计全树条目与许可类文件 → blob 端点取 base64 字节 → 在内存中按 git 对象格式（`blob <长度>\0` + 内容）重算 blob SHA-1（与 tree 端点一致，证明取到的就是该公共提交的同一份字节）→ 对同一份字节算 SHA-256 → 在 Gitee 侧交叉核验同一 blob 与同一棵树。
+复现方式（本机实测通过，命令见 `candidate-metadata.json` 的 `reproduce` 第 6–8 步）：`node -e` 一行命令访问公开 API → 递归 tree 端点统计全树条目与许可类文件 → blob 端点取 base64 字节 → 在内存中按 git 对象格式（`blob <长度>\0` + 内容）重算 blob SHA-1（与 tree 端点一致，证明取到的就是该公共提交的同一份字节）→ 对同一份字节算 SHA-256 → 在 Gitee 侧交叉核验同一 blob 与同一棵树 → 再在 **Gitee 网页 raw 端点**取回同一份 1071 B 字节并在内存计算 SHA-256，与 GitHub API blob 端点逐字节一致（第二主机字节来源）。
 
-**环境限制（属于本机，不是上游事实）**：`raw.githubusercontent.com` 在本机 DNS 不可解析（`getaddrinfo ENOENT`），`curl.exe`（HTTP 000）与 `Invoke-RestMethod`（TLS 失败）也不可用，只有 Node 内置 `fetch` 能访问公共 API。因此取字节以 **API blob 端点**为准，复现命令一律写成 `node -e` 形式（见 §10.3 与 `candidate-metadata.json` 的 `reproduceEnvironment`）。
+**环境限制（属于本机，不是上游事实）**：`raw.githubusercontent.com` 在本机 DNS 不可解析（`getaddrinfo ENOENT`），`curl.exe`（HTTP 000）与 `Invoke-RestMethod`（TLS 失败）也不可用，只有 Node 内置 `fetch` 能访问公共 API。因此取字节以 **GitHub API blob 端点**与 **Gitee 网页 raw 端点**（`https://gitee.com/y_project/RuoYi-Vue/raw/springboot3/LICENSE`，本机可达）为准，复现命令一律写成 `node -e` 形式（见 §10.3 与 `candidate-metadata.json` 的 `reproduceEnvironment`）。
 
 **本轮只记录摘要与标识，没有把 LICENSE/POM 原文或任何 RuoYi 文件复制进本仓库**（blob 字节只在内存中摘要后丢弃），也没有创建 `compliance/` 下的任何证据文件或原文副本；`provenance-manifest.json` 的 `license-notice` 证据仍为 `pending`，不因本节而提前推进。
 
@@ -360,6 +363,7 @@ node services/ruoyi-api/toolchain/check-capability.mjs --audit-root "<仓库外�
 1. **证据项要求原文证据与再分发说明，而本仓库明确不保存上游原文。** `provenance-manifest.json` 的 `license-notice` 要求「保留候选仓库原始 LICENSE 与 NOTICE 的证据：SPDX 标识、原文文件摘要、NOTICE 存在性与再分发说明」，与之配套的准入合规产物是 `gate-manifest.json` 的 `services/ruoyi-api/compliance/LICENSE`（「候选仓库原始许可证原文副本」）。本项目当前的边界是**不把上游 LICENSE/NOTICE 原文复制进本仓库**，因此该产物无法登记；此时把证据推进到 `present`/`verified` 会让读者以为许可证准入已就位，属于过度声明。
 2. **`verified` 还有本轮不可能诚实满足的硬条件。** `check-provenance.mjs` 要求 `verified` 给出核验时间与核验署名，并与准入门禁的候选固定值交叉核验；而 `gate-manifest.json` 的 `candidate.pinned` 仍为 `tag=null` / `commit=null` / `resolved=false`（候选未冻结，缺对应 tag），且按 §3.4 的独立审查要求不由实施方自证。此时声明 `verified` 会被检查器直接判为违规（退出码 1），因此**不伪造 verified**。
 3. **公开可复现的只是摘要，不等于「原文已复核」。** 本轮证明的是「该公共提交的 LICENSE 字节可被公开端点复现、许可证类型为 MIT、全树不存在 NOTICE」，不包含逐条条款复核，也不包含依赖许可证清单（那属于 `dependency-licenses` 与 `sbom` 的范围）。
+4. **`absent-upstream` / `not-applicable` 只是公开摘要，不等于合规产物已核验。** 公开端点证明的只是「该提交全树不存在 `NOTICE`/`COPYING`/`COPYRIGHT`」，这只能写成「上游不存在该文件」（`absent-upstream`）一类**观测标签**；它既不等于「本项不适用」（`not-applicable`），更不等于准入门禁的合规产物 `services/ruoyi-api/compliance/NOTICE` 已 `present`/`verified`。因此 `NOTICE` 项保持 `pending`：上游没有 `NOTICE` 时**不得伪造一个 NOTICE 文件**来把该项标成 `present`/`verified`，也不得用 `absent-upstream`/`not-applicable` 这类标签替代证据——真正的再分发证据（本仓库分发哪些上游字节、依据哪条条款、由谁核验并署名）仍未登记、仍为 `pending`，只有在下面的解除条件全部满足后才会推进。
 
 解除条件（同时满足后才推进该项，届时按 §9 提升 `provenance-manifest.json` 版本并在本节记录）：
 
@@ -408,7 +412,7 @@ node services/ruoyi-api/toolchain/check-capability.mjs \
 # 11.3 信息性运行：始终退出码 0
 node services/ruoyi-api/toolchain/check-capability.mjs --report
 
-# 11.4 判定规则自检：182 项（合成场景 + 探针判定、路径安全与严格版本解析 + 外部审计模式单元检查），不读磁盘、不执行探测
+# 11.4 判定规则自检：221 项（合成场景 + 探针判定、路径安全与严格版本解析 + 外部审计模式单元检查），不读磁盘、不执行探测
 node services/ruoyi-api/toolchain/check-capability.mjs --self-test
 ```
 
@@ -450,37 +454,37 @@ node services/ruoyi-api/toolchain/check-capability.mjs --self-test
 
 ### 12.1 为什么需要它：先打破「证据 ↔ 准入」的循环
 
-生成 SBOM/漏洞/PostgreSQL/许可证证据要求先有可构建的 Maven 工程（`pom.xml`），而创建 `pom.xml` 又要求门禁 `stage=admitted`，`admitted` 又要求这些证据的前置 `satisfied`——按这个顺序什么都推进不了。但真实证据**并不需要在本仓库内生成**：把候选的一份只读检出放在仓库之外（本机为 `D:\ruoyi-audit\RuoYi-Vue-springboot3-current`，浅克隆、固定到候选 commit），在隔离目录里生成证据，再把**证据文件**回填进 `services/ruoyi-api/compliance/provenance/`。外部审计模式只回答一个问题：**这份隔离检出当前是否具备开始生成证据的前置**。它不回答「证据是否已收集」（那是 `check-provenance.mjs`），也不回答「是否允许在仓库内建 Maven 工程」（那是 `check-gate.mjs`）。
+生成 SBOM/漏洞/PostgreSQL/许可证证据要求先有可构建的 Maven 工程（`pom.xml`），而创建 `pom.xml` 又要求门禁 `stage=admitted`，`admitted` 又要求这些证据的前置 `satisfied`——按这个顺序什么都推进不了。但真实证据**并不需要在本仓库内生成**：把候选的一份只读检出放在仓库之外（本机为 `D:\ruoyi-audit\RuoYi-Vue-springboot3-current`，浅克隆、固定到候选 commit），在它**之外的输出目录**里生成证据，再把**证据文件**回填进 `services/ruoyi-api/compliance/provenance/`。外部审计模式只回答一个问题：**这份隔离检出当前是否具备开始生成证据的前置**（即「固定 commit + 干净工作树 + 根 `pom.xml` 与输入摘要可复核」）。它不回答「证据是否已收集」（那是 `check-provenance.mjs`），也不回答「是否允许在仓库内建 Maven 工程」（那是 `check-gate.mjs`）。
 
 ### 12.2 本模式只做四类前置核验
 
-| 类别          | 核验内容                                                                                                                                                                                                                                          | 判失败                                                                                     |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| 路径与隔离    | 审计根必须是绝对路径、无引号/控制字符、无 `..` 段、不是文件系统根；其 **realpath** 必须真实位于仓库之外；不得是仓库的**上级目录**（`git -C <上级目录>` 会沿父目录找到仓库自身的 `.git`）；根 `pom.xml` 的 realpath 不得经**符号链接逃逸**出审计根 | 违规（退出码 1）；路径形状非法＝用法错误（64）                                             |
-| 固定提交      | `--audit-commit` 必须是 **40 位小写十六进制 SHA**；短 SHA、分支名、`latest` 一类占位词一律拒绝                                                                                                                                                    | 用法错误（64）                                                                             |
-| 外部 Git 事实 | `git rev-parse --verify HEAD` 必须**等于**固定 commit；工作树不得有**已跟踪**变更（未跟踪文件只计数、不判 dirty——生成物本来就是未跟踪文件）                                                                                                       | HEAD 不一致 / dirty → 违规（1）；非 Git 仓库或 git 不可用 → 被阻断（2）                    |
-| 输入与摘要    | 审计根下必须有常规文件 `pom.xml`；记录其工作区字节 **SHA-256** 与 `HEAD:pom.xml` 的 **git blob SHA-1**；给出 `--audit-pom-sha256` 时逐字节比对                                                                                                    | 缺 `pom.xml`／不可读 → 被阻断（2）；摘要不一致、`pom.xml` 是目录或符号链接逃逸 → 违规（1） |
+| 类别          | 核验内容                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | 判失败                                                                                          |
+| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| 路径与隔离    | 审计根必须是绝对路径、无引号/控制字符、无 `..` 段、不是文件系统根；其 **realpath** 必须真实位于仓库之外：不得是文件系统根、不得是边界根目录（`services/ruoyi-api`）本身、不得落在边界目录内、不得落在仓库工作树内、也不得是仓库的**上级目录**（`git -C <上级目录>` 会沿父目录找到仓库自身的 `.git`）。realpath 由 `realpathSync` 解析，因此**经符号链接/联接逃逸回仓库或边界内**会被按真实路径拦下；本模式不读、不复制工作区文件，故不存在「工作区 `pom.xml` 指向仓库内」这类读取面 | 被阻断（违规，退出码 1）；路径形状非法＝用法错误（64）                                          |
+| 固定提交      | `--audit-commit` 必须是 **40 位小写十六进制 SHA**；短 SHA、分支名、`latest` 一类占位词一律拒绝                                                                                                                                                                                                                                                                                                                                                                                      | 用法错误（64）                                                                                  |
+| 外部 Git 事实 | 审计根下必须有 `.git`；`git rev-parse --verify HEAD` 的输出必须**整段就是**固定 commit（不做「在文本里搜 SHA」的宽松匹配）；工作树必须**完全干净**（`git status --porcelain` 无任何条目，已跟踪改动与**未跟踪文件都算不干净**——生成物必须写到检出目录之外）；状态或 HEAD 输出里出现任何非 porcelain 文本一律按「状态不可读」fail-closed                                                                                                                                             | HEAD 不一致 / 工作树不干净 → 被阻断（违规，1）；无 `.git`、git 不可用或状态不可读 → 被阻断（2） |
+| 输入与摘要    | 固定 commit 的根 `pom.xml` 必须存在（`git cat-file -e HEAD:pom.xml`）；用 `git show HEAD:pom.xml` **在内存里**取内容（`contentCopied=false`，不落盘、不复制任何文件、不看工作区文件），记录其内容 **SHA-256** 与 blob **SHA-1**；给出 `--audit-pom-sha256` 时与该内容摘要逐字节比对                                                                                                                                                                                                 | 缺 `HEAD:pom.xml` → 被阻断（2）；声明摘要与固定 commit 的内容摘要不一致 → 被阻断（违规，1）     |
 
-判定优先级：出现**违规**即判违规（此时不再重复罗列阻断项，前置明细仍完整保留在 `preconditions` 里）；否则任一前置未满足即判**被阻断**；全部满足才输出唯一的正向结论。
+判定优先级：出现**违规**即判违规（此时不再重复罗列阻断项，前置明细仍完整保留在 `preconditions` 里）；否则任一前置未满足即判**被阻断**；8 项前置全部满足才输出唯一的正向结论。**生成物不得留在审计检出内**：健康用法是在核验通过之后，把证据生成到检出目录之外的输出目录（或使用检出的一份一次性副本），使「固定 commit + 干净工作树」这一组合始终成立。
 
 ### 12.3 它不做什么（与 §11 的能力探测刻意区分）
 
 - **不要求、也不检查仓库内门禁 stage**：完全不读 `gate-manifest.json`——外部审计正是为了在准入之前先拿到证据；
 - 不创建、不复制、不移动任何源码或证据文件：既不写仓库，也不写审计目录；
-- 不联网、不安装、不下载依赖，不执行任何构建目标（只执行 `git rev-parse` / `git status --porcelain` 这类只读查询）；
+- 不联网、不安装、不下载依赖，不执行任何构建目标（只执行 `git rev-parse` / `git status --porcelain` / `git cat-file -e` / `git show` 这类只读查询）；
 - 不生成、不预填、不伪造证据，不推进 `provenance-manifest.json` 的任何状态；
 - 所有 git 调用都带 `-C <审计根>` 与 `GIT_OPTIONAL_LOCKS=0`，因此不会抢索引锁、不会刷新或写回 `.git/index`；**隔离判定不通过时一条 git 命令都不执行**（避免 `git -C` 沿父目录误触仓库自身的 `.git`）。
 
 ### 12.4 判定与退出码
 
-| 判定               | 含义                                                                                                                                                              | 退出码 |
-| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | -----: |
-| 外部审计前置可执行 | 四类前置全部满足，正向结论 `verdict=external-audit-ready`；**不等于 admitted，也不等于 verified**                                                                 |      0 |
-| 违规               | 隔离被破坏（仓库内、仓库上级、文件系统根、符号链接逃逸、`pom.xml` 不是常规文件），或外部事实与固定 commit 矛盾（HEAD 不一致、工作树有已跟踪变更、声明摘要不匹配） |      1 |
-| 被阻断             | 结构合法但前置未满足（不是 Git 仓库、git 不可用、根 `pom.xml` 缺失或不可读、realpath 失败、审计根不是目录）                                                       |      2 |
-| 用法错误           | 参数形状非法（缺 `--audit-commit`、短 SHA、相对路径、含 `..`、文件系统根、非 64 位摘要、与 `--java-home`/`--maven-home` 同用）                                    |     64 |
+| 判定                 | 含义                                                                                                                                                                  | 退出码 |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -----: |
+| 外部审计前置可执行   | 8 项前置全部满足，正向结论 `verdict=external-audit-ready`；**不等于 admitted，也不等于 verified**                                                                     |      0 |
+| 被阻断（违规）       | 隔离被破坏（边界目录内、仓库内、仓库上级、文件系统根、符号链接逃逸、`pom.xml` 不是常规文件）或外部事实与固定 commit 矛盾（HEAD 不一致、工作树不干净、声明摘要不匹配） |      1 |
+| 被阻断（前置未满足） | 结构合法但前置未满足（无 `.git`、git 不可用、工作树状态不可读、`HEAD:pom.xml` 缺失或不可读、realpath 失败、审计根不是目录）                                           |      2 |
+| 用法错误             | 参数形状非法（缺 `--audit-commit`、短 SHA、相对路径、含 `..`、文件系统根、非 64 位摘要、与 `--java-home`/`--maven-home` 同用）                                        |     64 |
 
-输出中 `admitted`、`verified`、`evidenceGenerated` 恒为 `false`，正向结论只有一个 `verdict` 取值 `external-audit-ready`（中文表述「外部审计前置可执行」，含义是前置齐备、可以开始生成证据，**不是**「已准入」也**不是**「已核验」）；`--report` 仍恒以 0 结束。
+**verdict 只有两个取值**（`external-audit-ready` 与 `blocked`）：隔离违规与「前置未满足」都落在 `blocked`，只用退出码 1/2 区分原因，明细保留在 `violations` / `preconditions` 里，**绝不**产生第三个 verdict。输出中 `admitted`、`verified`、`evidenceGenerated` 恒为 `false`，正向结论只有 `verdict=external-audit-ready`（中文表述「外部审计前置可执行」，含义是前置齐备、可以开始生成证据，**不是**「已准入」也**不是**「已核验」）；`--report` 仍恒以 0 结束。
 
 ### 12.5 运行方式与自检覆盖
 
@@ -490,7 +494,7 @@ node services/ruoyi-api/toolchain/check-capability.mjs \
   --audit-root "D:\ruoyi-audit\RuoYi-Vue-springboot3-current" \
   --audit-commit a51a838b71b446ea27256900efe7ed2faa2a02fd
 
-# 12.2 同时比对声明的输入摘要（根 pom.xml 工作区字节的 SHA-256）
+# 12.2 同时比对声明的输入摘要（固定 commit 中根 pom.xml 内容字节的 SHA-256）
 node services/ruoyi-api/toolchain/check-capability.mjs \
   --audit-root "D:\ruoyi-audit\RuoYi-Vue-springboot3-current" \
   --audit-commit a51a838b71b446ea27256900efe7ed2faa2a02fd \
@@ -500,15 +504,15 @@ node services/ruoyi-api/toolchain/check-capability.mjs \
 node services/ruoyi-api/toolchain/check-capability.mjs --audit-root "..." --audit-commit "..." --json
 ```
 
-自检（`--self-test`，不读磁盘、不执行任何命令）覆盖：合法外部审计目录 → `external-audit-ready`；仓库内路径、仓库上级目录、文件系统根 → 违规；短 SHA → 违规（判定层）与用法错误（参数层）；HEAD 不匹配、dirty 工作树 → 违规；缺 `pom.xml` → 被阻断；`pom.xml` 是目录、符号链接逃逸出审计根、声明摘要不一致 → 违规；非 Git 仓库、审计根不是目录 → 被阻断；隔离不通过时不执行 git 且只报违规；未跟踪生成物不算 dirty（生成 SBOM 后仍可执行）；以及 35 项单元检查（路径包含关系与大小写、文件系统根、`..` 段、隔离判定、40 位/64 位形状、porcelain 条目识别与 3 项 NIST SHA-256 向量）。每一例都同时断言 `admitted`/`verified` 恒为 `false`。
+自检（`--self-test`，不读磁盘、不执行任何命令）覆盖：合法外部审计目录 → `external-audit-ready`；仓库内路径、边界目录内、仓库上级目录、文件系统根 → 被阻断（违规）；短 SHA → 参数层用法错误（64）与判定层被阻断；HEAD 不匹配、工作树不干净（含**只增加未跟踪生成物**）→ 被阻断（违规）；缺 `HEAD:pom.xml` → 被阻断；`pom.xml` 是目录、符号链接逃逸出审计根、声明摘要不一致 → 被阻断（违规）；无 `.git`、审计根不是目录 → 被阻断；隔离不通过时不执行任何 git 命令；**在合法输入上叠加仓库内 `gate-manifest.json` 的 `stage=admitted` 不改变判定**（证明确实不读仓库内门禁状态）；以及 64 项单元检查（严格 40 位 SHA 解析、严格 porcelain 解析与 fail-closed、路径包含关系与大小写、文件系统根、`..` 段、隔离规则、verdict 契约与 3 项 NIST SHA-256 向量）。每一例都同时断言 `admitted`/`verified` 恒为 `false`。
 
-本机实测（2026-10-08，可复现，本轮由实施会话重新执行）：`D:\ruoyi-audit\RuoYi-Vue-springboot3-current` 的 `HEAD=a51a838b71b446ea27256900efe7ed2faa2a02fd`、工作树无已跟踪变更（未跟踪 0 个）、根 `pom.xml` 的 SHA-256 为 `16bf030a…`、`HEAD:pom.xml` blob SHA-1 为 `699a3bcc…`，因此 `verdict=external-audit-ready`（退出码 0；报告中 `admitted=verified=false`）。同一命令指向另一条线的检出（`D:\ruoyi-audit\RuoYi-Vue-0e2d75c2`，`HEAD=0e2d75c2…`）会因 HEAD 与固定 commit 不一致判**违规**（退出码 1）；指向仓库内路径（如 `services`）或仓库上级目录（如 `D:\WorkSpace`）判**违规**（退出码 1，且隔离不通过时一条 git 命令都不执行）；指向仓库外非 Git 目录（如系统临时目录）判**被阻断**（退出码 2）；`--audit-commit` 只给 12 位短 SHA、给分支名、`--audit-root` 给相对路径或含 `..` 段判**用法错误**（退出码 64）。另在系统临时目录用 `git init` 造了一个一次性固定 pin 检出做端到端复核：干净 + 声明的输入摘要 → 0；换成另一个 40 位 SHA → 1；修改已跟踪的 `pom.xml` → 1（并点名该文件）；只增加未跟踪的 `sbom.cyclonedx.json` 与 `target/` → 0（未跟踪 2 个）。这些都是本机实测，不是声明。
+本机实测（2026-10-08，可复现）：`D:\ruoyi-audit\RuoYi-Vue-springboot3-current` 的 `HEAD=a51a838b71b446ea27256900efe7ed2faa2a02fd`、工作树干净、`HEAD:pom.xml` 内容 SHA-256 为 `16bf030a…`、blob SHA-1 为 `699a3bcc…`，因此 8/8 前置满足，`verdict=external-audit-ready`（退出码 0；报告中 `admitted=verified=false`）——**同一时刻仓库内 `check-gate.mjs` 的 `stage` 仍是 `pre-poc-gate`（默认模式退出码 2）**，正好证明审计模式不依赖仓库内准入。同一命令指向另一条线的检出（`D:\ruoyi-audit\RuoYi-Vue-0e2d75c2`，`HEAD=0e2d75c2…`）判被阻断（违规，退出码 1）；指向仓库内路径（如 `services`）、边界目录 `services/ruoyi-api` 或仓库上级目录（如 `D:\WorkSpace`）判被阻断（违规，退出码 1；隔离不通过时一条 git 命令都不执行）；指向仓库外非 Git 目录（如系统临时目录）判被阻断（退出码 2）；`--audit-commit` 只给 12 位短 SHA、给分支名、`--audit-root` 给相对路径或含 `..` 段判用法错误（退出码 64）。另在系统临时目录用 `git init` 造了一个一次性固定 pin 检出做端到端复核：干净 + 声明的输入摘要 → `external-audit-ready`（0）；换成另一个 40 位 SHA → 被阻断（1）；修改已跟踪的 `pom.xml` → 被阻断（1，点名该文件）；只在检出里新增未跟踪的 `sbom.cyclonedx.json` → 同样被阻断（1，未跟踪文件也算不干净，提示把生成物写到检出目录之外）。运行前后审计检出的 `.git/index` 与 `.git/HEAD` mtime 不变，证明核验本身不写任何文件。这些都是本机实测，不是声明。
 
-### 12.6 隔离目录可先生成哪些证据、回填到哪（路径必须先统一）
+### 12.6 隔离目录可先生成哪些证据、回填到哪（`sbom` 已统一，其余四项待统一）
 
-真实证据可以在仓库外的隔离目录里生成（生成时记录工具与版本、输入锁定文件、生成时间与实例版本），但**回填前路径必须统一**，且每个证据项的唯一目标路径以 `provenance-manifest.json` 的 `evidence[].path` 为准：
+真实证据可以在仓库外的隔离检出**之外**生成（生成时记录工具与版本、输入锁定文件、生成时间与实例版本），但**回填前路径必须统一**，且每个证据项的唯一目标路径以 `provenance-manifest.json` 的 `evidence[].path` 为准。核验在**开始生成之前**跑：核验通过后，构建/生成过程可能让检出不再干净（例如 Maven 写 `target/`），这时的「前置可执行」结论不再成立（需重新核验），但已记录的固定 commit 与根 `pom.xml` 内容摘要仍然可复核。
 
-| 证据项                 | 在隔离目录里怎么生成                                   | 回填目标路径（唯一）                                                   |
+| 证据项                 | 怎么生成（检出保持干净）                               | 回填目标路径（唯一）                                                   |
 | ---------------------- | ------------------------------------------------------ | ---------------------------------------------------------------------- |
 | SBOM（CycloneDX）      | 用 Maven CycloneDX 插件或 SBOM 工具对已锁定依赖生成    | `services/ruoyi-api/compliance/provenance/sbom.cyclonedx.json`         |
 | 漏洞扫描               | 扫描已锁定依赖清单或已生成的 SBOM，逐项记录处置结论    | `services/ruoyi-api/compliance/provenance/vulnerability-scan.md`       |
@@ -518,7 +522,7 @@ node services/ruoyi-api/toolchain/check-capability.mjs --audit-root "..." --audi
 
 - **回填路径必须与两条清单一致**：唯一目标路径以 `provenance-manifest.json` 的 `evidence[].path` 为准（上表）；`gate-manifest.json` 的 `complianceArtifacts` 是**并列的另一条清单**（记的是准入门禁用的合规产物），两条清单必须指向同一份证据文件——其中 `sbom` 已统一为 `services/ruoyi-api/compliance/provenance/sbom.cyclonedx.json`。其余四项（`license` / `notice` / `dependency-licenses` / `vulnerability-scan`）在两条清单里记的仍是不同的文件或粒度（例如准入门禁记「原文副本」，证据清单记「证据说明文档」），回填前必须逐项裁定并统一，**不得让同一份证据出现两条路径**。核对方式：分别运行 `node services/ruoyi-api/toolchain/check-gate.mjs --json` 与 `node services/ruoyi-api/toolchain/check-provenance.mjs --json`，逐项比对两份报告里的路径。
 - 回填后逐项给出 `fileSha256` 与内容标记（如 SBOM 的 `bomFormat`/`specVersion`/`components`），由 `check-provenance.mjs` 判定；证据状态只能由实际核验推进，不能为了过检查器预先写成 `verified`。
-- 摘要口径要写明字节流：本机 `core.autocrlf=true`，同一份文件「git blob 字节（LF）」与「工作区检出字节（CRLF）」的 SHA-256 可能不同（§10.2 已记录 LICENSE 的两种摘要）。外部审计模式报告的是**工作区字节**的 SHA-256，登记证据时必须注明采用哪一种。
+- 摘要口径要写明字节流：外部审计模式报告的是**固定 commit 中 `pom.xml` 的内容字节**（`git show HEAD:pom.xml`，LF）的 SHA-256 与 blob SHA-1，并在给出 `--audit-pom-sha256` 时与之比对；本机 `core.autocrlf=true` 时工作区检出字节（CRLF）的 SHA-256 可能不同（§10.2 已记录 LICENSE 的两种摘要），登记证据时必须注明采用哪一种字节流。
 
 ### 12.7 仍然保留的阻断与禁入（本模式不解除）
 

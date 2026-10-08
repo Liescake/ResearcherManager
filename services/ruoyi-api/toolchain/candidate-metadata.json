@@ -156,11 +156,11 @@
           "pathsContainingNoticeCount": 11,
           "pathsContainingNoticeNature": "全部为 RuoYi 业务类（SysNoticeController/SysNotice/SysNoticeRead/SysNoticeMapper 等），不是 NOTICE 合规文件",
           "twoHostTreeEquality": "GitHub 镜像与 Gitee 主仓库的全树逐条目比对（type:path → sha）：两侧各 477 个条目，单侧独有 0 个，sha 不一致 0 个",
-          "reproduceCommandVerifiedOnThisHost": "见本文件 reproduce 第 6、7 步；两条命令均在本机用 node 内置 fetch 实测通过（curl.exe 与 Invoke-RestMethod 在本机不可用）",
+          "reproduceCommandVerifiedOnThisHost": "见本文件 reproduce 第 6–8 步；三条命令（含第 8 步的 Gitee 网页 raw 字节摘要）均在本机用 node 内置 fetch 实测通过（curl.exe 与 Invoke-RestMethod 在本机不可用）",
           "notTheGateVerified": "本轮不写证据文件、不改任何闸门状态，也不声明 provenance 证据 verified；gate-manifest.json 的候选固定值仍为 tag=null/commit=null/resolved=false，因此按 check-provenance.mjs 的交叉核验规则，此时也不可能诚实成立 verified。"
         }
       },
-      "method": "只取公开元数据与摘要，不复制原文：①公共 tree 端点列出候选 commit 根树，确认存在 LICENSE（blob 8564f294…，size 1071）；②公共递归 tree 端点（truncated=false）列出全树 477 个条目/334 个 blob，按文件名精确匹配确认没有任何 NOTICE/COPYING/COPYRIGHT 类文件，并把 11 条含 “notice” 的业务路径排除；③GitHub 仓库端点给出 license.spdx_id=MIT，单文件 license 端点（?ref=候选提交）给出 path=LICENSE、sha=8564f294…、size=1071；④公共 blob 端点取回 base64 字节，在内存中解码后按 git 对象格式重算 blob SHA-1（与 tree 端点一致）并计算 SHA-256，全程不落盘；⑤Gitee 主仓库的 contents 端点与递归 tree 端点交叉核验同一 blob 与同一棵树；⑥逐个条目比对两主机全树（path→sha）一致。第三轮不再依赖仓库外只读副本即可复现全部摘要。",
+      "method": "只取公开元数据与摘要，不复制原文：①公共 tree 端点列出候选 commit 根树，确认存在 LICENSE（blob 8564f294…，size 1071）；②公共递归 tree 端点（truncated=false）列出全树 477 个条目/334 个 blob，按文件名精确匹配确认没有任何 NOTICE/COPYING/COPYRIGHT 类文件，并把 11 条含 “notice” 的业务路径排除；③GitHub 仓库端点给出 license.spdx_id=MIT，单文件 license 端点（?ref=候选提交）给出 path=LICENSE、sha=8564f294…、size=1071；④公共 blob 端点取回 base64 字节，在内存中解码后按 git 对象格式重算 blob SHA-1（与 tree 端点一致）并计算 SHA-256，全程不落盘；⑤Gitee 主仓库的 contents 端点与递归 tree 端点交叉核验同一 blob 与同一棵树；⑥逐个条目比对两主机全树（path→sha）一致；⑦Gitee 网页 raw 端点取回同一 LICENSE 的 1071 B 字节并在内存中计算 SHA-256，与 GitHub API blob 端点逐字节一致（构成第二主机字节来源；GitHub raw 在本机不可达）。第三轮不再依赖仓库外只读副本即可复现全部摘要。",
       "sources": [
         "https://api.github.com/repos/yangzongzhuan/RuoYi-Vue",
         "https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/git/trees/a51a838b71b446ea27256900efe7ed2faa2a02fd",
