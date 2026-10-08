@@ -1,0 +1,164 @@
+{
+  "contract": "ruoyi-toolchain-gate",
+  "manifestVersion": "0.1.0",
+  "stage": "pre-poc-gate",
+  "boundary": {
+    "rule": "在准入前置与工具链门禁全部满足前，services/ruoyi-api 内不得出现 Maven 工程、Java/Kotlin 源码、构建产物或 RuoYi 源码副本。",
+    "scanRoot": "services/ruoyi-api",
+    "forbiddenFiles": [
+      "pom.xml",
+      "mvnw",
+      "mvnw.cmd",
+      "build.gradle",
+      "build.gradle.kts",
+      "settings.gradle",
+      "settings.gradle.kts"
+    ],
+    "forbiddenExtensions": [".java", ".kt", ".kts", ".jar", ".war", ".class"],
+    "forbiddenDirectories": ["src/main/java", "src/test/java", ".mvn"],
+    "ruoyiSourceMarkers": [
+      "ruoyi-admin",
+      "ruoyi-common",
+      "ruoyi-framework",
+      "ruoyi-generator",
+      "ruoyi-quartz",
+      "ruoyi-system",
+      "ruoyi-ui",
+      "RuoYi-Vue"
+    ],
+    "forbiddenTextMarkers": ["docs/"],
+    "frozenPaths": ["services/api", "db/migrations"],
+    "allowedImportSpecifiers": [
+      "node:assert",
+      "node:child_process",
+      "node:fs",
+      "node:os",
+      "node:path",
+      "node:process",
+      "node:url"
+    ],
+    "forbidNetworkAccess": true,
+    "forbidDependencyDownload": true,
+    "forbidInternalDocumentReferences": true
+  },
+  "toolchain": {
+    "jdk": { "minMajor": 17, "requirement": "JDK 17+" },
+    "maven": { "minVersion": "3.9.0", "requirement": "Maven 3.9+" }
+  },
+  "candidate": {
+    "target": {
+      "project": "RuoYi-Vue",
+      "line": "spring-boot-3",
+      "minJdkMajor": 17,
+      "note": "候选观测值、哈希与许可证原文保存在本地内部审计记录中，不进入本公开目录。"
+    },
+    "pinned": { "tag": null, "commit": null, "resolved": false },
+    "unresolvedReasons": [
+      "toolchain-jdk",
+      "toolchain-maven",
+      "candidate-commit",
+      "license-notice",
+      "dependency-licenses",
+      "sbom",
+      "vulnerability-scan",
+      "postgresql-compatibility",
+      "security-review",
+      "final-review"
+    ],
+    "rules": {
+      "commitFormat": "^[0-9a-f]{40}$",
+      "requireTagWithCommit": true,
+      "requirePrerequisitesBeforePin": true,
+      "rejectFabricatedReferences": true
+    }
+  },
+  "admissionPrerequisites": [
+    {
+      "id": "toolchain-jdk",
+      "status": "pending",
+      "requirement": "本机 JDK 17+ 可用（版本探测达要求）"
+    },
+    {
+      "id": "toolchain-maven",
+      "status": "pending",
+      "requirement": "本机 Maven 3.9+ 可用（版本探测达要求）"
+    },
+    {
+      "id": "candidate-commit",
+      "status": "pending",
+      "requirement": "固定实际 Spring Boot 3 候选 commit（40 位 SHA + tag），并核对其 POM 声明与 JDK 要求"
+    },
+    {
+      "id": "license-notice",
+      "status": "pending",
+      "requirement": "保留候选仓库原始 LICENSE/NOTICE 原文与哈希证据"
+    },
+    {
+      "id": "dependency-licenses",
+      "status": "pending",
+      "requirement": "生成传递依赖许可证清单并复核第三方声明"
+    },
+    {
+      "id": "sbom",
+      "status": "pending",
+      "requirement": "生成依赖树与 SBOM（记录工具、版本、生成时间与输入锁定文件）"
+    },
+    {
+      "id": "vulnerability-scan",
+      "status": "pending",
+      "requirement": "完成依赖漏洞扫描并记录工具、规则版本、结果与处置结论"
+    },
+    {
+      "id": "postgresql-compatibility",
+      "status": "pending",
+      "requirement": "在隔离 PostgreSQL 实例验证 DDL、分页、时间、事务、索引与迁移回滚"
+    },
+    {
+      "id": "security-review",
+      "status": "pending",
+      "requirement": "完成架构与安全独立审查，记录变更范围与关键安全边界"
+    },
+    {
+      "id": "final-review",
+      "status": "pending",
+      "requirement": "完成独立安全终审并保留放行结论"
+    }
+  ],
+  "complianceArtifacts": [
+    {
+      "id": "license",
+      "path": "services/ruoyi-api/compliance/LICENSE",
+      "status": "pending",
+      "description": "候选仓库原始许可证原文副本"
+    },
+    {
+      "id": "notice",
+      "path": "services/ruoyi-api/compliance/NOTICE",
+      "status": "pending",
+      "description": "第三方 NOTICE 与版权声明副本（若上游存在）"
+    },
+    {
+      "id": "dependency-licenses",
+      "path": "services/ruoyi-api/compliance/dependency-licenses.md",
+      "status": "pending",
+      "description": "传递依赖许可证清单与复核结论"
+    },
+    {
+      "id": "sbom",
+      "path": "services/ruoyi-api/compliance/sbom.cyclonedx.json",
+      "status": "pending",
+      "description": "依赖 SBOM（含工具与版本）"
+    },
+    {
+      "id": "vulnerability-scan",
+      "path": "services/ruoyi-api/compliance/vulnerability-scan.md",
+      "status": "pending",
+      "description": "漏洞扫描结果与逐项处置结论"
+    }
+  ],
+  "nonGoals": [
+    "本清单不保存 RuoYi 源码、候选 POM 副本、依赖锁定文件或任何构建产物。",
+    "本清单不声明可构建、可运行或生产就绪；它只描述准入前置与禁止项。",
+    "本清单不替代公开契约校验（services/ruoyi-api/contracts/validate.mjs）与人工安全评审。"
+  ]
+}

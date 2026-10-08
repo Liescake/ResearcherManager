@@ -11,7 +11,7 @@
 - 目标运行时：JDK 17+
 - 构建工具：Maven 3.9+
 - 目标数据库：PostgreSQL（必须先完成方言和迁移验证）
-- 当前工作区已知限制：本机核验时为 Java 8，未安装 Maven；因此当前目录不包含 `pom.xml`，也不声明可构建。
+- 当前工作区已知限制：本机核验时为 Java 8，未安装 Maven；因此当前目录不包含 `pom.xml`，也不声明可构建。该限制可用 `toolchain/check-gate.mjs` 随时复核（见下节）。
 - RuoYi 候选源码位于仓库外审计目录，不属于本目录和本仓库。
 
 ## POC 范围（后续实现）
@@ -41,6 +41,16 @@ node services/ruoyi-api/contracts/validate.mjs
 ```
 
 校验范围与判定语义见 `contracts/README.md` §7：结构校验 + 授权场景重放 + 全量 `$ref` 解析。
+
+## 工具链与准入门禁检查
+
+`toolchain/` 下的公开检查器（只用 Node 内置模块，不联网、不下载依赖、不写仓库）在创建 `pom.xml` 或 Java 源码之前核验本机工具链、候选 commit 元数据占位与准入前置：
+
+```bash
+node services/ruoyi-api/toolchain/check-gate.mjs
+```
+
+判定语义与探测方式见 `toolchain/README.md`：退出码 0 通过；1 违规（门禁前出现 `pom.xml`、Java 源码或 RuoYi 源码副本，或占位/状态与事实不符）；2 未准入（本机 JDK/Maven 未达标或准入前置未满足）。只有在清单把 `stage` 提升为 `admitted`（要求候选 commit 已冻结、全部准入前置带证据满足、合规产物就位）之后，本目录才允许出现 Maven 工程与 Java 源码；本机当前为 Java 8 且未安装 Maven，因此该检查按设计返回未准入。
 
 ## 保留的现有边界
 
