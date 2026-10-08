@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "noEmit": true,
+    "composite": false,
+    "types": ["node"],
+    "lib": ["ES2022"],
+    "paths": {
+      "@rm/shared": ["../../packages/shared/src/index.ts"],
+      "@rm/ai-adapter": ["../../packages/ai-adapter/src/index.ts"]
+    }
+  },
+  "include": ["src/**/*.ts"]
+}

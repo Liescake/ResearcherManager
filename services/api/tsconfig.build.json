@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": true,
+    "tsBuildInfoFile": "dist/.tsbuildinfo",
+    "paths": {}
+  },
+  "exclude": ["dist", "src/**/*.spec.ts", "src/**/__tests__/**"]
+}

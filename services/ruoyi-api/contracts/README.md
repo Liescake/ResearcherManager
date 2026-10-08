@@ -84,6 +84,26 @@
 - **范围判定是「单角色严格相等」**：命中某个角色时，`request.scope` 必须等于该角色的默认范围（`DEFAULT_ROLE_DATA_SCOPE`）；需要不同范围时，只能由主体**同时持有相应角色**、经多角色并集的另一条分支满足（例如同时持 `system_admin` 与 `admin`，才能在 `ASSIGNED` 范围下操作）。仅持 `system_admin` 而请求 `ASSIGNED` 会被拒绝。
 - 本切片谓词的输入只有 `roles` / `groupIds` / `assignedResourceIds`，**没有**「按用户授予的权限集合」这一输入：`isAuthorized` 只按角色的默认权限目录（`DEFAULT_ROLE_PERMISSIONS`）判定。因此上表所述「由超级管理员明确授予的原子权限」在本契约中体现为角色默认集合的固定边界；动态授予需后续切片新增独立输入后另行定义，并同步更新夹具。
 
+### 4.1 RuoYi 兼容适配器接口（可回退基线）
+
+在 RuoYi 体系尚未准入之前，NestJS 基线提供一个**可回退的适配器边界**，位置与职责如下（不改变既有 API 行为，也不声称 RuoYi 已接入）：
+
+| 文件（`services/api/src/modules/ruoyi-adapter/`） | 职责                                                                                |
+| ------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `ruoyi-adapter.port.ts`                           | 端口 `RuoYiAuthzAdapter`（`checkAuthorization` / `checkGrant`）、能力声明与 DI 令牌 |
+| `ruoyi-adapter.baseline.ts`                       | 基线实现：只做委托（见下），能力声明 backend = `nestjs-baseline`                    |
+| `ruoyi-adapter.module.ts`                         | 绑定 `RUOYI_AUTHZ_ADAPTER → BaselineRuoYiAuthzAdapter`，导出端口，不注册任何路由    |
+| `contract/health-contract.ts`                     | 健康探针契约的字段/取值约束（不解析 YAML，不复制契约文案）                          |
+| `contract/authz-fixtures.ts`                      | 夹具读取与跨边界强制转换（未登记枚举 → undefined → 拒绝）                           |
+
+约定：
+
+1. **端口只接受服务端解析结果**：与 §4 的 `authorize(subject, request)` 语义相同，客户端提交的 `scope` / `groupId` / `role` / 资源归属永不作为入参。
+2. **基线实现只做委托**：判定仍由 `packages/shared` 的 `isAuthorized` / `canGrantPermissions` 完成，适配器只额外负责边界强制转换（未登记权限/范围/角色在进入谓词前即判拒绝）与结构化决策（便于接审计切片）。因此「适配器路径」与「基线路径」在契约重放中必然同结果。
+3. **能力声明必须如实**：`menuRbacBackend` / `ruoyiDataScopeBackend` 基线上恒为 `false`，`ruoyiSourceIncluded` / `mavenDependencyIntroduced` 恒为 `false`；只有真正切换实现时才允许改变，且必须同步本节与 `x-boundary`。
+4. **切换即回退点**：迁移到 RuoYi 时把该 provider 换成 RuoYi 侧实现（或在测试中替换 DI 令牌）即可，调用方无需改动；本模块不注册路由，因此不影响现有 API 的对外行为。
+5. 适配器**不承载**认证（401）、状态机、审计落库与脱敏——它们是后续切片。
+
 ## 5. `authz-fixtures.json` 夹具格式
 
 顶层字段：
@@ -161,6 +181,24 @@ git diff --check
 ```
 
 7.4 的判定入口为 `packages/shared/dist/index.js` 的 `isAuthorized` / `canGrantPermissions`，输入即夹具中的 `subject` / `request` / `actor` / `grants`；`enums` 快照必须与 `packages/shared/src/enums/permission.ts` 完全一致（7.1 已自动核对）。
+
+### 7.6 与 NestJS 基线的双向符合性回归
+
+§7.1 校验的是**契约文件本身**；下列回归校验的是**运行时响应是否真的符合契约**，属于运行期一侧：
+
+```bash
+pnpm --filter @rm/api test    # vitest：契约符合性 + 夹具重放
+```
+
+| 测试文件（`services/api/src/modules/ruoyi-adapter/`） | 覆盖内容                                                                                                                                           |
+| ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ruoyi-adapter.baseline.spec.ts`                      | 能力声明如实（未接入 RuoYi 不得声明 true）、默认拒绝原因、判定与基线谓词一致、观察者不落主体标识                                                   |
+| `contract/health-contract.spec.ts`                    | `GET /health`、`GET /health/ready` 的真实数据满足契约字段/取值/闭集/`additionalProperties: false`                                                  |
+| `contract/authz-fixtures.spec.ts`                     | `authz-fixtures.json` 全量重放：基线谓词与适配器都必须等于 `expect.allowed`；`clientClaims` 必须被忽略且确实伪造；`enums` 快照与 `@rm/shared` 一致 |
+
+这组测试与 §7.1 互为交叉验证：§7.1 用自包含参考执行器把夹具断言到文档语义，§7.6 用**真实生产代码路径**（`AuthorizationPolicy` + 适配器）复算同一批夹具。
+
+注意：契约文件在运行期**不可达时不会静默跳过**——`contract/*.spec.ts` 会明确失败并提示需在仓库根内运行，避免「测试通过但契约其实没被读到」的假阳性。
 
 ## 8. 后续契约切片与版本规则
 
