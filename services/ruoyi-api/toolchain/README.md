@@ -332,17 +332,17 @@ node services/ruoyi-api/toolchain/check-capability.mjs --audit-root "<仓库外�
 
 第三轮把许可证/NOTICE 的核验从「公开元数据 + 仓库外只读副本」推进到**只用公开仓库 API 即可完整复现**：LICENSE 的字节摘要不再依赖任何本地克隆，而是在内存中取回、解码、摘要后立即丢弃。观测值如下（候选提交 `a51a838b71b446ea27256900efe7ed2faa2a02fd`）：
 
-| 项                         | 观测值                                                                                                                                                                  | 来源（公开端点）                                                                                                                                            |
-| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 许可证类型（SPDX）         | `MIT`（`license.name` = `MIT License`）                                                                                                                                 | GitHub 仓库端点 `license.spdx_id`（启发式识别）＋该提交的单文件 license 端点 `?ref=<commit>`（`path=LICENSE`、`sha=8564f294…`、`size=1071`、`spdx_id=MIT`） |
-| LICENSE 路径               | `LICENSE`（候选提交**根目录**，精确文件名；根树 16 个条目中唯一的许可类文件）                                                                                           | 公共根 tree 端点 ＋ 全树递归端点                                                                                                                            |
-| LICENSE 网页 URL           | `https://github.com/yangzongzhuan/RuoYi-Vue/blob/a51a838b71b446ea27256900efe7ed2faa2a02fd/LICENSE`（HTTP 200）                                                          | 浏览器可读；Gitee 侧对应 `https://gitee.com/y_project/RuoYi-Vue/blob/springboot3/LICENSE`（HTTP 200）                                                       |
-| LICENSE blob               | `8564f294c7781cbbbdb22ae5927a96f859db0054`（size 1071）                                                                                                                 | 公共 tree 端点；blob 端点 `git/blobs/8564f294…`（base64）                                                                                                   |
-| LICENSE 字节 SHA-256       | `7296da00ac5dfc56c36e6ac10ce5abdb2900898c101d5c4720d7b6c1254dd993`                                                                                                      | GitHub API blob 端点与 Gitee 网页 raw 端点**各自**取回字节后内存计算，两主机摘要逐字节一致（只记录摘要，不落盘）                                            |
-| NOTICE 存在性              | **不存在**：全树 477 个条目（334 blob + 143 tree，`truncated=false`）中，精确文件名的许可类文件只有根 `LICENSE`；`NOTICE` / `NOTICE.txt` / `COPYING` / `COPYRIGHT` 均无 | 公共递归 tree 端点；11 条含 “notice” 的路径逐条核对全部是 RuoYi 业务类（`SysNotice`、`SysNoticeController` 等），与 NOTICE 合规文件无关                     |
-| 两主机一致性               | Gitee 主仓库与 GitHub 镜像的全树逐条目（`type:path` → `sha`）比对：各 477 个条目、单侧独有 0 个、sha 不一致 0 个                                                        | 两主机的递归 tree 端点 ＋ Gitee `contents/LICENSE?ref=springboot3`（`sha=8564f294…`、size 1071）                                                            |
-| POM blob / 字节 SHA-256    | `699a3bcc6a6df052525984b2a96628e3c6c5664e`（size 8513） / `16bf030a8e4c79c978bbf11eb6f6e18475771c10f4708d9e62e219480a172c9a`                                            | 公共 tree 端点（本轮核对 blob sha/size）＋ 第一/二轮的仓库外只读副本字节摘要（本轮未重算 SHA-256）                                                          |
-| LICENSE 工作区字节 SHA-256 | `46973d260eabeaf43df2478bf00dacf862911988eba72387596fcafbc4888cab`（1090 B、19 组 CRLF）                                                                                | 本机 `core.autocrlf=true` 检出后的工作区文件；与上一行的 blob 字节摘要**不同**，登记 `license-file-sha256` 时必须写明采用哪一种字节流                       |
+| 项                         | 观测值                                                                                                                                                                                                                  | 来源（公开端点）                                                                                                                                            |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 许可证类型（SPDX）         | `MIT`（`license.name` = `MIT License`）                                                                                                                                                                                 | GitHub 仓库端点 `license.spdx_id`（启发式识别）＋该提交的单文件 license 端点 `?ref=<commit>`（`path=LICENSE`、`sha=8564f294…`、`size=1071`、`spdx_id=MIT`） |
+| LICENSE 路径               | `LICENSE`（候选提交**根目录**，精确文件名；根树 16 个条目中唯一的许可类文件）                                                                                                                                           | 公共根 tree 端点 ＋ 全树递归端点                                                                                                                            |
+| LICENSE 网页 URL           | `https://github.com/yangzongzhuan/RuoYi-Vue/blob/a51a838b71b446ea27256900efe7ed2faa2a02fd/LICENSE`（HTTP 200）                                                                                                          | 浏览器可读；Gitee 侧对应 `https://gitee.com/y_project/RuoYi-Vue/blob/springboot3/LICENSE`（HTTP 200）                                                       |
+| LICENSE blob               | `8564f294c7781cbbbdb22ae5927a96f859db0054`（size 1071）                                                                                                                                                                 | 公共 tree 端点；blob 端点 `git/blobs/8564f294…`（base64）                                                                                                   |
+| LICENSE 字节 SHA-256       | `7296da00ac5dfc56c36e6ac10ce5abdb2900898c101d5c4720d7b6c1254dd993`                                                                                                                                                      | GitHub API blob 端点与 Gitee 网页 raw 端点**各自**取回字节后内存计算，两主机摘要逐字节一致（只记录摘要，不落盘）                                            |
+| NOTICE 存在性              | **`absent-upstream` / `not-applicable`**（上游本就不存在）：全树 477 个条目（334 blob + 143 tree，`truncated=false`）中，精确文件名的许可类文件只有根 `LICENSE`；`NOTICE` / `NOTICE.txt` / `COPYING` / `COPYRIGHT` 均无 | 公共递归 tree 端点；11 条含 “notice” 的路径逐条核对全部是 RuoYi 业务类（`SysNotice`、`SysNoticeController` 等），与 NOTICE 合规文件无关                     |
+| 两主机一致性               | Gitee 主仓库与 GitHub 镜像的全树逐条目（`type:path` → `sha`）比对：各 477 个条目、单侧独有 0 个、sha 不一致 0 个                                                                                                        | 两主机的递归 tree 端点 ＋ Gitee `contents/LICENSE?ref=springboot3`（`sha=8564f294…`、size 1071）                                                            |
+| POM blob / 字节 SHA-256    | `699a3bcc6a6df052525984b2a96628e3c6c5664e`（size 8513） / `16bf030a8e4c79c978bbf11eb6f6e18475771c10f4708d9e62e219480a172c9a`                                                                                            | 公共 tree 端点（本轮核对 blob sha/size）＋ 第一/二轮的仓库外只读副本字节摘要（本轮未重算 SHA-256）                                                          |
+| LICENSE 工作区字节 SHA-256 | `46973d260eabeaf43df2478bf00dacf862911988eba72387596fcafbc4888cab`（1090 B、19 组 CRLF）                                                                                                                                | 本机 `core.autocrlf=true` 检出后的工作区文件；与上一行的 blob 字节摘要**不同**，登记 `license-file-sha256` 时必须写明采用哪一种字节流                       |
 
 复现方式（本机实测通过，命令见 `candidate-metadata.json` 的 `reproduce` 第 6–8 步）：`node -e` 一行命令访问公开 API → 递归 tree 端点统计全树条目与许可类文件 → blob 端点取 base64 字节 → 在内存中按 git 对象格式（`blob <长度>\0` + 内容）重算 blob SHA-1（与 tree 端点一致，证明取到的就是该公共提交的同一份字节）→ 对同一份字节算 SHA-256 → 在 Gitee 侧交叉核验同一 blob 与同一棵树 → 再在 **Gitee 网页 raw 端点**取回同一份 1071 B 字节并在内存计算 SHA-256，与 GitHub API blob 端点逐字节一致（第二主机字节来源）。
 
@@ -359,6 +359,8 @@ node services/ruoyi-api/toolchain/check-capability.mjs --audit-root "<仓库外�
 ### 10.3 为什么 `license-notice` 仍保持 `pending`（解除条件）
 
 第三轮把「公开元数据层面」的核验做完整了，但**证据状态不推进**：这是刻意的 fail-closed，不是遗漏。
+
+**NOTICE 的处置口径（已记录）**：候选提交的整个树里不存在 `NOTICE` / `NOTICE.txt` / `COPYING` / `COPYRIGHT`，因此「NOTICE 是否缺失」这一项按 **`absent-upstream`**（上游本就不存在该文件）记录、并按 **`not-applicable`**（没有第三方 NOTICE 需要再分发）处置。这只是**观测口径**，不是证据状态：`license-notice` 证据在**仓库外受控目录的 LICENSE 原文证据**与**非实施方的独立复核署名**完成之前一律保持 `pending`，不因上述口径而提前推进。
 
 1. **证据项要求原文证据与再分发说明，而本仓库明确不保存上游原文。** `provenance-manifest.json` 的 `license-notice` 要求「保留候选仓库原始 LICENSE 与 NOTICE 的证据：SPDX 标识、原文文件摘要、NOTICE 存在性与再分发说明」，与之配套的准入合规产物是 `gate-manifest.json` 的 `services/ruoyi-api/compliance/LICENSE`（「候选仓库原始许可证原文副本」）。本项目当前的边界是**不把上游 LICENSE/NOTICE 原文复制进本仓库**，因此该产物无法登记；此时把证据推进到 `present`/`verified` 会让读者以为许可证准入已就位，属于过度声明。
 2. **`verified` 还有本轮不可能诚实满足的硬条件。** `check-provenance.mjs` 要求 `verified` 给出核验时间与核验署名，并与准入门禁的候选固定值交叉核验；而 `gate-manifest.json` 的 `candidate.pinned` 仍为 `tag=null` / `commit=null` / `resolved=false`（候选未冻结，缺对应 tag），且按 §3.4 的独立审查要求不由实施方自证。此时声明 `verified` 会被检查器直接判为违规（退出码 1），因此**不伪造 verified**。
@@ -456,6 +458,15 @@ node services/ruoyi-api/toolchain/check-capability.mjs --self-test
 
 生成 SBOM/漏洞/PostgreSQL/许可证证据要求先有可构建的 Maven 工程（`pom.xml`），而创建 `pom.xml` 又要求门禁 `stage=admitted`，`admitted` 又要求这些证据的前置 `satisfied`——按这个顺序什么都推进不了。但真实证据**并不需要在本仓库内生成**：把候选的一份只读检出放在仓库之外（本机为 `D:\ruoyi-audit\RuoYi-Vue-springboot3-current`，浅克隆、固定到候选 commit），在它**之外的输出目录**里生成证据，再把**证据文件**回填进 `services/ruoyi-api/compliance/provenance/`。外部审计模式只回答一个问题：**这份隔离检出当前是否具备开始生成证据的前置**（即「固定 commit + 干净工作树 + 根 `pom.xml` 与输入摘要可复核」）。它不回答「证据是否已收集」（那是 `check-provenance.mjs`），也不回答「是否允许在仓库内建 Maven 工程」（那是 `check-gate.mjs`）。
 
+**推进顺序固定且不可颠倒（这是本项目的准入顺序，不因本模式而改变）：**
+
+1. **仓库外固定 commit 先生成真实证据**：在仓库之外的隔离检出上对固定 commit 产出许可证/NOTICE、SBOM（CycloneDX）、漏洞扫描与 PostgreSQL 兼容性四类**真实**证据（记录工具与版本、输入锁定文件、生成时间与实例版本），生成物写在检出目录之外，使检出保持干净；
+2. **按唯一路径回填**：证据文件回填到 `services/ruoyi-api/compliance/provenance/` 下（唯一目标路径见 §12.6），并给出 `fileSha256` 与内容标记；
+3. **由 `check-provenance.mjs` 判定**：五项来源/合规证据达到 `verified`；
+4. **之后才考虑仓库内准入**：全部准入前置带证据满足、合规产物就位后，才把 `gate-manifest.json` 的 `stage` 提升为 `admitted`，也才允许在本目录出现 `pom.xml` 与 Java 源码。
+
+**仓库内准入不是生成证据的前提，恰恰相反：先有仓库外真实证据，仓库内准入才有依据。** 本模式只负责第 1 步之前的「前置是否具备」，既不生成证据，也不推进任何状态。
+
 ### 12.2 本模式只做四类前置核验
 
 | 类别          | 核验内容                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | 判失败                                                                                          |
@@ -477,12 +488,12 @@ node services/ruoyi-api/toolchain/check-capability.mjs --self-test
 
 ### 12.4 判定与退出码
 
-| 判定                 | 含义                                                                                                                                                                  | 退出码 |
-| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -----: |
-| 外部审计前置可执行   | 8 项前置全部满足，正向结论 `verdict=external-audit-ready`；**不等于 admitted，也不等于 verified**                                                                     |      0 |
-| 被阻断（违规）       | 隔离被破坏（边界目录内、仓库内、仓库上级、文件系统根、符号链接逃逸、`pom.xml` 不是常规文件）或外部事实与固定 commit 矛盾（HEAD 不一致、工作树不干净、声明摘要不匹配） |      1 |
-| 被阻断（前置未满足） | 结构合法但前置未满足（无 `.git`、git 不可用、工作树状态不可读、`HEAD:pom.xml` 缺失或不可读、realpath 失败、审计根不是目录）                                           |      2 |
-| 用法错误             | 参数形状非法（缺 `--audit-commit`、短 SHA、相对路径、含 `..`、文件系统根、非 64 位摘要、与 `--java-home`/`--maven-home` 同用）                                        |     64 |
+| 判定                 | 含义                                                                                                                                                | 退出码 |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | -----: |
+| 外部审计前置可执行   | 8 项前置全部满足，正向结论 `verdict=external-audit-ready`；**不等于 admitted，也不等于 verified**                                                   |      0 |
+| 被阻断（违规）       | 隔离被破坏（边界目录内、仓库内、仓库上级、文件系统根、符号链接逃逸回仓库）或外部事实与固定 commit 矛盾（HEAD 不一致、工作树不干净、声明摘要不匹配） |      1 |
+| 被阻断（前置未满足） | 结构合法但前置未满足（无 `.git`、git 不可用、工作树状态不可读、`HEAD:pom.xml` 缺失或不可读、realpath 失败、审计根不是目录）                         |      2 |
+| 用法错误             | 参数形状非法（缺 `--audit-commit`、短 SHA、相对路径、含 `..`、文件系统根、非 64 位摘要、与 `--java-home`/`--maven-home` 同用）                      |     64 |
 
 **verdict 只有两个取值**（`external-audit-ready` 与 `blocked`）：隔离违规与「前置未满足」都落在 `blocked`，只用退出码 1/2 区分原因，明细保留在 `violations` / `preconditions` 里，**绝不**产生第三个 verdict。输出中 `admitted`、`verified`、`evidenceGenerated` 恒为 `false`，正向结论只有 `verdict=external-audit-ready`（中文表述「外部审计前置可执行」，含义是前置齐备、可以开始生成证据，**不是**「已准入」也**不是**「已核验」）；`--report` 仍恒以 0 结束。
 
@@ -504,9 +515,9 @@ node services/ruoyi-api/toolchain/check-capability.mjs \
 node services/ruoyi-api/toolchain/check-capability.mjs --audit-root "..." --audit-commit "..." --json
 ```
 
-自检（`--self-test`，不读磁盘、不执行任何命令）覆盖：合法外部审计目录 → `external-audit-ready`；仓库内路径、边界目录内、仓库上级目录、文件系统根 → 被阻断（违规）；短 SHA → 参数层用法错误（64）与判定层被阻断；HEAD 不匹配、工作树不干净（含**只增加未跟踪生成物**）→ 被阻断（违规）；缺 `HEAD:pom.xml` → 被阻断；`pom.xml` 是目录、符号链接逃逸出审计根、声明摘要不一致 → 被阻断（违规）；无 `.git`、审计根不是目录 → 被阻断；隔离不通过时不执行任何 git 命令；**在合法输入上叠加仓库内 `gate-manifest.json` 的 `stage=admitted` 不改变判定**（证明确实不读仓库内门禁状态）；以及 64 项单元检查（严格 40 位 SHA 解析、严格 porcelain 解析与 fail-closed、路径包含关系与大小写、文件系统根、`..` 段、隔离规则、verdict 契约与 3 项 NIST SHA-256 向量）。每一例都同时断言 `admitted`/`verified` 恒为 `false`。
+自检（`--self-test`，只用合成输入：不读磁盘、不执行任何命令、**不为测试创建源码或 `pom.xml`**——审计根、`.git`、工作树状态、HEAD 与 pom 摘要全部由纯函数注入）覆盖：合法外部审计目录 → `external-audit-ready`；仓库内路径、边界目录内、仓库上级目录、文件系统根 → 被阻断（违规）；短 SHA → 参数层用法错误（64）与判定层被阻断；HEAD 不匹配、工作树不干净（含**只增加未跟踪生成物**）→ 被阻断（违规）；缺 `HEAD:pom.xml` → 被阻断；符号链接逃逸回仓库、声明摘要不一致或形状非法 → 被阻断（违规）；无 `.git`、审计根不是目录 → 被阻断；隔离不通过时不执行任何 git 命令；**在合法输入上叠加仓库内 `gate-manifest.json` 的 `stage=admitted` 不改变判定**（证明确实不读仓库内门禁状态）；以及 64 项单元检查（严格 40 位 SHA 解析、严格 porcelain 解析与 fail-closed、路径包含关系与大小写、文件系统根、`..` 段、隔离规则、verdict 契约与 3 项 NIST SHA-256 向量）。每一例都同时断言 `admitted`/`verified` 恒为 `false`。
 
-本机实测（2026-10-08，可复现）：`D:\ruoyi-audit\RuoYi-Vue-springboot3-current` 的 `HEAD=a51a838b71b446ea27256900efe7ed2faa2a02fd`、工作树干净、`HEAD:pom.xml` 内容 SHA-256 为 `16bf030a…`、blob SHA-1 为 `699a3bcc…`，因此 8/8 前置满足，`verdict=external-audit-ready`（退出码 0；报告中 `admitted=verified=false`）——**同一时刻仓库内 `check-gate.mjs` 的 `stage` 仍是 `pre-poc-gate`（默认模式退出码 2）**，正好证明审计模式不依赖仓库内准入。同一命令指向另一条线的检出（`D:\ruoyi-audit\RuoYi-Vue-0e2d75c2`，`HEAD=0e2d75c2…`）判被阻断（违规，退出码 1）；指向仓库内路径（如 `services`）、边界目录 `services/ruoyi-api` 或仓库上级目录（如 `D:\WorkSpace`）判被阻断（违规，退出码 1；隔离不通过时一条 git 命令都不执行）；指向仓库外非 Git 目录（如系统临时目录）判被阻断（退出码 2）；`--audit-commit` 只给 12 位短 SHA、给分支名、`--audit-root` 给相对路径或含 `..` 段判用法错误（退出码 64）。另在系统临时目录用 `git init` 造了一个一次性固定 pin 检出做端到端复核：干净 + 声明的输入摘要 → `external-audit-ready`（0）；换成另一个 40 位 SHA → 被阻断（1）；修改已跟踪的 `pom.xml` → 被阻断（1，点名该文件）；只在检出里新增未跟踪的 `sbom.cyclonedx.json` → 同样被阻断（1，未跟踪文件也算不干净，提示把生成物写到检出目录之外）。运行前后审计检出的 `.git/index` 与 `.git/HEAD` mtime 不变，证明核验本身不写任何文件。这些都是本机实测，不是声明。
+本机实测（2026-10-08，可复现）：`D:\ruoyi-audit\RuoYi-Vue-springboot3-current` 的 `HEAD=a51a838b71b446ea27256900efe7ed2faa2a02fd`、工作树干净、`HEAD:pom.xml` 内容 SHA-256 为 `16bf030a…`、blob SHA-1 为 `699a3bcc…`，因此 8/8 前置满足，`verdict=external-audit-ready`（退出码 0；报告中 `admitted=verified=false`）——**同一时刻仓库内 `check-gate.mjs` 的 `stage` 仍是 `pre-poc-gate`（默认模式退出码 2）**，正好证明审计模式不依赖仓库内准入。同一命令指向另一条线的检出（`D:\ruoyi-audit\RuoYi-Vue-0e2d75c2`，`HEAD=0e2d75c2…`）判被阻断（违规，退出码 1）；指向仓库内路径（如 `services`）、边界目录 `services/ruoyi-api` 或仓库上级目录（如 `D:\WorkSpace`）判被阻断（违规，退出码 1；隔离不通过时一条 git 命令都不执行）；指向仓库外非 Git 目录（如系统临时目录）判被阻断（退出码 2）；`--audit-commit` 只给 12 位短 SHA、给分支名、`--audit-root` 给相对路径或含 `..` 段判用法错误（退出码 64）。另在系统临时目录（仓库之外）用 `git init` 造了一个一次性固定 pin 检出做端到端复核（这是本模式的真实输入形态，**不是自检的一部分**；自检本身不创建任何文件）：干净 + 声明的输入摘要 → `external-audit-ready`（0）；换成另一个 40 位 SHA → 被阻断（1）；修改已跟踪的 `pom.xml` → 被阻断（1，点名该文件）；只在检出里新增未跟踪的 `sbom.cyclonedx.json` → 同样被阻断（1，未跟踪文件也算不干净，提示把生成物写到检出目录之外）。运行前后审计检出的 `.git/index` 与 `.git/HEAD` mtime 不变，证明核验本身不写任何文件。这些都是本机实测，不是声明。
 
 ### 12.6 隔离目录可先生成哪些证据、回填到哪（`sbom` 已统一，其余四项待统一）
 
@@ -523,6 +534,8 @@ node services/ruoyi-api/toolchain/check-capability.mjs --audit-root "..." --audi
 - **回填路径必须与两条清单一致**：唯一目标路径以 `provenance-manifest.json` 的 `evidence[].path` 为准（上表）；`gate-manifest.json` 的 `complianceArtifacts` 是**并列的另一条清单**（记的是准入门禁用的合规产物），两条清单必须指向同一份证据文件——其中 `sbom` 已统一为 `services/ruoyi-api/compliance/provenance/sbom.cyclonedx.json`。其余四项（`license` / `notice` / `dependency-licenses` / `vulnerability-scan`）在两条清单里记的仍是不同的文件或粒度（例如准入门禁记「原文副本」，证据清单记「证据说明文档」），回填前必须逐项裁定并统一，**不得让同一份证据出现两条路径**。核对方式：分别运行 `node services/ruoyi-api/toolchain/check-gate.mjs --json` 与 `node services/ruoyi-api/toolchain/check-provenance.mjs --json`，逐项比对两份报告里的路径。
 - 回填后逐项给出 `fileSha256` 与内容标记（如 SBOM 的 `bomFormat`/`specVersion`/`components`），由 `check-provenance.mjs` 判定；证据状态只能由实际核验推进，不能为了过检查器预先写成 `verified`。
 - 摘要口径要写明字节流：外部审计模式报告的是**固定 commit 中 `pom.xml` 的内容字节**（`git show HEAD:pom.xml`，LF）的 SHA-256 与 blob SHA-1，并在给出 `--audit-pom-sha256` 时与之比对；本机 `core.autocrlf=true` 时工作区检出字节（CRLF）的 SHA-256 可能不同（§10.2 已记录 LICENSE 的两种摘要），登记证据时必须注明采用哪一种字节流。
+- **只允许由真实外部审计产物回填**：这些文件必须是仓库外固定 commit 检出上**实际执行**工具/实例产出的字节（SBOM 必须是工具生成的 CycloneDX，不是手写组件列表）。**不得**由本仓库内的脚本生成、预填、推测或手写；能力探测（§11）与外部审计前置核验（本节）的结论都**不是**证据，不能充当回填来源。
+- **NOTICE 处置已记录为 `absent-upstream` / `not-applicable`，但 `license-notice` 仍保持 `pending`**：候选提交全树（477 个条目）里不存在 `NOTICE` / `NOTICE.txt` / `COPYING` / `COPYRIGHT`，唯一的许可类文件是根 `LICENSE`（MIT），因此「NOTICE 缺失」这一项按 **absent-upstream**（上游本就不存在）记录、并按 **not-applicable**（无第三方 NOTICE 可再分发）处置；这**不等于**许可证证据已就位——`license-notice` 在**仓库外受控目录的 LICENSE 原文证据**与**非实施方的独立复核署名**完成之前一律保持 `pending`（理由与解除条件见 §10.3），也不因本模式而提前推进。
 
 ### 12.7 仍然保留的阻断与禁入（本模式不解除）
 
