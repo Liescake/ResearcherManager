@@ -14,12 +14,7 @@ import {
   toAuditEventView,
 } from './audit.contract';
 import type { AuditEventView, AuditRequestContext, StoredAuditEvent } from './audit.contract';
-import {
-  AUDIT_REPOSITORY,
-  AuditEventType,
-  AuditResourceType,
-  AuditResult,
-} from './audit.port';
+import { AUDIT_REPOSITORY, AuditEventType, AuditResourceType, AuditResult } from './audit.port';
 import type { AuditEvent, AuditRepository } from './audit.port';
 
 /**

@@ -68,9 +68,7 @@ export const ipHashSchema = z.string().regex(/^[a-f0-9]{64}$/u, 'ipHash 必须�
  * 审计主体形态：与会话存储的 ID 白名单同构（非空、无空白与控制字符、长度受控）。
  * 审计记录里出现自由文本式的主体（例如姓名、手机号）本身就是存储损坏，按 500 处理。
  */
-export const actorIdSchema = z
-  .string()
-  .regex(/^[A-Za-z0-9._:@-]{1,64}$/u, '审计主体形态不合法');
+export const actorIdSchema = z.string().regex(/^[A-Za-z0-9._:@-]{1,64}$/u, '审计主体形态不合法');
 
 /**
  * 服务端在「本人读取审计摘要」时写入的摘要文案。
@@ -219,7 +217,8 @@ export function toAuditRequestContext(request: unknown): AuditRequestContext {
  * 明文地址既不入库也不外发；地址不可用时哈希服务端哨兵值，而不是接受客户端提供的值。
  */
 export function hashPeerAddress(peerAddress?: string): string {
-  const source = typeof peerAddress === 'string' && peerAddress !== '' ? peerAddress : UNKNOWN_PEER_ADDRESS;
+  const source =
+    typeof peerAddress === 'string' && peerAddress !== '' ? peerAddress : UNKNOWN_PEER_ADDRESS;
   return createHash('sha256').update(source, 'utf8').digest('hex');
 }
 
@@ -266,12 +265,10 @@ export function assertDeclaredAuditQueryFields(query: unknown): void {
   if (!unexpected) return;
 
   const forbidden: readonly string[] = FORBIDDEN_AUDIT_QUERY_FIELDS;
-  throwUnexpectedFields(
-    unexpected,
-    (key) =>
-      forbidden.includes(key)
-        ? `禁止使用查询参数 ${key}（授权、归属与网络口径只来自服务端）`
-        : `本端点不接受查询参数 ${key}`,
+  throwUnexpectedFields(unexpected, (key) =>
+    forbidden.includes(key)
+      ? `禁止使用查询参数 ${key}（授权、归属与网络口径只来自服务端）`
+      : `本端点不接受查询参数 ${key}`,
   );
 }
 

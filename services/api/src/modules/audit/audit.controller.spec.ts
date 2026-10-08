@@ -613,24 +613,27 @@ describe('审计切片：认证边界 401（fail-closed）', () => {
     { name: '会话主体含未登记角色', headers: bearer(SESSION_UNKNOWN_ROLE) },
   ];
 
-  it.each(unauthenticatedCases)('$name → 401 UNAUTHENTICATED，且不取数、不写入审计', async ({ headers }) => {
-    const { baseUrl, repository } = await startAuditApp();
-    const list = vi.spyOn(repository, 'listVisibleByActor');
-    const append = vi.spyOn(repository, 'append');
+  it.each(unauthenticatedCases)(
+    '$name → 401 UNAUTHENTICATED，且不取数、不写入审计',
+    async ({ headers }) => {
+      const { baseUrl, repository } = await startAuditApp();
+      const list = vi.spyOn(repository, 'listVisibleByActor');
+      const append = vi.spyOn(repository, 'append');
 
-    const res = await call(baseUrl, 'GET', '/me/audit-events', { headers });
+      const res = await call(baseUrl, 'GET', '/me/audit-events', { headers });
 
-    expect(res.status).toBe(401);
-    expect(res.body.data).toBeNull();
-    expect(res.body.error?.code).toBe('UNAUTHENTICATED');
-    // 不区分失败原因，避免给探测者额外信息
-    expect(res.body.error?.message).toBe('登录状态无效或已过期，请重新登录');
-    // 认证失败发生在任何取数与写入之前
-    expect(list).not.toHaveBeenCalled();
-    expect(append).not.toHaveBeenCalled();
-    expect(contentText(res)).not.toContain(SESSION_UNKNOWN_ROLE);
-    expect(contentText(res)).not.toContain('guest');
-  });
+      expect(res.status).toBe(401);
+      expect(res.body.data).toBeNull();
+      expect(res.body.error?.code).toBe('UNAUTHENTICATED');
+      // 不区分失败原因，避免给探测者额外信息
+      expect(res.body.error?.message).toBe('登录状态无效或已过期，请重新登录');
+      // 认证失败发生在任何取数与写入之前
+      expect(list).not.toHaveBeenCalled();
+      expect(append).not.toHaveBeenCalled();
+      expect(contentText(res)).not.toContain(SESSION_UNKNOWN_ROLE);
+      expect(contentText(res)).not.toContain('guest');
+    },
+  );
 
   it('未认证时即便带了查询串/伪造头/请求体也是 401（认证先于一切输入）', async () => {
     const { baseUrl, repository } = await startAuditApp();
@@ -990,7 +993,6 @@ describe('审计切片：PII 与 fail-closed 500', () => {
       // 明文 IP（数据字典 §4：IP 只存哈希/脱敏）必须是存储损坏，不是「合法原始值」
       fixtureEvent({ ipHash: FORGED_ADDRESS }),
       fixtureEvent({ ipHash: '127.0.0.1' }),
-      fixtureEvent({ summary: '' }),
       fixtureEvent({ id: 'not-a-uuid' }),
     ];
 
@@ -1280,9 +1282,9 @@ describe('审计切片：装配边界与纯函数门禁', () => {
       'summary',
       'occurredAt',
     ]);
-    expect(Object.keys(toAuditEventView(parseStoredAuditEventOrThrow(fixtureEvent()))).sort()).toEqual(
-      [...AUDIT_EVENT_VIEW_FIELDS].sort(),
-    );
+    expect(
+      Object.keys(toAuditEventView(parseStoredAuditEventOrThrow(fixtureEvent()))).sort(),
+    ).toEqual([...AUDIT_EVENT_VIEW_FIELDS].sort());
   });
 
   it('存储读取契约：三个枚举闭集、ISO 时间、UUID、ipHash 形态、主体形态与免 PII 摘要', () => {
@@ -1302,6 +1304,7 @@ describe('审计切片：装配边界与纯函数门禁', () => {
       { record: { ...valid, actorUserId: '' }, path: 'actorUserId' },
       { record: { ...valid, selfVisible: 'yes' }, path: 'selfVisible' },
       { record: { ...valid, resourceId: 'not-a-uuid' }, path: 'resourceId' },
+      { record: { ...valid, summary: '' }, path: 'summary' },
       { record: { ...valid, summary: `证件 ${PII_ID_CARD}` }, path: 'summary' },
       { record: { ...valid, summary: `密钥 ${PII_SECRET}` }, path: 'summary' },
       { record: { ...valid, reason: '改前值' }, path: 'reason' },
@@ -1399,9 +1402,9 @@ describe('审计切片：装配边界与纯函数门禁', () => {
     expect(parseStoredAuditEvent(fixtureEvent({ type: 'audit_delete' as AuditEventType })).ok).toBe(
       false,
     );
-    expect(
-      parseStoredAuditEvent(fixtureEvent({ result: 'deleted' as AuditResult })).ok,
-    ).toBe(false);
+    expect(parseStoredAuditEvent(fixtureEvent({ result: 'deleted' as AuditResult })).ok).toBe(
+      false,
+    );
   });
 
   it('完整 AppModule：health / runtime-info 与既有路由行为不变，审计路由默认 401', async () => {
