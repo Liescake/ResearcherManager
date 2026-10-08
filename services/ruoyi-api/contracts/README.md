@@ -35,7 +35,7 @@
 - Base URL：`/api/v1`。
 - 响应恒为信封 `{ data, meta, error }`：成功时 `error = null`；失败时 `data = null`，且 `meta.requestId` 必填。
 - `meta` 至少包含 `requestId`；基线实现在此之上返回 `generatedAt`。
-- 列表统一分页、排序与过滤，服务端限制 page size；写接口支持 `Idempotency-Key`（16–128 字符）。
+- 列表统一分页、排序与过滤，服务端限制 page size（基线 `DEFAULT_PAGE_SIZE = 20`、`MAX_PAGE_SIZE = 100`）；写接口支持 `Idempotency-Key`，取值规则与 `packages/shared/src/validation/fields.ts` 的 `idempotencyKeySchema` 一致：去首尾空白后 8–128 字符，仅允许字母、数字和 `.`、`_`、`:`、`-`。
 - 权限失败统一 `403 + FORBIDDEN`；不得通过错误码或消息泄露他组资源是否存在（`404 NOT_FOUND` 同样不得区分「不存在」与「不可见」）。
 
 ### 错误码注册表
@@ -80,6 +80,8 @@
 - 原子权限目录中的值必须精确匹配；`export:*`、`profile:*` 等通配形式以及任何未列出的值一律拒绝。
 - `role:assign` 与 `permission:configure` 不得经通用配置接口授予，且不进入超级管理员的默认权限集合；`role:assign` 只能走独立二次确认流程。
 - 普通管理员不得授予任何权限；系统管理员不得自动获得全局业务数据。
+- **范围判定是「单角色严格相等」**：命中某个角色时，`request.scope` 必须等于该角色的默认范围（`DEFAULT_ROLE_DATA_SCOPE`）；需要不同范围时，只能由主体**同时持有相应角色**、经多角色并集的另一条分支满足（例如同时持 `system_admin` 与 `admin`，才能在 `ASSIGNED` 范围下操作）。仅持 `system_admin` 而请求 `ASSIGNED` 会被拒绝。
+- 本切片谓词的输入只有 `roles` / `groupIds` / `assignedResourceIds`，**没有**「按用户授予的权限集合」这一输入：`isAuthorized` 只按角色的默认权限目录（`DEFAULT_ROLE_PERMISSIONS`）判定。因此上表所述「由超级管理员明确授予的原子权限」在本契约中体现为角色默认集合的固定边界；动态授予需后续切片新增独立输入后另行定义，并同步更新夹具。
 
 ## 5. `authz-fixtures.json` 夹具格式
 
