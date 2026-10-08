@@ -12,7 +12,8 @@ NestJS API 服务：**唯一业务规则入口**，前端不直接访问数据�
 - 统一响应信封 `{ data, meta, error }` + 稳定错误码 + 请求 ID。
 - 领域模块边界（auth、access-control、profiles、groups、memberships、achievements、education、matching、
   statistics、exports、compliance、audit、notifications）：P3 期间都是空模块占位，自 P4 起逐个填充实现；
-  当前 `education`、`profiles` 与 `memberships`（入组申请学生自服务）已落地业务切片，其余仍只声明边界。
+  当前 `education`、`profiles`、`memberships`（入组申请学生自服务）与 `achievements`
+  （成果学生自服务）已落地业务切片，其余仍只声明边界。
 - **升学记录切片（`education`，学生自服务）**：`src/modules/education/`。它同时是「认证 → 授权 →
   校验 → 存储端口 → 统一响应」的端到端样板：
   - 路由：`GET/POST /api/v1/me/education-records`、`GET /api/v1/me/education-records/{recordId}`
@@ -68,10 +69,34 @@ NestJS API 服务：**唯一业务规则入口**，前端不直接访问数据�
     需要权限目录版本升级并同步 `services/ruoyi-api/contracts` 夹具，属后续版本项；
   - 尚不包含：小组存在性/招募状态校验（需要 `groups` 仓储端口）、审核、退组申请、成员关系联动、
     结果通知、幂等键、审计落库、列表分页与排序。
+- **成果切片（`achievements`，学生自服务）**：`src/modules/achievements/`（该模块即
+  docs/P2-架构与数据设计.md §2 声明的「成果、附件与审核」边界，本切片只落地成果自服务）：
+  - 路由：`POST/GET /api/v1/me/achievements`
+    （权限点 `achievement:self:create` / `achievement:self:read`，数据范围固定 `SELF`；
+    单条读取、更新 `PATCH /me/achievements/{id}`（`achievement:self:update`）、审核
+    （`achievement:review`）、附件实体校验、导出与统计不在本切片）；
+  - 请求校验：`@rm/shared` 的 `achievementInputSchema`（未知类型枚举、空/超长标题、控制字符、
+    `achievedAt` 非法时间、`evidenceFileId` 非 UUID、说明含身份证号/密钥/长数字标识
+    → 400 `VALIDATION_FAILED` + 字段路径）；另有**字段闭集**：请求体出现 `userId`/`roles`/
+    `scope`/`groupId`/`reviewStatus`/`id`/`createdAt` 等**服务端独占字段**一律 400
+    （给出可区分的拒绝原因），不是静默剥离；
+  - 主体与归属：`userId` 只来自 `SESSION_SUBJECT_RESOLVER` 解析出的服务端会话主体，
+    `reviewStatus`/时间戳只由服务端写入（入口恒为共享审核态的 `pending`，自授权通过审核需要
+    `achievement:review`）；自定义头（`x-user-id`/`x-roles`/`x-scope`/`x-group-id`）与请求体
+    一样不进入任何判定；
+  - 授权：两条路由都先经 `AuthorizationGuard`（`RUOYI_AUTHZ_ADAPTER` 端口），
+    **先于任何仓储访问**——缺权限点（如 `admin`）或权限点存在但范围不是 `SELF`
+    （如 `group_leader` 的 `achievement:self:read` 只在 `GROUP` 范围生效）都得到同一个 403，
+    且拒绝时仓储方法一次都不被调用；
+  - 输出：对外视图不含 `userId`，也不含审核人/审核意见/审核时间/审计事件 ID；读取契约仍校验
+    存储形状（枚举闭集 + ISO 时间格式），并额外复核**记录归属与会话主体一致**，
+    违者 500 且不泄露字段取值（损坏与越界取数共用同一文案，调用方无法区分内部原因）；
+  - 尚不包含：单条读取、更新与撤回、审核状态流转、附件实体（本切片只校验 `evidenceFileId`
+    的 UUID 形状，不校验文件是否存在）、幂等键、审计落库、列表分页与排序。
 - **存储端口（无数据库阶段）**：`EDUCATION_RECORD_REPOSITORY`、`PROFILE_REPOSITORY`、
-  `APPLICATION_REPOSITORY` 与 `SESSION_STORE`
+  `APPLICATION_REPOSITORY`、`ACHIEVEMENT_REPOSITORY` 与 `SESSION_STORE`
   都是**显式可替换端口**，默认绑定内存基线（`persistent = false`、`productionReady = false`，
-  `NODE_ENV=production` 下拒绝构造，默认不预置任何会话/记录/画像/申请）；引入 PostgreSQL 时只替换
+  `NODE_ENV=production` 下拒绝构造，默认不预置任何会话/记录/画像/申请/成果）；引入 PostgreSQL 时只替换
   provider 绑定，controller/service 不改动。
 - 统一响应信封 `{ data, meta, error }` + 稳定错误码 + 请求 ID。
 - **RuoYi 兼容适配器（可回退基线）**：`src/modules/ruoyi-adapter/`。只注册端口
@@ -82,15 +107,16 @@ NestJS API 服务：**唯一业务规则入口**，前端不直接访问数据�
     （**仅测试期读取**，应用启动不依赖契约目录）。
 - 环境变量在启动时校验，非法配置立即失败。
 
-**未包含**：数据库连接、微信登录、RuoYi RBAC 实现，以及升学记录/学生画像/入组申请之外的其他业务接口
+**未包含**：数据库连接、微信登录、RuoYi RBAC 实现，以及升学记录/学生画像/入组申请/成果之外的其他业务接口
 （画像首次提交锁定与管理员代改、升学记录的状态流转/审核、更新与撤回、升学率统计、入组申请的审核与
-退组、成员关系联动、小组存在性与招募状态校验、所有写接口的幂等键与审计落库）。它们属于后续切片。
+退组、成员关系联动、小组存在性与招募状态校验、成果的单条读取/更新/审核与附件实体、所有写接口的
+幂等键与审计落库）。它们属于后续切片。
 
 ## 命令
 
 ```bash
 pnpm --filter @rm/api typecheck   # 直接对源码做类型检查（经 tsconfig paths 引用工作区包源码）
-pnpm --filter @rm/api test        # vitest：env 校验、信封、异常映射、健康检查、运维信息白名单、RuoYi 契约、升学记录切片、学生画像切片、入组申请切片
+pnpm --filter @rm/api test        # vitest：env 校验、信封、异常映射、健康检查、运维信息白名单、RuoYi 契约、升学记录切片、学生画像切片、入组申请切片、成果切片
 pnpm --filter @rm/api build       # tsc 产出 dist（CommonJS + decorator metadata）
 pnpm --filter @rm/api start       # node dist/main.js
 ```

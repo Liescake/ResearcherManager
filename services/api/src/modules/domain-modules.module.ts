@@ -19,7 +19,9 @@ import { StatisticsModule } from './statistics/statistics.module';
  * 「API 是唯一业务规则入口」。
  *
  * P3 期间各模块只有边界声明；自 P4 起逐个填充 controller/service/repository，
- * 当前已有业务实现的是 `EducationModule`（升学记录学生自服务切片），其余仍为占位。
+ * 当前已有业务实现的是 `EducationModule`（升学记录学生自服务切片）、
+ * `ProfilesModule`（学生画像自服务）、`MembershipsModule`（入组申请自服务）与
+ * `AchievementsModule`（成果学生自服务：创建 / 本人列表），其余仍为占位。
  */
 @Module({
   imports: [
