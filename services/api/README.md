@@ -12,7 +12,7 @@ NestJS API 服务：**唯一业务规则入口**，前端不直接访问数据�
 - 统一响应信封 `{ data, meta, error }` + 稳定错误码 + 请求 ID。
 - 领域模块边界（auth、access-control、profiles、groups、memberships、achievements、education、matching、
   statistics、exports、compliance、audit、notifications）：P3 期间都是空模块占位，自 P4 起逐个填充实现；
-  当前 `education` 与 `profiles` 已落地业务切片，其余仍只声明边界。
+  当前 `education`、`profiles` 与 `memberships`（入组申请学生自服务）已落地业务切片，其余仍只声明边界。
 - **升学记录切片（`education`，学生自服务）**：`src/modules/education/`。它同时是「认证 → 授权 →
   校验 → 存储端口 → 统一响应」的端到端样板：
   - 路由：`GET/POST /api/v1/me/education-records`、`GET /api/v1/me/education-records/{recordId}`
@@ -35,13 +35,43 @@ NestJS API 服务：**唯一业务规则入口**，前端不直接访问数据�
     另有**字段闭集**：请求体出现 `roles`/`scope`/`groupId`/`userId`/`permissions`/`reviewStatus`
     等未声明字段直接 400（身份/权限字段给出可区分的拒绝原因），不是静默忽略；
   - 认证：主体只来自 `SESSION_SUBJECT_RESOLVER`；授权：资源级判定只经 `AuthorizationGuard`
-    （`RUOYI_AUTHZ_ADAPTER` 端口），`resourceUserId` 取自**存储归属**（纵深防御：仓储返回他人归属
-    即 403），客户端无法影响权限点/范围/归属；
-  - 输出：对外视图不含 `userId`，且学号（`studentNo`）与联系方式（`phone`）**只写不读**——
-    任何状态码的响应都不出现这两个字段与其明文；读取契约仍校验其存储形状（违规 500）。
-- **存储端口（无数据库阶段）**：`EDUCATION_RECORD_REPOSITORY`、`PROFILE_REPOSITORY` 与 `SESSION_STORE`
+    （`RUOYI_AUTHZ_ADAPTER` 端口），并**先于任何存储访问**——第一次 SELF 判定以会话主体作为
+    `resourceUserId`，未授权主体只会得到 403，连「画像是否存在」都观察不到（不是 404）；
+    取数后再按**存储归属**做第二次 SELF 判定（纵深防御：仓储返回他人归属或归属缺失即同一个 403）。
+    权限点/范围/归属全部是服务端解析值，客户端无法影响；
+  - 输出：对外视图不含 `userId`；`privacyConsent`（政策版本与同意时间是服务端处理记录）与
+    学号（`studentNo`）、联系方式（`phone`）一律**只写不读**——任何状态码的响应都不出现这些
+    字段与其明文；读取契约仍校验它们的存储形状（违规 500）。
+- **入组申请切片（`memberships`，学生自服务）**：`src/modules/memberships/`（该模块即
+  docs/P2-架构与数据设计.md §2 声明的「入退组申请和成员关系状态机」边界，本切片只落地入组申请）：
+  - 路由：`POST/GET /api/v1/me/applications`、`POST /api/v1/me/applications/{applicationId}/withdraw`
+    （权限点 `membership:self:create` / `membership:self:withdraw`，数据范围固定 `SELF`；
+    契约基线的 `/join-applications`、管理端 `/admin/applications*` 与审核不在本切片）。
+    撤回是对既有资源的幂等状态变更，因此显式返回 200（而不是 POST 默认的 201）；
+  - 请求校验：`@rm/shared` 的 `joinApplicationInputSchema`（创建）与 `withdrawApplicationInputSchema`
+    （撤回的路径 ID 必须是 UUID）→ 400 `VALIDATION_FAILED` + 字段路径；另有**字段闭集**：
+    创建只接受 `groupId`/`note`，撤回**不接受任何请求体字段**；
+  - 主体与归属：`userId` 只来自 `SESSION_SUBJECT_RESOLVER` 解析出的服务端会话主体，
+    `status`/`kind`/时间戳只由服务端写入；客户端提交 `status`/`reviewStatus`/`decision`/`userId`/
+    `roles`/`scope`/`dataScope`/`groupIds`/`kind` 等**服务端独占字段**一律 400（给出可区分的拒绝
+    原因），不是静默剥离。`groupId`（单数）是**申请目标小组**这一业务字段（契约基线要求请求包含
+    它），从不作为授权范围：`scope` 恒为服务端常量 `SELF`；
+  - 授权：三条路由都先经 `AuthorizationGuard`（`RUOYI_AUTHZ_ADAPTER` 端口），**先于任何存储访问**；
+    撤回在取数后按**存储归属**做第二次 SELF 判定（纵深防御）；缺权限点/跨主体一律同一个 403；
+  - 状态：创建固定落在共享状态机中**唯一的入口状态** `pending`；撤回只允许 `pending -> withdrawn`，
+    其余状态 → 409 `STATE_TRANSITION_INVALID`；同一用户同一小组的**未终态**申请重复提交 → 409
+    （终态申请不占用该约束，撤回后可以重新提交）；
+  - 输出：对外视图不含 `userId`，也不含审核人/审核意见/审核时间；读取契约仍校验它们的存储形状
+    （违规 500），但绝不投影到响应里；
+  - 读取口径（已知偏差）：权限目录是闭集且没有 membership self-read 点，本人列表暂以
+    `membership:self:create` 作为「本人申请自服务」的读取门控点；登记 `membership:self:read`
+    需要权限目录版本升级并同步 `services/ruoyi-api/contracts` 夹具，属后续版本项；
+  - 尚不包含：小组存在性/招募状态校验（需要 `groups` 仓储端口）、审核、退组申请、成员关系联动、
+    结果通知、幂等键、审计落库、列表分页与排序。
+- **存储端口（无数据库阶段）**：`EDUCATION_RECORD_REPOSITORY`、`PROFILE_REPOSITORY`、
+  `APPLICATION_REPOSITORY` 与 `SESSION_STORE`
   都是**显式可替换端口**，默认绑定内存基线（`persistent = false`、`productionReady = false`，
-  `NODE_ENV=production` 下拒绝构造，默认不预置任何会话/记录/画像）；引入 PostgreSQL 时只替换
+  `NODE_ENV=production` 下拒绝构造，默认不预置任何会话/记录/画像/申请）；引入 PostgreSQL 时只替换
   provider 绑定，controller/service 不改动。
 - 统一响应信封 `{ data, meta, error }` + 稳定错误码 + 请求 ID。
 - **RuoYi 兼容适配器（可回退基线）**：`src/modules/ruoyi-adapter/`。只注册端口
@@ -52,15 +82,15 @@ NestJS API 服务：**唯一业务规则入口**，前端不直接访问数据�
     （**仅测试期读取**，应用启动不依赖契约目录）。
 - 环境变量在启动时校验，非法配置立即失败。
 
-**未包含**：数据库连接、微信登录、RuoYi RBAC 实现，以及升学记录/学生画像之外的其他业务接口
-（画像首次提交锁定与管理员代改、升学记录的状态流转/审核、更新与撤回、升学率统计、幂等键与审计落库）。
-它们属于后续切片。
+**未包含**：数据库连接、微信登录、RuoYi RBAC 实现，以及升学记录/学生画像/入组申请之外的其他业务接口
+（画像首次提交锁定与管理员代改、升学记录的状态流转/审核、更新与撤回、升学率统计、入组申请的审核与
+退组、成员关系联动、小组存在性与招募状态校验、所有写接口的幂等键与审计落库）。它们属于后续切片。
 
 ## 命令
 
 ```bash
 pnpm --filter @rm/api typecheck   # 直接对源码做类型检查（经 tsconfig paths 引用工作区包源码）
-pnpm --filter @rm/api test        # vitest：env 校验、信封、异常映射、健康检查、运维信息白名单、RuoYi 契约、升学记录切片、学生画像切片
+pnpm --filter @rm/api test        # vitest：env 校验、信封、异常映射、健康检查、运维信息白名单、RuoYi 契约、升学记录切片、学生画像切片、入组申请切片
 pnpm --filter @rm/api build       # tsc 产出 dist（CommonJS + decorator metadata）
 pnpm --filter @rm/api start       # node dist/main.js
 ```

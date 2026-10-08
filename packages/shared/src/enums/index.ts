@@ -1,5 +1,6 @@
 export * from './guard';
 export * from './status';
+export * from './decision';
 export * from './taxonomy';
 export * from './permission';
 export * from './authorization';

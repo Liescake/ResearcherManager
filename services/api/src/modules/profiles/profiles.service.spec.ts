@@ -133,7 +133,7 @@ describe('ProfilesService：判定入参只来自服务端', () => {
     expect(view.updatedAt).toBe(saved?.updatedAt);
   });
 
-  it('取数与判定都走服务端：resourceUserId 取会话主体，存储归属不符即 403', () => {
+  it('取数与判定都走服务端：先行判定取会话主体，取数后按存储归属二次判定，不符即 403', () => {
     const repository = new StubProfileRepository([profileFixture()]);
     repository.lookupOverride = () => profileFixture({ userId: 'u-student-2', name: '李四' });
     const realAdapter = new BaselineRuoYiAuthzAdapter(policy);
@@ -162,20 +162,38 @@ describe('ProfilesService：判定入参只来自服务端', () => {
         /unknown-|policy-denied/u,
       );
     }
-    // 授权入参只来自服务端：resourceUserId 是会话主体（不是存储归属，更不是请求体）
+    // 授权入参只来自服务端：先行判定的 resourceUserId 是会话主体，取数后的二次判定取**存储归属**
+    // （两者都不是请求体；仓储返回他人归属时，第二次 SELF 判定必然拒绝）
     expect(requests).toEqual([
       { permission: 'profile:self:read', scope: 'SELF', resourceUserId: 'u-student-1' },
+      { permission: 'profile:self:read', scope: 'SELF', resourceUserId: 'u-student-2' },
       { permission: 'profile:self:update', scope: 'SELF', resourceUserId: 'u-student-1' },
+      { permission: 'profile:self:update', scope: 'SELF', resourceUserId: 'u-student-2' },
     ]);
     expect(repository.saved).toHaveLength(0);
   });
 
-  it('存储归属不可读（空归属）时按 403 处理，不退化成放行', () => {
+  it('存储归属不可读（空归属）时二次 SELF 授权拒绝并判 403，不退化成放行', () => {
     const repository = new StubProfileRepository();
     repository.lookupOverride = () => profileFixture({ userId: '' });
-    const service = serviceWith(repository);
+    const realAdapter = new BaselineRuoYiAuthzAdapter(policy);
+    const requests: AuthorizationRequest[] = [];
+    const recording: RuoYiAuthzAdapter = {
+      capabilities: realAdapter.capabilities,
+      checkAuthorization: (subject, request): AuthorizationDecision => {
+        requests.push(request);
+        return realAdapter.checkAuthorization(subject, request);
+      },
+      checkGrant: (): AuthorizationDecision => ({ allowed: false, reason: 'policy-denied' }),
+    };
+    const service = new ProfilesService(new AuthorizationGuard(recording), repository);
 
     expect(captureError(() => service.getMyProfile(student))).toBeInstanceOf(ForbiddenException);
+    // 归属缺失同样只经 AuthorizationGuard：第二次 SELF 判定的 resourceUserId 为空 → 拒绝
+    expect(requests).toEqual([
+      { permission: 'profile:self:read', scope: 'SELF', resourceUserId: 'u-student-1' },
+      { permission: 'profile:self:read', scope: 'SELF', resourceUserId: '' },
+    ]);
   });
 
   it('经端口判定：端口拒绝时即使仓储有数据也 403，且不写入；拒绝发生在取数之前', () => {
@@ -339,6 +357,24 @@ describe('ProfilesService：存储异常与输出边界 fail-closed', () => {
     expect(
       captureError(() => service.updateMyProfile(student, { college: '数学学院' })),
     ).toBeInstanceOf(InternalServerErrorException);
+  });
+
+  it('存储的隐私同意快照违反读取契约 → 500（移出对外视图不等于不再校验）', () => {
+    const logError = vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const repository = new StubProfileRepository([
+      profileFixture({ privacyConsent: { policyVersion: '', consentedAt: 'not-a-datetime' } }),
+    ]);
+    const service = serviceWith(repository);
+
+    const error = captureError(() => service.getMyProfile(student));
+
+    expect(error).toBeInstanceOf(InternalServerErrorException);
+    expect((error as InternalServerErrorException).getStatus()).toBe(500);
+    // 字段路径可观测（便于定位），但字段取值不进入日志，也不进入响应
+    const logged = logError.mock.calls.flat().join(' ');
+    expect(logged).toContain('privacyConsent');
+    expect(logged).not.toContain('not-a-datetime');
+    expect(JSON.stringify(error)).not.toContain('not-a-datetime');
   });
 
   it('对外视图不含归属、高敏感字段与隐私同意快照：序列化结果里没有 userId/学号/联系方式/同意记录', () => {

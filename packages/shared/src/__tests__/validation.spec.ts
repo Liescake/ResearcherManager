@@ -9,6 +9,7 @@ import {
   maskName,
   maskPhone,
   maskStudentNo,
+  studentProfileUpdateSchema as exportedStudentProfileUpdateSchema,
 } from '../index';
 import {
   DEFAULT_ROLE_DATA_SCOPE,
@@ -40,6 +41,7 @@ function validProfile(): z.input<typeof studentProfileInputSchema> {
     skills: ['TypeScript', 'TypeScript', 'SQL'],
     programmingLevel: 'intermediate',
     researchExperience: '参与过校级科研项目',
+    competitionExperience: '蓝桥杯省赛二等奖',
     availableTime: { weeklyHours: 10, periods: ['weekend'] },
     researchInterests: ['机器学习'],
     strengths: '沟通与文档能力',
@@ -98,6 +100,13 @@ describe('学生画像更新（PATCH /me/profile 的部分输入）', () => {
 
   it('空对象（没有任何变更字段）被拒绝', () => {
     expect(studentProfileUpdateSchema.safeParse({}).success).toBe(false);
+  });
+
+  it('经公共出口导出，且字段集与创建 schema 完全相同（不另起第二套字段/枚举）', () => {
+    // 回归：API 层只从包出口引用该 schema，出口漏导出会让 services/api 的 typecheck 直接失败
+    expect(exportedStudentProfileUpdateSchema).toBe(studentProfileUpdateSchema);
+    const parsed = exportedStudentProfileUpdateSchema.parse(validProfile());
+    expect(Object.keys(parsed).sort()).toEqual(Object.keys(studentProfileInputSchema.shape).sort());
   });
 
   it('字段级规则不放宽：未登记枚举、非法联系方式、未同意隐私政策仍被拒绝', () => {

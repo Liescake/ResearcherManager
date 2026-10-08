@@ -1,5 +1,4 @@
 import {
-  ForbiddenException,
   Inject,
   Injectable,
   InternalServerErrorException,
@@ -8,10 +7,7 @@ import {
 } from '@nestjs/common';
 import { DataScope, PermissionPoint, studentProfileUpdateSchema } from '@rm/shared';
 import type { AuthorizationSubject, StudentProfileUpdateInput } from '@rm/shared';
-import {
-  AUTHORIZATION_FORBIDDEN_MESSAGE,
-  AuthorizationGuard,
-} from '../access-control/authorization-guard';
+import { AuthorizationGuard } from '../access-control/authorization-guard';
 import {
   assertDeclaredProfileInputFields,
   parseStoredStudentProfile,
@@ -33,13 +29,15 @@ import type {
  *
  * 三条硬约束：
  * 1. **主体与资源归属都来自服务端**：权限点、数据范围与资源归属都是服务端解析值。`/me/profile`
- *    的资源就是会话主体本人，因此 SELF 判定的 `resourceUserId` 取 `subject.userId`（会话主体，
- *    不是请求体，也不是存储记录）。客户端提交的 `roles`/`scope`/`groupId`/`userId` 不进入判定，
+ *    的资源就是会话主体本人，因此**先行**的 SELF 判定 `resourceUserId` 取 `subject.userId`（会话
+ *    主体，不是请求体，也不是存储记录）；**取数后**再按存储记录的归属（`readProfileOwnerId`）做
+ *    第二次 SELF 判定。客户端提交的 `roles`/`scope`/`groupId`/`userId` 不进入判定，
  *    且会被输入闭集直接拒绝。
  * 2. **授权先于任何存储访问**：`requireOwnProfile` 先经 `AuthorizationGuard`（其下是
  *    `RUOYI_AUTHZ_ADAPTER` 端口 → canonical 谓词），拒绝即 403；未登记权限/范围/角色在端口层已
  *    fail-closed。**取数与请求体校验都排在授权之后**：无权主体既观察不到画像是否存在，
- *    也拿不到任何字段级校验反馈。
+ *    也拿不到任何字段级校验反馈。取数后的**归属二次授权**同样只经 `AuthorizationGuard`
+ *    （纵深防御），service 不自行比较归属字符串。
  * 3. **输出前再校验一次**：存储记录必须满足读取契约（枚举闭集 + 时间格式 + 高敏感字段形状），
  *    违反者按服务端缺陷 500 处理；对外视图不含 `userId`/`studentNo`/`phone`/`privacyConsent`。
  *
@@ -84,15 +82,17 @@ export class ProfilesService {
   }
 
   /**
-   * **授权先行**，再取本人画像。
+   * **授权先行**，再取本人画像；取数后再按**存储归属**做一次 SELF 授权。
    *
-   * 1. **先授权**：`/me/profile` 的资源归属就是会话主体本人，所以 SELF 判定的 `resourceUserId`
-   *    取 `subject.userId`（服务端会话解析值，不来自请求体，也不来自存储）。这一步不访问任何
-   *    存储：未授权主体连「是否存在画像」都观察不到。
+   * 1. **先授权**：`/me/profile` 的资源归属就是会话主体本人，所以第一次 SELF 判定的
+   *    `resourceUserId` 取 `subject.userId`（服务端会话解析值，不来自请求体，也不来自存储）。
+   *    这一步不访问任何存储：未授权主体连「是否存在画像」都观察不到。
    * 2. **再取数**：取数键同样是 `subject.userId`，因此不会触达他人资源；无记录 → 404。
-   * 3. **归属一致性纵深防御**：存储记录自带的 `userId` 必须等于主体，否则即便授权通过也判 403
-   *    （异常仓储 / 横向越权 / 数据被外部改写）。该 403 与授权拒绝使用同一文案，
-   *    调用方无法据此区分原因。
+   * 3. **归属二次授权（纵深防御）**：资源级判定只经 `AuthorizationGuard`，第二次 SELF 判定的
+   *    `resourceUserId` 取**存储归属**（`readProfileOwnerId(record)`，服务端存储值，不来自请求体）。
+   *    正常仓储下它与主体一致、判定通过；仓储返回他人归属、归属缺失或被外部改写时，canonical
+   *    谓词的 SELF 规则（`resourceUserId` 必须等于主体）直接拒绝 → 403（异常仓储 / 横向越权）。
+   *    该 403 与第一次授权拒绝同经一个 guard，文案一致，调用方无法据此区分原因。
    */
   private requireOwnProfile(
     subject: AuthorizationSubject,
@@ -109,9 +109,12 @@ export class ProfilesService {
       throw new NotFoundException('本人画像不存在');
     }
 
-    if (readProfileOwnerId(record) !== subject.userId) {
-      throw new ForbiddenException(AUTHORIZATION_FORBIDDEN_MESSAGE);
-    }
+    // 二次 SELF 授权：判定入参取自**存储归属**（不是请求体，也不是会话主体）
+    this.guard.assertAuthorized(subject, {
+      permission,
+      scope: DataScope.Self,
+      resourceUserId: readProfileOwnerId(record),
+    });
 
     return this.assertStoredProfile(record);
   }

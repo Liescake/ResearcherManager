@@ -635,11 +635,15 @@ describe('画像：越权 403（AuthorizationGuard + RUOYI_AUTHZ_ADAPTER）', ()
     expect(read.text).not.toContain('13900139000');
 
     // 判定确实经适配器端口，且入参只来自服务端：
-    // 资源就是会话主体本人，resourceUserId 取**会话主体**（不是存储归属，也不是请求体）；
-    // 取数后发现的归属不一致由 service 判 403，不与授权拒绝区分。
+    // 先行判定取**会话主体**，取数后的二次 SELF 判定取**存储归属**（都不是请求体）；
+    // 仓储返回他人归属时第二次判定必然拒绝，且与授权拒绝不区分。
     expect(checkAuthorization).toHaveBeenCalledWith(
       { userId: 'u-student-1', roles: [Role.Student] },
       { permission: 'profile:self:read', scope: 'SELF', resourceUserId: 'u-student-1' },
+    );
+    expect(checkAuthorization).toHaveBeenCalledWith(
+      { userId: 'u-student-1', roles: [Role.Student] },
+      { permission: 'profile:self:read', scope: 'SELF', resourceUserId: 'u-student-2' },
     );
 
     const write = await call(baseUrl, 'PATCH', '/me/profile', {
@@ -684,6 +688,7 @@ describe('画像：越权 403（AuthorizationGuard + RUOYI_AUTHZ_ADAPTER）', ()
       allowed: false,
       reason: 'policy-denied',
     });
+    const collegeBefore = repository.findByUserId('u-student-1')?.college;
     const findByUserId = vi.spyOn(repository, 'findByUserId');
 
     const read = await call(baseUrl, 'GET', '/me/profile', { headers: bearer(SESSION_STUDENT_1) });
@@ -700,9 +705,9 @@ describe('画像：越权 403（AuthorizationGuard + RUOYI_AUTHZ_ADAPTER）', ()
       body: validPatchBody,
     });
     expect(write.status).toBe(403);
-    expect(repository.findByUserId('u-student-1')?.college).toBe('计算机学院');
     // 授权先行：被拒绝的请求不得触达仓储（不泄露资源存在性，也不产生无谓读）
     expect(findByUserId).not.toHaveBeenCalled();
+    expect(collegeBefore).toBe('计算机学院');
   });
 
   it('授权先于字段校验与取数：无权主体带非法请求体得到 403，而不是校验反馈', async () => {
