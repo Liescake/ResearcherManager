@@ -32,6 +32,16 @@
 
 RuoYi 的菜单、按钮和角色 RBAC 只能作为粗粒度入口，不能替代上述业务资源谓词。所有角色、scope、groupId、owner 和授权集合必须由服务端会话或数据库解析，不能信任客户端字段。
 
+## 契约静态校验
+
+`contracts/` 下的公开契约自带零依赖校验器（只用 Node 内置模块，不联网、不写文件）：
+
+```bash
+node services/ruoyi-api/contracts/validate.mjs
+```
+
+校验范围与判定语义见 `contracts/README.md` §7：结构校验 + 授权场景重放 + 全量 `$ref` 解析。
+
 ## 保留的现有边界
 
 - `services/api`：NestJS 回滚基线，保持不变。

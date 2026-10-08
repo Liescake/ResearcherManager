@@ -4,13 +4,14 @@
 
 ## 1. 本目录内容
 
-| 文件                  | 用途                                                               | 静态校验                                          |
-| --------------------- | ------------------------------------------------------------------ | ------------------------------------------------- |
-| `README.md`           | 契约边界、信封/错误码与授权语义说明                                | 人工评审（本文件不参与自动校验）                  |
-| `health.openapi.yaml` | `GET /health`、`GET /health/ready` 的 OpenAPI 3.0.3 契约           | YAML 解析、OpenAPI 结构、`$ref` 可解析            |
-| `authz-fixtures.json` | `SELF/GROUP/ASSIGNED/GLOBAL/SYSTEM` 授权判定夹具（含越权负向用例） | JSON 解析、夹具结构、枚举与服务端单一事实来源一致 |
+| 文件                  | 用途                                                               | 静态校验                                                                            |
+| --------------------- | ------------------------------------------------------------------ | ----------------------------------------------------------------------------------- |
+| `README.md`           | 契约边界、信封/错误码与授权语义说明                                | 人工评审（本文件不参与自动校验）                                                    |
+| `validate.mjs`        | 本目录公开静态校验器（仅用 Node 内置模块，结构 + 授权场景重放）    | 自身即校验入口，见 §7.1                                                             |
+| `health.openapi.yaml` | `GET /health`、`GET /health/ready` 的 OpenAPI 3.0.3 契约           | YAML 解析、OpenAPI 结构、`$ref` 可解析（§7.1/§7.2）                                 |
+| `authz-fixtures.json` | `SELF/GROUP/ASSIGNED/GLOBAL/SYSTEM` 授权判定夹具（含越权负向用例） | JSON 解析、夹具结构与授权场景重放（§7.1/§7.3）；枚举与单一事实来源一致（§7.1/§7.4） |
 
-校验命令见 §7；`authz-fixtures.json` 的判定语义必须与 NestJS 基线谓词一致（§5），并可用 §7.3 的方式回归。
+校验命令见 §7；`authz-fixtures.json` 的判定语义必须与 NestJS 基线谓词一致（§5），并可用 §7.4 的方式回归。
 
 ## 2. 边界与单一事实来源
 
@@ -122,27 +123,44 @@
 
 ## 7. 静态校验
 
-以下检查必须在提交前通过（本目录不含校验脚本，避免在边界目录内引入工具依赖）：
+本目录自带公开校验器 `validate.mjs`：只用 Node 内置模块，不声明也不安装第三方依赖，不联网、不写文件，可在任意工作目录执行。以下检查必须在提交前通过：
 
 ```bash
-# 7.1 YAML 解析 + OpenAPI 结构 + $ref 解析（任选一个可用解析器）
+# 7.1 本目录公开校验器（主门禁；失败时退出码为 1，仅输出失败项）
+node services/ruoyi-api/contracts/validate.mjs
+# 等价写法：进入本目录后执行（脚本按自身位置解析同目录契约文件）
+cd services/ruoyi-api/contracts && node validate.mjs
+```
+
+7.1 的校验范围：
+
+- `authz-fixtures.json` 结构：JSON 解析、顶层字段、`enums` 内部一致性（角色 ↔ 默认范围 ↔ 权限目录、受限权限必须已登记、权限目录不含通配形式）、逐条夹具的必需字段与允许键（判定输入只允许白名单字段，客户端声明只能出现在 `clientClaims`）、拒绝用例必须携带 `deniedBy`、夹具 id 唯一、契约版本为 semver；
+- `authz-fixtures.json` 授权场景重放：内置参考执行器（镜像 `packages/shared/src/enums/authorization.ts` 的 `isAuthorized` / `canGrantPermissions`）逐条断言结果等于 `expect.allowed`；放行用例不得引用未登记的枚举，`clientClaims` 必须被忽略且确实伪造了与服务端解析结果不同的声明，并按 §5 检查负向场景标签覆盖是否齐全；
+- `enums` 快照与单一事实来源一致：冻结快照必须等于 `packages/shared/src/enums/permission.ts` 派生出的权限目录（该文件不可读时跳过，并在输出中标注）；
+- `health.openapi.yaml`：无依赖解析本文件使用的缩进式 YAML 子集（块映射/序列、字面量块、引号标量、JSON 兼容集合），校验必要顶层字段、必需路径 `/health` 与 `/health/ready`、操作与响应的 `description`、`*Envelope` 的 `required: [data, meta, error]` 与 `additionalProperties: false`、全部 `$ref` 均为本文档内引用且可解析、`x-boundary` 边界声明（未含 RuoYi 源码、未引入 Maven 依赖）与契约版本一致；
+- 不支持的 YAML 写法（制表符缩进、锚点/别名/标签、多文档、跨行流式集合）直接判定失败，不做宽松猜测。
+
+7.1 的授权场景重放是**契约自包含的参考执行器**，不是第二事实来源：它把夹具断言到文档语义，`enums` 快照仍以 `packages/shared/src/enums/permission.ts` 为准；与基线共享包（`packages/shared/dist/index.js`）的独立谓词回归见 7.4，两者互为交叉验证。
+
+```bash
+# 7.2 YAML 解析 + OpenAPI 结构 + $ref 解析（可选交叉验证，任选一个可用解析器）
 python -c "import yaml;yaml.safe_load(open('services/ruoyi-api/contracts/health.openapi.yaml',encoding='utf-8'))"
 # node 变体需要本机已有 YAML 解析器；仓库刻意不声明该依赖，未安装时用上面的 python/pyyaml
 node -e "import('yaml').then(m=>m.parse(require('fs').readFileSync('services/ruoyi-api/contracts/health.openapi.yaml','utf8')))"
 
-# 7.2 JSON 解析
+# 7.3 JSON 解析（可选交叉验证）
 python -c "import json;json.load(open('services/ruoyi-api/contracts/authz-fixtures.json',encoding='utf-8'))"
 
-# 7.3 夹具回归：遍历 fixtures/grantFixtures，逐条断言
+# 7.4 夹具回归：遍历 fixtures/grantFixtures，逐条断言
 #     isAuthorized(subject, request) === expect.allowed
 #     canGrantPermissions(actor, grants) === expect.allowed
 #     判定入口为 packages/shared/dist/index.js（只读导入基线共享包，不新增依赖）
 
-# 7.4 空白与冲突标记
+# 7.5 空白与冲突标记
 git diff --check
 ```
 
-7.3 的判定入口为 `packages/shared/dist/index.js` 的 `isAuthorized` / `canGrantPermissions`，输入即夹具中的 `subject` / `request` / `actor` / `grants`；`enums` 快照必须与 `packages/shared/src/enums/permission.ts` 完全一致。
+7.4 的判定入口为 `packages/shared/dist/index.js` 的 `isAuthorized` / `canGrantPermissions`，输入即夹具中的 `subject` / `request` / `actor` / `grants`；`enums` 快照必须与 `packages/shared/src/enums/permission.ts` 完全一致（7.1 已自动核对）。
 
 ## 8. 后续契约切片与版本规则
 
