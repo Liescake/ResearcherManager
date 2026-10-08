@@ -149,21 +149,132 @@ function firstLine(text) {
  * - 经 shell 启动时命令行**仍然额外整段加引号**（纵深防御：即使元字符校验将来被放宽，也已中和一次）；
  * - `.exe` 与 POSIX 可执行文件由 Node 直接 exec（`shell: false`），不经过任何 shell，因此只做通用校验：
  *   `C:\Program Files (x86)\...\java.exe` 这类含括号的合法路径不会被误拒（本机 java.exe 即在该目录）；
- * - 「可用」必须同时满足**定位到文件 + 确实执行成功（退出码 0）+ 输出非空且可解析出版本号**。
+ * - 「可用」必须同时满足**定位到文件 + 确实执行成功（退出码 0）+ 输出非空且含该工具的严格版本行**。
  *   只凭「同名文件存在」就判可用是 fail-open：一个坏掉的同名脚本会被当成现成工具；只判「非空」也不够：
- *   `--version` 只打印用法说明（如 `Usage: trivy [flags]`）却返回 0 的坏工具同样会把 capability 误报为 ready。
+ *   `--version` 只打印用法说明（如 `Usage: trivy [flags]`）却返回 0 的坏工具同样会把 capability 误报为 ready；
+ *   版本号只能在**该工具自己的版本行**上取（工具标识行 / 整行语义版本 / 实测的 `Version:` 行），不允许
+ *   在垃圾或错误文本里任意搜「数字.数字」——规则与自检见后文「严格的工具特定版本解析」；
+ * - Docker 走另一条更严的规则：`docker info --format '{{.ServerVersion}}'` 的输出必须**整段就是**一条合法
+ *   ServerVersion（允许 Docker 常见后缀），出现任何垃圾或错误文本即判守护进程不可达（fail-closed）。
  */
 const PROBE_TIMEOUT_MS = 15000;
 const UNSAFE_PATH_CHARS = /["'\u0000-\u001f\u007f]/;
 const SHELL_META_CHARS = /[&|<>^()%!]/;
 
-/** 可解析的版本号形状：至少两段点分数字（`1.2`、`1.2.3`）；读不出来即视为「输出不可解析」。 */
-const VERSION_SHAPE = /\d+(?:\.\d+)+/;
+/**
+ * 严格的**工具特定**版本解析（禁止在垃圾文本里任意搜「数字.数字」）。
+ *
+ * 旧实现用 `\d+(?:\.\d+)+` 在整段输出里搜数字点串，于是 `error code 1.2`、`garbage 999.999`
+ * 这类错误文本也会被当成版本号，把坏工具误判为可用。现只承认三种版本行，且版本号本身必须是
+ * **严格语义版本**（`MAJOR.MINOR.PATCH`，可选 `-预发布` / `+构建元数据`）：
+ *
+ *   A. 合法版本行：整行恰好是一条语义版本（commander 风格 CLI 只打印版本号，如 cdxgen 的 `11.5.1`）；
+ *   B. 工具标识行：行首必须是**该工具自己的**标识（`trivy 0.58.0`、`osv-scanner version: 1.9.0`、
+ *      `psql (PostgreSQL) 16.4`），版本号紧随标识之后，行尾只允许空或 PostgreSQL 的发行版括号说明；
+ *   C. 带标签版本行：整行是 `Version: X.Y.Z`，且只对该工具实测这样输出的工具开放（syft / grype / trivy）。
+ *
+ * 因此 `garbage 999.999`（既非工具标识行、也非整行版本）、`error 1.2`、`0.0`（只有两段，不是语义
+ * 版本）与 `Usage: trivy [flags]` 都不可能再解析出版本号。PostgreSQL 的 `MAJOR.MINOR`（10 起官方
+ * 版本号只有两段）只在工具标识行内接受，且主版本必须 ≥ 1：`psql (PostgreSQL) 0.0` 按不可解析
+ * fail-closed 处理。
+ */
+const SEMVER_CORE =
+  /^(?:v)?(\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?(?:\+[0-9A-Za-z][0-9A-Za-z.-]*)?)$/;
+const POSTGRES_CORE = /^(\d+)\.(\d+)(?:\.\d+)?(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?$/;
+const LABELED_VERSION_LINE = /^version\s*[:=]\s*(\S+)$/i;
+/** PostgreSQL 客户端版本号后可能追加发行版括号说明（如 Ubuntu 的 `(Ubuntu 16.4-0ubuntu0...)`）。 */
+const VENDOR_SUFFIX = /^\s*\([^()]*\)\s*$/;
+/** 工具标识（锚定行首）：只有这些行的行首才允许出现对应工具的版本号。 */
+const TOOL_IDENTITY = {
+  cyclonedx: /^cyclonedx(?:[- ]cli)?/i,
+  syft: /^(?:application:\s*)?syft\b/i,
+  cdxgen: /^cdxgen\b/i,
+  jbom: /^jbom\b/i,
+  trivy: /^trivy\b/i,
+  grype: /^(?:application:\s*)?grype\b/i,
+  'osv-scanner': /^osv-scanner\b/i,
+  'dependency-check': /^(?:owasp\s+)?dependency-check(?:\s+core)?\b/i,
+  psql: /^psql\s*\(postgresql\)/i,
+  pg_ctl: /^pg_ctl\s*\(postgresql\)/i,
+  pg_isready: /^pg_isready\s*\(postgresql\)/i,
+};
+/** 实测以 `Version: X.Y.Z` 单行打印版本的工具（syft / grype / trivy 的 `--version`）。 */
+const LABELED_VERSION_TOOLS = new Set(['syft', 'grype', 'trivy']);
+const POSTGRES_TOOLS = new Set(['psql', 'pg_ctl', 'pg_isready']);
+/** 工具标识与版本号之间的连接词：` 0.58.0` / `: 0.58.0` / ` version 0.58.0` / `v0.58.0`。 */
+const VERSION_CONNECTOR = /^\s*[:=]?\s*(?:v(?:ersion)?\b\s*[:=]?\s*)?/i;
+/** 版本号 token：数字开头（允许 `v` 前缀）；token 之后若还有其他内容由行尾校验拒绝。 */
+const VERSION_TOKEN = /^[vV]?\d[0-9A-Za-z.+-]*/;
+/** 最多扫描的输出行数（多行 `--version` 输出的合法版本行都很靠前，避免在长输出里乱找）。 */
+const MAX_VERSION_SCAN_LINES = 20;
 
-/** 从探针输出里解析版本号形状（只做形状校验，不猜工具语义；解析不出返回 null 交调用方 fail-closed）。 */
-function parseToolVersion(text) {
-  const match = VERSION_SHAPE.exec(String(text ?? ''));
-  return match === null ? null : match[0];
+/** 按工具要求的形状校验版本号：不属于该形状一律返回 null（fail-closed，不截取部分匹配）。 */
+function validateVersion(name, candidate) {
+  if (typeof candidate !== 'string' || candidate === '') return null;
+  const value = /^[vV]/.test(candidate) ? candidate.slice(1) : candidate;
+  if (POSTGRES_TOOLS.has(name)) {
+    const match = POSTGRES_CORE.exec(value);
+    if (match === null) return null;
+    // PostgreSQL 主版本自 1 起；`0.0` / `0.1` 这类占位不是任何真实客户端版本，按不可解析处理
+    return Number.parseInt(match[1], 10) >= 1 ? value : null;
+  }
+  return SEMVER_CORE.exec(value) === null ? null : value;
+}
+
+/** 从一行输出里按**工具特定**规则取版本号；该行不属于此工具的任一版本行形状即返回 null。 */
+function versionFromLine(name, rawLine) {
+  const line = String(rawLine ?? '').trim();
+  if (line === '') return null;
+  // A. 合法版本行：整行就是一条语义版本（两段的 0.0 / 1.2 / 999.999 不算）
+  const bare = SEMVER_CORE.exec(line);
+  if (bare !== null) return bare[1];
+  // C. 带标签版本行：`Version: X.Y.Z`，仅对该工具实测这样输出时接受
+  if (LABELED_VERSION_TOOLS.has(name)) {
+    const labeled = LABELED_VERSION_LINE.exec(line);
+    if (labeled !== null) {
+      const version = validateVersion(name, labeled[1]);
+      if (version !== null) return version;
+    }
+  }
+  // B. 工具标识行：行首是该工具标识，版本号紧随其后，行尾只允许空或（PostgreSQL）发行版括号说明
+  const identity = TOOL_IDENTITY[name];
+  if (!identity) return null;
+  const identityMatch = identity.exec(line);
+  if (identityMatch === null) return null;
+  const afterIdentity = line.slice(identityMatch[0].length);
+  const connector = VERSION_CONNECTOR.exec(afterIdentity);
+  const remainder = afterIdentity.slice(connector === null ? 0 : connector[0].length);
+  const token = VERSION_TOKEN.exec(remainder);
+  if (token === null) return null;
+  const tail = remainder.slice(token[0].length);
+  if (tail !== '' && !(POSTGRES_TOOLS.has(name) && VENDOR_SUFFIX.test(tail))) return null;
+  return validateVersion(name, token[0]);
+}
+
+/** 在**有界行数**内取第一个合格版本行；解析不出来返回 null，由调用方 fail-closed 判不可用。 */
+function parseToolVersion(name, text) {
+  const lines = String(text ?? '')
+    .split(/\r?\n/)
+    .slice(0, MAX_VERSION_SCAN_LINES);
+  for (const line of lines) {
+    const version = versionFromLine(name, line);
+    if (version !== null) return version;
+  }
+  return null;
+}
+
+/**
+ * Docker ServerVersion：`docker info --format '{{.ServerVersion}}'` 的输出必须**整段就是**一条合法
+ * 版本串（允许 Docker 常见的 `-rc.1` / `-ce` / `+dfsg1` 一类后缀），拒绝任何垃圾或错误文本：
+ * `error during connect: ...`、`ServerVersion: 27.3.1`、`0.0`、`999.999`、版本后跟警告行都不算可用。
+ */
+const DOCKER_SERVER_VERSION =
+  /^(?:v)?(\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?(?:\+[0-9A-Za-z][0-9A-Za-z.-]*)?)$/;
+
+function parseDockerVersion(text) {
+  const value = String(text ?? '').trim();
+  const match = DOCKER_SERVER_VERSION.exec(value);
+  return match === null ? null : match[1];
 }
 
 /** 通用路径校验：非空且不含引号与控制字符（对所有平台、是否经 shell 都成立的最低要求）。 */
@@ -306,7 +417,8 @@ function findOnPath(name) {
 
 /**
  * 把一次探测判成「可用 / 不可用」（纯函数，便于自检注入合成结果，不需要真的执行命令）。
- * 可用四条件：定位到文件、执行成功（退出码 0）、输出非空、输出能解析出版本号形状。
+ * 可用四条件：定位到文件、执行成功（退出码 0）、输出非空、输出含该工具的严格版本行（语义版本；
+ * Docker 单独要求整段输出就是合法 ServerVersion）。
  */
 function classifyProbe(input) {
   const { name, located, path, captured } = input ?? {};
@@ -345,7 +457,8 @@ function classifyProbe(input) {
     record.failure = 'empty-output';
     return record;
   }
-  const version = parseToolVersion(captured.text);
+  const version =
+    name === 'docker' ? parseDockerVersion(captured.text) : parseToolVersion(name, captured.text);
   if (version === null) {
     record.failure = 'output-unparsable';
     return record;
@@ -893,7 +1006,7 @@ function collectProbes(prepared) {
   const dockerDaemonOk =
     dockerProbe.usable === true &&
     dockerProbe.status === 0 &&
-    dockerText.trim() !== '' &&
+    parseDockerVersion(dockerText) !== null &&
     !DAEMON_FAILURE.test(dockerText);
   const sbom = probeTools(SBOM_TOOL_SPECS);
   const scanner = probeTools(SCANNER_SPECS);
@@ -1139,7 +1252,7 @@ function probeUnitChecks() {
     signal: null,
     mode: 'pipe',
     reason: null,
-    text: 'trivy 0.58.0',
+    text: 'trivy version 0.58.0',
   };
   const blocked = {
     ok: false,
@@ -1180,10 +1293,120 @@ function probeUnitChecks() {
     'output-unparsable',
   );
   check(
-    '退出码 0 且输出版本号（无前缀）→ 可用',
+    '工具标识行 + 版本号（trivy version 0.58.0）→ 可用',
+    withCaptured({ ...good, text: 'trivy version 0.58.0\n' }).version,
+    '0.58.0',
+  );
+  check(
+    '合法版本行（整行只有一条语义版本）→ 可用',
     withCaptured({ ...good, text: '27.3.1\n' }).version,
     '27.3.1',
   );
+  check(
+    '带标签版本行（trivy 实测形态 Version: X.Y.Z）→ 可用',
+    withCaptured({ ...good, text: 'Version: 0.58.0\nVulnerability DB:\n  Version: 2\n' }).version,
+    '0.58.0',
+  );
+  check(
+    '多行 Application/Version（syft 实测形态）→ 可用',
+    classifyProbe({
+      name: 'syft',
+      located: true,
+      path: 'fixture/syft',
+      captured: { ...good, text: 'Application: syft\nVersion: 1.14.0\nBuildDate: 2024-01-01' },
+    }).version,
+    '1.14.0',
+  );
+  check(
+    'PostgreSQL 两段式版本 psql (PostgreSQL) 16.4 → 可用',
+    classifyProbe({
+      name: 'psql',
+      located: true,
+      path: 'fixture/psql',
+      captured: { ...good, text: 'psql (PostgreSQL) 16.4\n' },
+    }).version,
+    '16.4',
+  );
+  check(
+    'PostgreSQL 客户端带发行版括号（Ubuntu 形态）→ 仍取标识后的版本号',
+    classifyProbe({
+      name: 'psql',
+      located: true,
+      path: 'fixture/psql',
+      captured: { ...good, text: 'psql (PostgreSQL) 16.4 (Ubuntu 16.4-0ubuntu0.24.04.1)' },
+    }).version,
+    '16.4',
+  );
+  /*
+   * 严格版本解析（本 BLOCK 的修复点）：只在「该工具自己的版本行」上取版本号，绝不在垃圾文本里
+   * 任意搜「数字.数字」；两段数字（0.0 / 1.2 / 999.999）不构成语义版本，一律不可解析。
+   */
+  const unparsableToolTexts = [
+    ['garbage 999.999', 'garbage 999.999\n'],
+    ['error 1.2', 'error 1.2\n'],
+    ['0.0', '0.0\n'],
+    ['多行混合 starting probe + garbage 999.999', 'starting probe\ngarbage 999.999\n'],
+    ['Version: 1.2（标签后是两段数字）', 'Version: 1.2\n'],
+    ['Usage: trivy [flags]', 'Usage: trivy [flags]\n'],
+    ['工具标识后不是版本号 trivy image <target>', 'trivy image <target>\n'],
+  ];
+  for (const [label, text] of unparsableToolTexts) {
+    check(
+      `不可解析的工具输出「${label}」→ output-unparsable`,
+      withCaptured({ ...good, text }).failure,
+      'output-unparsable',
+    );
+  }
+  check(
+    '另一工具的标识行不算本工具版本（trivy 探测看到 grype 0.90.0）→ 不可用',
+    withCaptured({ ...good, text: 'grype 0.90.0\n' }).failure,
+    'output-unparsable',
+  );
+  check(
+    'PostgreSQL 占位版本 psql (PostgreSQL) 0.0 → 不可用（fail-closed）',
+    classifyProbe({
+      name: 'psql',
+      located: true,
+      path: 'fixture/psql',
+      captured: { ...good, text: 'psql (PostgreSQL) 0.0\n' },
+    }).failure,
+    'output-unparsable',
+  );
+  // Docker：`info --format '{{.ServerVersion}}'` 的输出必须整段就是一条合法 ServerVersion
+  const withDocker = (text) =>
+    classifyProbe({
+      name: 'docker',
+      located: true,
+      path: 'fixture/docker',
+      captured: { ...good, text },
+    });
+  for (const [label, text] of [
+    ['27.3.1', '27.3.1'],
+    ['行尾换行 27.3.1\\n', '27.3.1\n'],
+    ['发行版后缀 24.0.7-ce', '24.0.7-ce'],
+    ['预发布后缀 27.3.1-rc.1', '27.3.1-rc.1'],
+    ['构建元数据 20.10.24+dfsg1', '20.10.24+dfsg1'],
+  ]) {
+    check(`Docker ServerVersion「${label}」→ 可用`, withDocker(text).version, text.trim());
+  }
+  for (const [label, text] of [
+    [
+      'error during connect',
+      'error during connect: this error may indicate that the docker daemon is not running',
+    ],
+    [
+      'Cannot connect 文本',
+      'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?',
+    ],
+    ['两段式 0.0', '0.0'],
+    ['两段式 999.999', '999.999'],
+    ['带标签而非纯版本 ServerVersion: 27.3.1', 'ServerVersion: 27.3.1'],
+    ['版本后夹带说明 27.3.1 (build abcdef)', '27.3.1 (build abcdef)'],
+    ['版本后跟警告行', '27.3.1\nWARNING: No swap limit support'],
+    ['空输出', '   '],
+  ]) {
+    check(`Docker 非法输出「${label}」→ 不算可用`, withDocker(text).usable, false);
+  }
   check('执行被环境阻止 → 不可用', withCaptured(blocked).failure, 'EPERM');
   check('探针超时 → 不可用', withCaptured(timedOut).failure, 'timeout');
   check('只定位到、未执行 → 不可用（fail-open 已堵住）', withCaptured(null).usable, false);
