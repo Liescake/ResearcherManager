@@ -100,9 +100,11 @@ export class MatchingService {
     // 1. 授权先于字段校验与任何仓储访问（未授权主体连字段级反馈都拿不到）
     this.authorizeSelf(subject);
 
-    // 2. 输入闭集 → 共享 schema：未知字段（含归属/角色/范围/状态）与非法版本一律 400
-    assertDeclaredMatchingRequestInputFields(body);
-    const input = matchingRequestInputSchema.parse(body);
+    // 2. 输入闭集 → 共享 schema：未知字段（含归属/角色/范围/状态）与非法版本一律 400。
+    //    缺省请求体等价于空对象（画像版本是可选的）；`null`/数组/标量仍按非法输入拒绝
+    const rawBody = body === undefined ? {} : body;
+    assertDeclaredMatchingRequestInputFields(rawBody);
+    const input = matchingRequestInputSchema.parse(rawBody);
 
     const modelVersion = resolveModelVersion(this.env, this.provider);
     const bundle = this.features.loadBundle(subject.userId);
@@ -245,8 +247,7 @@ export class MatchingService {
           : MatchingRequestStatus.Completed,
       recommendations: checked.value,
       fallbackUsed: true,
-      degradationCode:
-        checked.value.length === 0 ? AiErrorCode.NoCandidate : degradationCode,
+      degradationCode: checked.value.length === 0 ? AiErrorCode.NoCandidate : degradationCode,
     };
   }
 

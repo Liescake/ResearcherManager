@@ -30,11 +30,7 @@ import {
   MATCHING_REQUEST_INPUT_FIELDS,
   MATCHING_REQUEST_INTEGRITY_MESSAGE,
 } from './matching.contract';
-import type {
-  MatchingFeatureSource,
-  MatchingRepository,
-  MatchingRequest,
-} from './matching.port';
+import type { MatchingFeatureSource, MatchingRepository, MatchingRequest } from './matching.port';
 import { MatchingService } from './matching.service';
 
 /**
@@ -183,7 +179,9 @@ function harness(options: {
   features.bundle = 'bundle' in options ? options.bundle : featureBundle();
   const provider =
     options.provider ??
-    createMockProvider(options.providerResult === undefined ? {} : { result: options.providerResult });
+    createMockProvider(
+      options.providerResult === undefined ? {} : { result: options.providerResult },
+    );
   const env = loadEnv({
     NODE_ENV: 'test',
     AI_MATCHING_ENABLED: options.aiEnabled ? 'true' : 'false',
@@ -287,6 +285,12 @@ describe('MatchingService：主体与归属只来自服务端', () => {
     const view = await service.createMyMatchingRequest(student, {});
     expect(repository.created).toHaveLength(1);
     expect(view.profileVersion).toBeUndefined();
+
+    // HTTP 层缺省请求体到达 service 时是 undefined，必须等价于空对象
+    const { service: second, repository: secondRepository } = harness({});
+    const withoutBody = await second.createMyMatchingRequest(student, undefined);
+    expect(secondRepository.created).toHaveLength(1);
+    expect(withoutBody.profileVersion).toBeUndefined();
   });
 
   it('列表：只取会话主体自己的记录，且视图不含归属字段', () => {

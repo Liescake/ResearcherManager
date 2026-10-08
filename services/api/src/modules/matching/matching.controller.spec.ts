@@ -33,10 +33,7 @@ import { AuthModule } from '../auth/auth.module';
 import { InMemorySessionStore } from '../auth/session-store.in-memory';
 import { RUOYI_AUTHZ_ADAPTER } from '../ruoyi-adapter/ruoyi-adapter.port';
 import type { RuoYiAuthzAdapter } from '../ruoyi-adapter/ruoyi-adapter.port';
-import {
-  MATCHING_REQUEST_INPUT_FIELDS,
-  MATCHING_REQUEST_VIEW_FIELDS,
-} from './matching.contract';
+import { MATCHING_REQUEST_INPUT_FIELDS, MATCHING_REQUEST_VIEW_FIELDS } from './matching.contract';
 import { MatchingController } from './matching.controller';
 import { InMemoryMatchingFeatureSource } from './matching.feature-source.in-memory';
 import { InMemoryMatchingRepository } from './matching.in-memory-repository';
@@ -526,6 +523,7 @@ describe('匹配：输入拒绝 400（闭集，不是静默剥离）', () => {
       { profileVersion: 1.5 },
       { profileVersion: 1_000_001 },
       [],
+      null,
       'not-an-object',
     ]) {
       const res = await call(baseUrl, 'POST', '/me/matching-requests', {
@@ -592,6 +590,36 @@ describe('匹配：越权 403 与「授权先于一切」', () => {
     expect(createSpy).not.toHaveBeenCalled();
     expect(saveSpy).not.toHaveBeenCalled();
     expect(listSpy).not.toHaveBeenCalled();
+  });
+
+  it('授权与输入校验都先于召回来源访问，且合法请求才真的去召回（正反对照）', async () => {
+    const { baseUrl, features } = await startMatchingApp();
+    const loadSpy = vi.spyOn(features, 'loadBundle');
+
+    // 无权限主体：403，且连「该主体有没有可召回画像」都不去观察
+    const forbidden = await call(baseUrl, 'POST', '/me/matching-requests', {
+      headers: bearer(SESSION_LEADER_1),
+      body: {},
+    });
+    expect(forbidden.status).toBe(403);
+
+    // 有权限但输入非法：400，同样不触碰召回来源（校验先于取数）
+    const invalid = await call(baseUrl, 'POST', '/me/matching-requests', {
+      headers: bearer(SESSION_STUDENT_1),
+      body: { userId: 'u-victim-1' },
+    });
+    expect(invalid.status).toBe(400);
+
+    expect(loadSpy).not.toHaveBeenCalled();
+
+    // 对照组：合法请求确实会按服务端主体访问召回来源（证明上面的「零调用」不是恒真）
+    const accepted = await call(baseUrl, 'POST', '/me/matching-requests', {
+      headers: bearer(SESSION_STUDENT_1),
+      body: {},
+    });
+    expect(accepted.status).toBe(201);
+    expect(loadSpy).toHaveBeenCalledTimes(1);
+    expect(loadSpy).toHaveBeenCalledWith(STUDENT_1);
   });
 
   it('授权先于字段校验：无权限主体的非法请求体得到 403，而不是 400', async () => {
@@ -774,17 +802,32 @@ describe('匹配：敏感字段不外泄（快照、模型输出、存储记录�
     expect(res.text).not.toContain('建议尽快联系负责人');
   });
 
-  it('输出字段闭集：视图键集恒等于白名单，且不含归属与快照摘要', async () => {
-    const { baseUrl } = await startMatchingApp();
-    const res = await call(baseUrl, 'POST', '/me/matching-requests', {
+  it('输出字段闭集：视图只可能出现在白名单内，归属与快照摘要永不出现', async () => {
+    const { baseUrl, repository } = await startMatchingApp();
+    const created = await call(baseUrl, 'POST', '/me/matching-requests', {
       headers: bearer(SESSION_STUDENT_1),
+      // 显式带上可选字段，使白名单里的 10 个字段全部可达
+      body: { profileVersion: 1 },
     });
-    expect(Object.keys(viewOf(res.body)).sort()).toEqual([...MATCHING_REQUEST_VIEW_FIELDS].sort());
+    expect(created.status).toBe(201);
+    expect(Object.keys(viewOf(created.body)).sort()).toEqual(
+      [...MATCHING_REQUEST_VIEW_FIELDS].sort(),
+    );
+
     const list = await call(baseUrl, 'GET', '/me/matching-requests', {
       headers: bearer(SESSION_STUDENT_1),
     });
-    for (const item of list.body.data as Record<string, unknown>[]) {
-      expect(Object.keys(item).sort()).toEqual([...MATCHING_REQUEST_VIEW_FIELDS].sort());
+    const whitelist: readonly string[] = MATCHING_REQUEST_VIEW_FIELDS;
+    const items = list.body.data as Record<string, unknown>[];
+    expect(items.length).toBeGreaterThanOrEqual(1);
+    for (const item of items) {
+      // 白名单是闭集：未登记字段一旦出现即为契约漂移
+      expect(Object.keys(item).filter((key) => !whitelist.includes(key))).toEqual([]);
+      expect(item.userId).toBeUndefined();
+      expect(item.inputSnapshotHash).toBeUndefined();
+      expect(list.text).not.toContain(
+        repository.findById(String(item.id))?.inputSnapshotHash ?? 'x',
+      );
     }
   });
 });
@@ -838,7 +881,11 @@ describe('匹配：状态机与存储不变量 fail-closed', () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startMatchingApp();
     vi.spyOn(repository, 'listByUserId').mockReturnValue([
-      fixtureRequest({ userId: STUDENT_2, recommendations: [] , status: MatchingRequestStatus.NoCandidate }),
+      fixtureRequest({
+        userId: STUDENT_2,
+        recommendations: [],
+        status: MatchingRequestStatus.NoCandidate,
+      }),
     ]);
 
     const res = await call(baseUrl, 'GET', '/me/matching-requests', {
@@ -914,8 +961,7 @@ describe('匹配：切片装配与既有路由回归', () => {
     );
 
     const listed = repository.listByUserId(STUDENT_1)[0] as
-      | { id: string; status: string }
-      | undefined;
+      { id: string; status: string } | undefined;
     expect(listed?.id).toBe(stored.id);
     // 副本：外部改写不得影响存储
     if (listed) listed.status = 'tampered';

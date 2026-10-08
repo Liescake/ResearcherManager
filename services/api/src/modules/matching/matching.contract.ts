@@ -100,9 +100,7 @@ export const storedMatchingRequestSchema = z
     userId: trimmedText(1, 64, '归属主体'),
     status: z.enum(MATCHING_REQUEST_STATUS_VALUES),
     profileVersion: z.number().int().min(1).max(1_000_000).optional(),
-    inputSnapshotHash: z
-      .string()
-      .regex(/^[0-9a-f]{64}$/u, '输入快照摘要必须是 sha256 十六进制'),
+    inputSnapshotHash: z.string().regex(/^[0-9a-f]{64}$/u, '输入快照摘要必须是 sha256 十六进制'),
     recommendations: matchingRecommendationListSchema,
     modelVersion: trimmedText(1, 64, '模型版本'),
     promptVersion: trimmedText(1, 64, '提示词版本'),
@@ -256,8 +254,6 @@ export function checkMatchingRecommendations(raw: unknown): RecommendationCheck 
 }
 
 /** 供测试与调用方复用：记录归属主体（不可读时返回空串，交由调用方按服务端缺陷处理） */
-export function readMatchingRequestOwnerId(record: {
-  readonly userId?: unknown;
-}): string {
+export function readMatchingRequestOwnerId(record: { readonly userId?: unknown }): string {
   return typeof record.userId === 'string' ? record.userId : '';
 }

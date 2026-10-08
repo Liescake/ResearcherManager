@@ -73,6 +73,87 @@ export interface MatchingRepository {
   listByUserId(userId: string): readonly MatchingRequest[];
 }
 
+/**
+ * PostgreSQL 后端标识（能力声明 `backend` 的规范取值）。
+ *
+ * 数据库 adapter、边界守卫与运维摘要共用同一字面量，避免同一后端出现
+ * `postgres` / `postgres-draft` / `postgresql` 多个拼写而无法机器比对。
+ */
+export const MATCHING_REPOSITORY_BACKEND_POSTGRES = 'postgres';
+
+/**
+ * **存储 ID 域约束**：`ai_match_records.id` / `user_id` 与推荐结果里的 `groupId`
+ * 在存储侧都是 `uuid`（`ai_match_records` 引用 `users`，`recommendations[].groupId` 引用
+ * `research_groups`，见 docs/P1-字段级数据字典.md 与 docs/P2-ER图.md）。
+ *
+ * 会话主体当前的 `userId` 只保证是「安全 ID」（例如 `u-student-1`），**不是** UUID；
+ * 推荐来源 `MatchingFeatureSource` 返回的候选小组 ID 同样只保证是安全 ID。
+ * 因此绑定到数据库实现的那一片切片必须把这两类标识一起收敛为 UUID（规范小写形，
+ * 以便归属复核保持逐字节精确比较），否则数据库 adapter 会按本约束 **fail-closed 拒绝**，
+ * 而不是退化成「放弃类型约束的字符串比较」。
+ */
+export const MATCHING_REPOSITORY_STORAGE_ID_DOMAIN = 'uuid';
+
+/**
+ * 匹配记录的**服务端授权边界**（读 / 写都必须携带）。
+ *
+ * 它刻意不是「客户端过滤器」：两个字段都只能由 service 在 `AuthorizationGuard`
+ * 判定之后、从**服务端会话主体**与**服务端资源级判定产物**构造，请求体、查询串与自定义头
+ * （`x-user-id` / `x-roles` / `x-scope` / `x-group-id`）永不进入本结构。
+ *
+ * - `ownerUserId`：会话主体。仓储把它**下推进 SQL**（`WHERE user_id = $n`），
+ *   他人匹配记录根本不出库；返回行上再逐条复核归属（纵深防御）。
+ * - `authorizedGroupIds`：服务端已判定「该主体可见」的小组集合（推荐召回与资源级判定的产物）。
+ *   存储记录里的推荐结果一旦出现集合之外的小组，说明记录被外部改写或召回越权：
+ *   仓储**fail-closed 抛错**（`GROUP_SCOPE_VIOLATION`），绝不像过滤器那样静默剔除后照常返回
+ *   ——静默剔除会把「存储层被污染」伪装成「这条记录只是少几条推荐」。
+ */
+export interface MatchingAccessScope {
+  /** 服务端会话主体（归属）：非客户端输入，必须是存储 ID 域内的 UUID */
+  readonly ownerUserId: string;
+  /** 服务端已授权可见的小组 ID 集合（资源级判定产物）；空集合表示一条推荐都不允许出现 */
+  readonly authorizedGroupIds: readonly string[];
+}
+
+/**
+ * **异步仓储契约**（数据库形状的 repository 端口，与 `MatchingRepository` 同语义）。
+ *
+ * 为什么与 `MatchingRepository` 并存、而不是把它直接改成异步：后者是当前运行时绑定
+ * （内存基线，同步返回）。把它改成 Promise 是**跨模块契约变更**（service / controller 与既有
+ * spec 必须一起改），只能与「引入经评估的数据库驱动 + 集成验证」在同一片切片完成。在那之前，
+ * 数据库 adapter 按本契约实现并单独验证，运行时绑定一动不动，因此「切换到数据库」与
+ * 「回退到内存基线」都仍然是可以整步执行 / 整步回退的操作。
+ *
+ * 实现者（当前只有 `matching.postgres-repository.ts`）必须满足与内存基线**完全相同**的语义
+ * （含「同 ID 重复写入视为服务端缺陷、不得静默覆盖」与「覆盖写入未知 ID 必须显式抛错」），
+ * 并额外守住五条边界：
+ * 1. **授权边界随每次访问传入**：四个方法都要求 `MatchingAccessScope`（服务端 subject + 已授权小组
+ *    集合），因此不存在「只传 `userId` 就绕过小组边界」的调用形态。仓储**不做授权判定**，
+ *    只校验传入的边界是否被满足；边界本身由 `AuthorizationGuard` 与召回来源负责。
+ *    `listByUserId` 的方法名沿用同步端口，取数主体改由 `scope.ownerUserId` 承载。
+ * 2. **归属只来自服务端**：`userId` 既是写入记录的归属，也是取数主体；仓储不生成、不覆盖归属，
+ *    并复核「返回记录的归属 === 本次访问的归属」，不一致即判服务端缺陷（`OWNER_VIOLATION`）。
+ * 3. **存储 ID 域**：`userId`、记录 `id` 与推荐结果里的 `groupId` 都必须落在
+ *    `MATCHING_REPOSITORY_STORAGE_ID_DOMAIN`（UUID，规范小写形）内，否则 fail-closed
+ *    （`INVALID_SUBJECT` / `INVALID_RECORD_ID` / `INVALID_RECORD` / `INVALID_SCOPE`）。
+ * 4. **推荐结果闭集**：状态、降级码只接受闭集取值；推荐条目只接受
+ *    `groupId` / `score` / `reason` / `advice` 四条白名单字段（原始模型 payload、内部评分明细与
+ *    审核字段既不入库也不出库）；`completed` 必须有推荐、其余状态必须为空（读取契约的自洽校验）。
+ * 5. **每条返回记录都必须能被读取契约校验**：未知列、未知枚举、坏形状、状态与条数矛盾、
+ *    推荐理由里出现个人标识，一律按服务端缺陷抛错；高敏感内容与归属**绝不**进入错误消息与日志。
+ */
+export interface AsyncMatchingRepository {
+  readonly capabilities: MatchingRepositoryCapabilities;
+  /** 写入入口记录（状态恒为入口态、推荐为空）；同 ID 冲突必须显式抛错，不得静默覆盖 */
+  create(request: MatchingRequest, scope: MatchingAccessScope): Promise<MatchingRequest>;
+  /** 覆盖写入状态机推进结果；ID 不存在或不属于该主体都必须显式抛错，不得退化成插入 */
+  save(request: MatchingRequest, scope: MatchingAccessScope): Promise<MatchingRequest>;
+  /** 未命中返回 `undefined`（不抛错）：只返回同时命中记录 ID 与**服务端主体归属**的记录 */
+  findById(requestId: string, scope: MatchingAccessScope): Promise<MatchingRequest | undefined>;
+  /** 只按归属主体取数：调用方必须是已授权访问该主体资源的服务端代码 */
+  listByUserId(scope: MatchingAccessScope): Promise<readonly MatchingRequest[]>;
+}
+
 /** 召回与特征最小化后端的能力声明 */
 export interface MatchingSourceCapabilities {
   readonly backend: string;

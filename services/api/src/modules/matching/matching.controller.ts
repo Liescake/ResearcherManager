@@ -45,6 +45,9 @@ export class MatchingController {
     @Headers('authorization') authorization: string | undefined,
     @Body() body: unknown,
   ): Promise<MatchingRequestView> {
-    return this.matching.createMyMatchingRequest(requireSubject(this.sessions, authorization), body);
+    return this.matching.createMyMatchingRequest(
+      requireSubject(this.sessions, authorization),
+      body,
+    );
   }
 }
