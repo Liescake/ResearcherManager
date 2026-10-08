@@ -81,8 +81,9 @@ export type DatabaseConfigResolution =
 
 /**
  * 配置来源：与 `services/api/src/config/env.ts` 的 `AppEnv` 结构兼容（只取需要的键）。
- * 布尔与数值允许直接传已解析值（`AppEnv` 已经把 `DATABASE_SSL` 转成 boolean、
- * 把数值型配置转成 number），也允许传原始字符串（测试与其他调用方）。
+ * 布尔与数值允许直接传已解析值（`AppEnv` 已把数值型配置转成 number；`DATABASE_SSL`
+ * 未配置时保持 `undefined`、显式配置时为 boolean），也允许传原始字符串（测试与其他调用方）。
+ * 「未配置」与「显式 false」必须区分：前者走安全默认值，后者按显式关闭 TLS 判定。
  */
 export interface DatabaseConfigSource {
   readonly NODE_ENV?: string | undefined;
@@ -266,7 +267,8 @@ export function resolveDatabaseConfig(
     }
     return {
       status: 'absent',
-      detail: '未配置 DATABASE_URL：仅开发/测试允许无数据库启动（health 记为 database.not_configured）',
+      detail:
+        '未配置 DATABASE_URL：仅开发/测试允许无数据库启动（health 记为 database.not_configured）',
     };
   }
 

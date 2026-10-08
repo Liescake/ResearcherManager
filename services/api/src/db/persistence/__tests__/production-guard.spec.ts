@@ -26,10 +26,7 @@ const POSTGRES_VERIFIED: PersistenceCapabilities = {
   productionReady: true,
 };
 
-function binding(
-  token: string,
-  capabilities?: PersistenceCapabilities,
-): PersistenceBinding {
+function binding(token: string, capabilities?: PersistenceCapabilities): PersistenceBinding {
   return capabilities === undefined
     ? { token, label: `${token} 的绑定` }
     : { token, label: `${token} 的绑定`, capabilities };
@@ -61,7 +58,9 @@ describe('evaluatePersistenceBoundary：开发/测试不因内存基线失败', 
     const report = evaluatePersistenceBoundary({
       nodeEnv: 'test',
       databaseConfigured: true,
-      bindings: [binding('GROUP_REPOSITORY', { backend: '  ', persistent: true, productionReady: true })],
+      bindings: [
+        binding('GROUP_REPOSITORY', { backend: '  ', persistent: true, productionReady: true }),
+      ],
     });
     expect(report.violations.map((item) => item.rule)).toEqual(['BACKEND_NOT_DECLARED']);
   });
@@ -141,7 +140,9 @@ describe('assertPersistenceBoundary：抛出可定位且不含机密的错误', 
     expect(boundaryError.violations).toHaveLength(3);
     expect(boundaryError.message).toContain('GROUP_REPOSITORY[IN_MEMORY_BACKEND_IN_PRODUCTION]');
     expect(boundaryError.message).toContain('AUDIT_REPOSITORY[IN_MEMORY_BACKEND_IN_PRODUCTION]');
-    expect(boundaryError.message).toContain('DATABASE_CONFIG[DATABASE_NOT_CONFIGURED_IN_PRODUCTION]');
+    expect(boundaryError.message).toContain(
+      'DATABASE_CONFIG[DATABASE_NOT_CONFIGURED_IN_PRODUCTION]',
+    );
     // 边界错误只承载端口名/后端名，永不携带连接串或口令
     expect(boundaryError.message).not.toContain('postgresql://');
     expect(boundaryError.message).not.toContain('@');

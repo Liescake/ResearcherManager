@@ -76,20 +76,31 @@ describe('describeMigrationFile：命名、头部与事务边界', () => {
   });
 
   it('reversible: 否 解析为 false，且缺失该字段直接判错', () => {
-    const irreversible = VALID_MIGRATION.replace('-- reversible: 是（DROP TABLE schema_migrations）', '-- reversible: 否（需人工恢复）');
+    const irreversible = VALID_MIGRATION.replace(
+      '-- reversible: 是（DROP TABLE schema_migrations）',
+      '-- reversible: 否（需人工恢复）',
+    );
     expect(describeMigrationFile('0002_demo.sql', irreversible).reversible).toBe(false);
 
-    const missingField = VALID_MIGRATION.replace('-- reversible: 是（DROP TABLE schema_migrations）\n', '');
-    expect(captureMigrationError(() => describeMigrationFile('0001_bootstrap.sql', missingField)).code).toBe(
-      'MIGRATION_HEADER_FIELD_MISSING',
+    const missingField = VALID_MIGRATION.replace(
+      '-- reversible: 是（DROP TABLE schema_migrations）\n',
+      '',
     );
+    expect(
+      captureMigrationError(() => describeMigrationFile('0001_bootstrap.sql', missingField)).code,
+    ).toBe('MIGRATION_HEADER_FIELD_MISSING');
   });
 
   it('文件名不符合 NNNN_snake_case.sql 时判错', () => {
-    for (const fileName of ['bootstrap.sql', '0001-Bootstrap.sql', '0001_bootstrap.SQL', '1_bootstrap.sql']) {
-      expect(captureMigrationError(() => describeMigrationFile(fileName, VALID_MIGRATION)).code).toBe(
-        'MIGRATION_FILE_NAME_INVALID',
-      );
+    for (const fileName of [
+      'bootstrap.sql',
+      '0001-Bootstrap.sql',
+      '0001_bootstrap.SQL',
+      '1_bootstrap.sql',
+    ]) {
+      expect(
+        captureMigrationError(() => describeMigrationFile(fileName, VALID_MIGRATION)).code,
+      ).toBe('MIGRATION_FILE_NAME_INVALID');
     }
   });
 
@@ -110,13 +121,15 @@ describe('describeMigrationFile：命名、头部与事务边界', () => {
 describe('assertMigrationSequence：序号唯一且递增', () => {
   it('序号重复时判错', () => {
     expect(
-      captureMigrationError(() => assertMigrationSequence([descriptor('0001'), descriptor('0001')])).code,
+      captureMigrationError(() => assertMigrationSequence([descriptor('0001'), descriptor('0001')]))
+        .code,
     ).toBe('MIGRATION_VERSION_DUPLICATE');
   });
 
   it('序号不递增时判错', () => {
     expect(
-      captureMigrationError(() => assertMigrationSequence([descriptor('0002'), descriptor('0001')])).code,
+      captureMigrationError(() => assertMigrationSequence([descriptor('0002'), descriptor('0001')]))
+        .code,
     ).toBe('MIGRATION_ORDER_INVALID');
   });
 
@@ -134,9 +147,9 @@ describe('readMigrationDirectory：与仓库真实迁移对齐', () => {
     expect(descriptors[0]?.version).toBe('0001');
     expect(descriptors[0]?.reversible).toBe(true);
     // 与 CI 静态门禁同源：文件内容必须真的可解析
-    expect(readFileSync(join(repoRoot, 'db', 'migrations', '0001_bootstrap.sql'), 'utf8')).toContain(
-      'schema_migrations',
-    );
+    expect(
+      readFileSync(join(repoRoot, 'db', 'migrations', '0001_bootstrap.sql'), 'utf8'),
+    ).toContain('schema_migrations');
   });
 });
 

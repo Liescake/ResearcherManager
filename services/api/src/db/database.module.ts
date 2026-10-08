@@ -2,10 +2,7 @@ import { Inject, Injectable, Logger, Module, type OnApplicationBootstrap } from 
 import { ModuleRef } from '@nestjs/core';
 import { APP_ENV } from '../config/config.module';
 import type { AppEnv } from '../config/env';
-import {
-  resolveDatabaseConfig,
-  type DatabaseConfigResolution,
-} from './config/database-config';
+import { resolveDatabaseConfig, type DatabaseConfigResolution } from './config/database-config';
 import { bindingTokenName, PERSISTENCE_BINDINGS } from './persistence-bindings';
 import {
   assertPersistenceBoundary,

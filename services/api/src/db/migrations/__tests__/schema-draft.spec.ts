@@ -95,13 +95,16 @@ describe('schema 草案规则：与 db/schema-drafts 的真实文件对齐', () 
       'SCHEMA_DRAFT_MISSING_IF_NOT_EXISTS',
     );
 
-    const noUuidPk = VALID_DRAFT.replace('id         uuid PRIMARY KEY,', 'id         bigserial PRIMARY KEY,');
+    const noUuidPk = VALID_DRAFT.replace(
+      'id         uuid PRIMARY KEY,',
+      'id         bigserial PRIMARY KEY,',
+    );
     expect(collectSchemaDraftViolations('0001_demo.draft.sql', noUuidPk)).toContain(
       'SCHEMA_DRAFT_MISSING_UUID_PRIMARY_KEY',
     );
 
     const noTimestamps = VALID_DRAFT.replace(
-      /  created_at timestamptz NOT NULL DEFAULT now\(\),\n  updated_at timestamptz NOT NULL DEFAULT now\(\),\n/u,
+      / {2}created_at timestamptz NOT NULL DEFAULT now\(\),\n {2}updated_at timestamptz NOT NULL DEFAULT now\(\),\n/u,
       '',
     );
     expect(collectSchemaDraftViolations('0001_demo.draft.sql', noTimestamps)).toContain(

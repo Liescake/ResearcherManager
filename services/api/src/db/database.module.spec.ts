@@ -6,7 +6,7 @@ import type { INestApplication } from '@nestjs/common';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AppModule } from '../app.module';
 import { loadEnv, type AppEnv } from '../config/env';
-import { DatabaseConfigError } from './config/database-config';
+import { DatabaseConfigError, describeDatabaseConfig } from './config/database-config';
 import {
   createAppSqlConnectionFactory,
   DATABASE_CONFIG,
@@ -18,14 +18,12 @@ import {
   NON_PERSISTENCE_PORTS,
   PERSISTENCE_BINDINGS,
 } from './persistence-bindings';
-import {
-  PersistenceBoundaryError,
-  type PersistenceCapabilities,
-} from './persistence/production-guard';
+import { PersistenceBoundaryError } from './persistence/production-guard';
 import {
   DatabaseUnavailableError,
   SQL_CONNECTION_FACTORY,
   UNVERIFIED_DRIVER_BACKEND,
+  type PersistenceCapabilities,
 } from './ports/sql-executor.port';
 
 const IN_MEMORY: PersistenceCapabilities = {
@@ -71,9 +69,7 @@ function buildService(
   capabilities: PersistenceCapabilities | undefined,
 ): PersistenceBoundaryService {
   const instances =
-    capabilities === undefined
-      ? new Map<symbol, unknown>()
-      : bindingInstances(capabilities);
+    capabilities === undefined ? new Map<symbol, unknown>() : bindingInstances(capabilities);
   const resolution = resolveAppDatabaseConfig(env);
   return new PersistenceBoundaryService(
     new FakeModuleRef(instances) as unknown as ModuleRef,
@@ -106,7 +102,7 @@ describe('数据库配置工厂：fail-closed', () => {
     expect(() => resolveAppDatabaseConfig(env)).toThrowError(DatabaseConfigError);
   });
 
-  it('生产环境配置完整时解析出共享配置，且摘要不含口令', () => {
+  it('生产环境配置完整时解析出共享配置，且对外摘要不含口令', () => {
     const env = loadEnv({
       NODE_ENV: 'production',
       DATABASE_URL: LOOPBACK_URL,
@@ -118,7 +114,16 @@ describe('数据库配置工厂：fail-closed', () => {
       status: 'configured',
       config: { poolMax: 20, applicationName: 'researcher-manager-api', ssl: 'disable' },
     });
-    expect(JSON.stringify(resolution)).not.toContain('postgres:postgres');
+    if (resolution.status !== 'configured') {
+      throw new Error('测试前置失败：配置应为 configured');
+    }
+
+    // 机密只允许存在于交给驱动的 connectionString 里
+    expect(resolution.config.connectionString).toBe(LOOPBACK_URL);
+    // 可写日志/可对外展示的投影必须已脱敏
+    const summary = JSON.stringify(describeDatabaseConfig(resolution));
+    expect(summary).not.toContain('postgres:postgres');
+    expect(summary).toContain('postgresql://***:***@127.0.0.1:5432/researcher_manager');
   });
 });
 
@@ -136,7 +141,9 @@ describe('SQL 连接工厂：默认绑定未验证驱动（不切换运行时 pr
     if (resolution.status !== 'configured') {
       throw new Error('测试前置失败：配置应为 configured');
     }
-    await expect(factory.connect(resolution.config)).rejects.toBeInstanceOf(DatabaseUnavailableError);
+    await expect(factory.connect(resolution.config)).rejects.toBeInstanceOf(
+      DatabaseUnavailableError,
+    );
   });
 });
 
@@ -149,7 +156,11 @@ describe('PersistenceBoundaryService：生产边界守卫', () => {
   });
 
   it('生产环境 + 内存基线：拒绝启动并逐端口报告违规', () => {
-    const env = loadEnv({ NODE_ENV: 'production', DATABASE_URL: LOOPBACK_URL, DATABASE_SSL: 'false' });
+    const env = loadEnv({
+      NODE_ENV: 'production',
+      DATABASE_URL: LOOPBACK_URL,
+      DATABASE_SSL: 'false',
+    });
     const service = buildService(env, IN_MEMORY);
 
     let captured: unknown;
@@ -161,9 +172,9 @@ describe('PersistenceBoundaryService：生产边界守卫', () => {
     expect(captured).toBeInstanceOf(PersistenceBoundaryError);
     const boundaryError = captured as PersistenceBoundaryError;
     expect(boundaryError.violations).toHaveLength(PERSISTENCE_BINDINGS.length);
-    expect(boundaryError.violations.every((item) => item.rule === 'IN_MEMORY_BACKEND_IN_PRODUCTION')).toBe(
-      true,
-    );
+    expect(
+      boundaryError.violations.every((item) => item.rule === 'IN_MEMORY_BACKEND_IN_PRODUCTION'),
+    ).toBe(true);
     expect(boundaryError.message).toContain('GROUP_REPOSITORY[IN_MEMORY_BACKEND_IN_PRODUCTION]');
   });
 
@@ -188,7 +199,11 @@ describe('PersistenceBoundaryService：生产边界守卫', () => {
   });
 
   it('生产环境 + 已声明持久且生产可用的后端 + 已配置数据库：放行', () => {
-    const env = loadEnv({ NODE_ENV: 'production', DATABASE_URL: LOOPBACK_URL, DATABASE_SSL: 'false' });
+    const env = loadEnv({
+      NODE_ENV: 'production',
+      DATABASE_URL: LOOPBACK_URL,
+      DATABASE_SSL: 'false',
+    });
     const service = buildService(env, VERIFIED_POSTGRES);
     expect(service.verify().ok).toBe(true);
   });
@@ -239,7 +254,9 @@ describe('完整 AppModule 装配：运行时仍是内存基线 + fail-closed �
     expect(service).toBeInstanceOf(PersistenceBoundaryService);
     const report = service?.verify();
     expect(report?.ok).toBe(true);
-    expect(report?.checkedTokens).toEqual(PERSISTENCE_BINDINGS.map((d) => bindingTokenName(d.token)));
+    expect(report?.checkedTokens).toEqual(
+      PERSISTENCE_BINDINGS.map((d) => bindingTokenName(d.token)),
+    );
   });
 
   it('DATABASE_CONFIG 未配置时是 absent，SQL_CONNECTION_FACTORY 是未验证驱动工厂', () => {

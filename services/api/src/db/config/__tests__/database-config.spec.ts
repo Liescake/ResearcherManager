@@ -39,16 +39,13 @@ describe('resolveDatabaseConfig：配置 fail-closed', () => {
   it('空串与纯空白视为未配置：开发环境 absent，生产环境拒绝', () => {
     expect(resolveDatabaseConfig({ NODE_ENV: 'test', DATABASE_URL: '   ' }).status).toBe('absent');
     expect(
-      captureConfigError(() =>
-        resolveDatabaseConfig({ NODE_ENV: 'production', DATABASE_URL: '' }),
-      ).code,
+      captureConfigError(() => resolveDatabaseConfig({ NODE_ENV: 'production', DATABASE_URL: '' }))
+        .code,
     ).toBe('DATABASE_URL_REQUIRED_IN_PRODUCTION');
   });
 
   it('非法 URL 与不支持的协议一律抛错，且错误消息不含口令', () => {
-    const invalid = captureConfigError(() =>
-      resolveDatabaseConfig({ DATABASE_URL: 'not-a-url' }),
-    );
+    const invalid = captureConfigError(() => resolveDatabaseConfig({ DATABASE_URL: 'not-a-url' }));
     expect(invalid.code).toBe('DATABASE_URL_INVALID');
 
     const unsupported = captureConfigError(() =>
@@ -79,22 +76,26 @@ describe('resolveDatabaseConfig：配置 fail-closed', () => {
 
   it('未显式配置 TLS 时：回环主机不强制 TLS，远端主机默认要求 TLS', () => {
     const loopback = resolveDatabaseConfig({ DATABASE_URL: LOOPBACK_URL });
-    expect(loopback).toMatchObject({ status: 'configured', config: { ssl: 'disable', port: 5432 } });
+    expect(loopback).toMatchObject({
+      status: 'configured',
+      config: { ssl: 'disable', port: 5432 },
+    });
 
     const remote = resolveDatabaseConfig({ DATABASE_URL: REMOTE_URL });
     expect(remote).toMatchObject({ status: 'configured', config: { ssl: 'require' } });
   });
 
   it('sslmode 查询参数生效，且宽松语义（allow/prefer）按安全优先升级', () => {
-    expect(
-      resolveDatabaseConfig({ DATABASE_URL: `${REMOTE_URL}?sslmode=disable` }),
-    ).toMatchObject({ status: 'configured', config: { ssl: 'disable' } });
+    expect(resolveDatabaseConfig({ DATABASE_URL: `${REMOTE_URL}?sslmode=disable` })).toMatchObject({
+      status: 'configured',
+      config: { ssl: 'disable' },
+    });
     expect(
       resolveDatabaseConfig({ DATABASE_URL: `${LOOPBACK_URL}?sslmode=require` }),
     ).toMatchObject({ status: 'configured', config: { ssl: 'require' } });
-    expect(
-      resolveDatabaseConfig({ DATABASE_URL: `${LOOPBACK_URL}?sslmode=prefer` }),
-    ).toMatchObject({ status: 'configured', config: { ssl: 'require' } });
+    expect(resolveDatabaseConfig({ DATABASE_URL: `${LOOPBACK_URL}?sslmode=prefer` })).toMatchObject(
+      { status: 'configured', config: { ssl: 'require' } },
+    );
   });
 
   it('sslmode 取值不在允许清单内时抛 DATABASE_SSL_MODE_UNSUPPORTED', () => {
@@ -107,10 +108,22 @@ describe('resolveDatabaseConfig：配置 fail-closed', () => {
 
   it('生产环境对非回环主机关闭 TLS 时拒绝解析', () => {
     const error = captureConfigError(() =>
-      resolveDatabaseConfig({ NODE_ENV: 'production', DATABASE_URL: REMOTE_URL, DATABASE_SSL: 'false' }),
+      resolveDatabaseConfig({
+        NODE_ENV: 'production',
+        DATABASE_URL: REMOTE_URL,
+        DATABASE_SSL: 'false',
+      }),
     );
     expect(error.code).toBe('DATABASE_SSL_DISABLED_FOR_REMOTE_HOST');
     expect(error.message).not.toContain('sup3r-s3cret');
+  });
+
+  it('生产环境未显式配置 TLS（DATABASE_SSL 缺省）时：非回环主机按安全默认要求 TLS，不抛错', () => {
+    // 「未配置」走安全默认值（require），不会被上层默认成显式 false 而静默降级；
+    // 显式关闭 TLS 的情况由上一条用例拒绝
+    expect(
+      resolveDatabaseConfig({ NODE_ENV: 'production', DATABASE_URL: REMOTE_URL }),
+    ).toMatchObject({ status: 'configured', config: { ssl: 'require' } });
   });
 
   it('生产环境允许回环地址关闭 TLS（本地/WSL 部署）', () => {
@@ -138,7 +151,10 @@ describe('resolveDatabaseConfig：配置 fail-closed', () => {
     ).toBe('DATABASE_NUMERIC_OPTION_INVALID');
     expect(
       captureConfigError(() =>
-        resolveDatabaseConfig({ DATABASE_URL: LOOPBACK_URL, DATABASE_STATEMENT_TIMEOUT_MS: '999999' }),
+        resolveDatabaseConfig({
+          DATABASE_URL: LOOPBACK_URL,
+          DATABASE_STATEMENT_TIMEOUT_MS: '999999',
+        }),
       ).code,
     ).toBe('DATABASE_NUMERIC_OPTION_INVALID');
   });
@@ -161,7 +177,10 @@ describe('resolveDatabaseConfig：配置 fail-closed', () => {
       ).code,
     ).toBe('DATABASE_APPLICATION_NAME_INVALID');
     expect(
-      resolveDatabaseConfig({ DATABASE_URL: LOOPBACK_URL, DATABASE_APPLICATION_NAME: 'rm-api-worker' }),
+      resolveDatabaseConfig({
+        DATABASE_URL: LOOPBACK_URL,
+        DATABASE_APPLICATION_NAME: 'rm-api-worker',
+      }),
     ).toMatchObject({ status: 'configured', config: { applicationName: 'rm-api-worker' } });
   });
 });
@@ -172,7 +191,11 @@ describe('describeDatabaseConfig / redactDatabaseUrl：不泄露机密', () => {
     const summary = describeDatabaseConfig(resolution);
     const serialized = JSON.stringify(summary);
 
-    expect(summary).toMatchObject({ status: 'configured', host: 'db.example.com', database: 'researcher_manager' });
+    expect(summary).toMatchObject({
+      status: 'configured',
+      host: 'db.example.com',
+      database: 'researcher_manager',
+    });
     expect(serialized).not.toContain('sup3r-s3cret');
     expect(serialized).not.toContain('rm_user');
     expect(serialized).not.toContain(REMOTE_URL);
@@ -186,7 +209,9 @@ describe('describeDatabaseConfig / redactDatabaseUrl：不泄露机密', () => {
   });
 
   it('脱敏覆盖 userinfo 与查询串里的口令参数，且对无法解析的输入安全', () => {
-    expect(redactDatabaseUrl('postgresql://a:b@host:5432/db')).toBe('postgresql://***:***@host:5432/db');
+    expect(redactDatabaseUrl('postgresql://a:b@host:5432/db')).toBe(
+      'postgresql://***:***@host:5432/db',
+    );
     expect(redactDatabaseUrl('postgresql://host/db?password=abc&sslmode=require')).toBe(
       'postgresql://host/db?password=***&sslmode=require',
     );

@@ -154,10 +154,7 @@ export function collectSchemaDraftViolations(
  *
  * @throws SchemaDraftError 草案不合规（消息里列出全部违规码）
  */
-export function describeSchemaDraftFile(
-  fileName: string,
-  content: string,
-): SchemaDraftDescriptor {
+export function describeSchemaDraftFile(fileName: string, content: string): SchemaDraftDescriptor {
   const violations = collectSchemaDraftViolations(fileName, content);
   if (violations.length > 0) {
     throw new SchemaDraftError(fileName, violations);

@@ -138,12 +138,14 @@ export const NON_PERSISTENCE_PORTS: readonly NonPersistencePortDescriptor[] = [
   {
     token: SESSION_SUBJECT_RESOLVER,
     module: 'auth',
-    reason: '会话解析器：能力声明镜像 SESSION_STORE，存储职责由 SESSION_STORE 单独承担，避免同一后端被重复计数',
+    reason:
+      '会话解析器：能力声明镜像 SESSION_STORE，存储职责由 SESSION_STORE 单独承担，避免同一后端被重复计数',
   },
   {
     token: MATCHING_FEATURE_SOURCE,
     module: 'matching',
-    reason: '派生特征源：能力声明为 connectedToDomainData（而非 persistent），只读其他存储，不承担存储职责',
+    reason:
+      '派生特征源：能力声明为 connectedToDomainData（而非 persistent），只读其他存储，不承担存储职责',
   },
   {
     token: MATCHING_AI_PROVIDER,
