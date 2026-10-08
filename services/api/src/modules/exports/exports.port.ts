@@ -124,7 +124,89 @@ export interface ExportRepository {
   listByOwnerId(ownerUserId: string): readonly ExportRequest[];
 }
 
-/** DI 令牌：导出请求仓储（真实实现应委托 `export_requests` 表） */
+/**
+ * PostgreSQL 后端标识（能力声明 `backend` 的规范取值）。
+ *
+ * 数据库 adapter、持久化边界守卫与运维摘要共用同一字面量，避免同一后端出现
+ * `postgres` / `postgres-draft` / `postgresql` 多个拼写而无法机器比对。
+ */
+export const EXPORT_REPOSITORY_BACKEND_POSTGRES = 'postgres';
+
+/**
+ * **存储 ID 域约束**：`export_jobs.id / requester_id / artifact_id` 在存储侧是 `uuid`
+ * （docs/P2-架构与数据设计.md §4「主键 UUID」、docs/P1-字段级数据字典.md §4）。
+ *
+ * 读取契约把 `ownerUserId` 写成 `requesterIdSchema`（非空、无空白与控制字符、长度 1–64），
+ * 会话基线的主体形如 `u-student-1` 也落在该形态内；而存储域**更严**：必须是
+ * 「合法、非空、规范小写形」的 UUID。两者不矛盾（UUID 形必然落在 1–64 长度内），
+ * 但把 `EXPORT_REPOSITORY` 换绑到数据库实现的那一片切片必须把会话主体收敛为 UUID，
+ * 否则 adapter 按本约束 **fail-closed 拒绝**，而不是退化成「放弃类型约束的字符串比较」。
+ */
+export const EXPORT_REPOSITORY_STORAGE_ID_DOMAIN = 'uuid';
+
+/**
+ * **异步仓储契约**（数据库形状的导出请求仓储端口，与 `ExportRepository` 同语义）。
+ *
+ * 为什么与同步端口并存、而不是把它直接改成异步：同步端口是当前运行时绑定（内存基线，同步返回）。
+ * 把它改成 Promise 是**跨模块契约变更**（service / controller 与既有 spec 必须一起改），
+ * 只能与「引入经评估的驱动 + 对真实 PostgreSQL 的集成验证」在同一片切片完成。在那之前，
+ * 数据库 adapter 按本契约实现并单独验证，运行时绑定一动不动，因此「切换到数据库」与
+ * 「回退到内存基线」都仍是可整步执行 / 整步回退的操作。
+ *
+ * 方法集与同步端口**逐字对应**（`create` / `save` / `listByOwnerId`），签名也逐字对应——
+ * 这里没有 `findById` 那种「单条读取」，因此不存在需要额外补主体参数的入口；三者都从入参
+ * 取**服务端**主体，数据库实现把归属**下推进 SQL**（`WHERE requester_id = $1`）。
+ *
+ * 实现者（当前只有 `exports.postgres-repository.ts`）必须满足与内存基线**完全相同**的语义
+ * （含「同 ID 重复创建视为服务端缺陷、不得静默覆盖」与「写回未知 id / 改写归属必须报错」），
+ * 并额外守住六条边界：
+ * 1. **状态机唯一入口与唯一出口**：`create` 只接受入口状态 `pending`（服务端常量
+ *    `EXPORT_ENTRY_STATUS`）；`save` 只接受 `pending -> completed | failed` 的合法转移，
+ *    非法转移**不产生任何写入**并按客户端可见冲突报错（切换到数据库的那一片切片必须把它映射为
+ *    409 `STATE_TRANSITION_INVALID`）。终态不可再转移，重复处理同一请求绝不静默改写历史结论；
+ * 2. **归属只来自服务端**：`ownerUserId` 由 service 从服务端会话主体写入，adapter 不生成、
+ *    不覆盖归属，并逐条复核「返回记录的归属 === 请求主体 / 请求记录的归属」，不一致即判服务端缺陷；
+ * 3. **存储 ID 域**：主体与记录内的 `id` / `artifactId` 必须落在
+ *    `EXPORT_REPOSITORY_STORAGE_ID_DOMAIN`（规范小写形 UUID）内，否则 fail-closed；
+ * 4. **按服务端主体隔离**：`listByOwnerId` 必须把归属下推进 SQL，让「他人导出请求」根本不出库，
+ *    并在返回行上**逐条**复核归属（纵深防御：仓储的过滤行为不作为安全边界）；
+ *    写回路径同样以 `id + 归属` 双重限定，拿他人的作业 ID 也写不中他人数据；
+ * 5. **每条返回记录都必须能被读取契约校验**：未知列、未知资源 / 状态枚举、非法时间戳、
+ *    非 UUID 标识、字段白名单之外的字段一律按服务端缺陷抛错；结果集出现多行 / 重复主键同样
+ *    fail-closed；
+ * 6. **归属、产物句柄、文件位置与存储侧内部列绝不进入错误消息、日志与公开视图**：
+ *    `ownerUserId`、`artifactId` 以及文件名 / 路径 / 下载地址 / 存储 key / 内部资源内容 /
+ *    原始错误文本既不出现在 adapter 的公开投影里，也不进入错误信息；公开视图由
+ *    `exports.contract.ts` 的 `toExportRequestView` 逐字段裁剪（恰好 `EXPORT_REQUEST_VIEW_FIELDS`）。
+ */
+export interface AsyncExportRepository {
+  readonly capabilities: ExportRepositoryCapabilities;
+  /**
+   * 写入一条已由调用方补齐归属、入口状态、字段与时间戳的记录（入口恒为 `pending`）。
+   * 同 ID 冲突必须显式抛错，不得静默覆盖。
+   */
+  create(request: ExportRequest): Promise<ExportRequest>;
+  /**
+   * 按 id 覆盖写入（状态机推进用），`WHERE` 同时钉住 `id` 与归属。
+   * id 不存在、归属不符或非法状态转移都必须报错且**不产生任何写入**；
+   * 不得退化成插入，也不得静默换主。
+   */
+  save(request: ExportRequest): Promise<ExportRequest>;
+  /**
+   * 只返回该服务端主体名下的记录，按创建顺序。
+   * 调用方必须是已授权访问该主体资源的服务端代码；归属必须下推进 SQL（他人记录不出库）。
+   */
+  listByOwnerId(ownerUserId: string): Promise<readonly ExportRequest[]>;
+}
+
+/**
+ * DI 令牌：导出请求仓储（真实实现应委托 `export_jobs` 表）。
+ *
+ * 表名以 docs/P2-ER图.md §「关系与最小字段」（`export_jobs(id, requester_id, resource,
+ * filters, fields, status, expires_at, downloaded_at)`）、docs/P1-字段级数据字典.md §4 与
+ * `db/migrations/0001_bootstrap.sql` 的业务表占位清单为准；本文件早先注释里的
+ * `export_requests` 属未定稿的旧名，命名对齐已登记在数据库 adapter 的验证清单里。
+ */
 export const EXPORT_REPOSITORY = Symbol('EXPORT_REPOSITORY');
 
 /**

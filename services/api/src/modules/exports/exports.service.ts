@@ -102,8 +102,8 @@ export class ExportsService {
    *
    * 判定顺序（被测试固定）：无有效会话 → 401（认证边界，见 controller）；入口授权拒绝 → 403；
    * 查询串带参数 / 请求体带服务端字段或未声明字段 → 400；资源不在白名单 → 400；
-   * 资源级授权拒绝 → 403；字段不在该资源白名单内 → 400；仓储失败 → 500；
-   * 产物生成失败 → 200/201 + `failed` 终态；仓储返回非 `pending` → 409。
+   * 资源级授权拒绝 → 403；字段不在该资源白名单内 → 400；入口写回被替换 → 500；仓储失败 → 500；
+   * 产物生成失败 → 201 + `failed` 终态；仓储返回非 `pending` → 409。
    * 未授权请求在两个端口上都没有调用记录。
    */
   createMyExportRequest(
@@ -132,8 +132,9 @@ export class ExportsService {
     const now = new Date().toISOString();
 
     // 7. 入口记录：状态恒为 pending、无产物句柄；此时不得声称导出已生成
+    const exportRequestId = randomUUID();
     const created = this.repository.create({
-      id: randomUUID(),
+      id: exportRequestId,
       ownerUserId: subject.userId,
       resource: input.resource,
       fields,
@@ -142,10 +143,20 @@ export class ExportsService {
       updatedAt: now,
     });
 
-    // 8. 状态机门禁**先于任何产物副作用**：本切片在同一个请求内把 `pending` 推进到终态，
-    //    因此「推进目标」是服务端常量 `completed`；仓储若返回非 `pending` 记录
-    //    （重复处理 / 数据被改写）→ 409 `STATE_TRANSITION_INVALID`，且此时不会生成任何产物。
-    //    产物生成失败时结论改判 `failed`（`pending -> failed` 同样由状态机表允许）。
+    // 8. 入口写回复核（**先于任何产物副作用**）：仓储返回的记录必须与本次写入同一身份与范围。
+    //    被替换的记录（他人归属/别的资源/别的字段）说明存储或调用链已损坏：立即 500，
+    //    绝不为他人或别的导出范围产出服务端产物。
+    this.assertRecordedEntry(created, {
+      id: exportRequestId,
+      ownerUserId: subject.userId,
+      resource: input.resource,
+      fields,
+    });
+
+    // 9. 状态机门禁：本切片在同一个请求内把 `pending` 推进到终态，因此「推进目标」是服务端常量
+    //    `completed`；仓储若返回非 `pending` 记录（重复处理 / 数据被改写）→ 409
+    //    `STATE_TRANSITION_INVALID`。产物生成失败时结论改判 `failed`
+    //    （`pending -> failed` 同样由状态机表允许）。
     assertExportTransition(created.status, ExportStatus.Completed);
 
     const outcome = this.materialize(created);
@@ -157,7 +168,7 @@ export class ExportsService {
       updatedAt: new Date().toISOString(),
     });
 
-    // 9. 写回复核：仓储必须如实持久化本次结论（状态与产物句柄）
+    // 10. 写回复核：仓储必须如实持久化本次结论（状态与产物句柄）
     this.assertRecordedOutcome(saved, outcome);
 
     return this.toOwnedView(saved, subject.userId);
@@ -226,6 +237,30 @@ export class ExportsService {
   }
 
   /**
+   * 入口写回复核：仓储返回的入口记录必须与本次写入**同一身份、同一导出范围**
+   * （主键、归属、资源与字段都不得被替换）。
+   *
+   * 不一致说明仓储或调用链已损坏：立即 500（共用完整性文案，不记录取值），
+   * 且此时**不会生成任何产物**——否则可能为他人或别的导出范围产出服务端产物。
+   * 状态**不在**这里判定：`pending -> 终态` 的推进由状态机负责（非 `pending` 记录 → 409）。
+   */
+  private assertRecordedEntry(created: ExportRequest, expected: ExportEntryExpectation): void {
+    const sameFields =
+      created.fields.length === expected.fields.length &&
+      created.fields.every((field, index) => field === expected.fields[index]);
+
+    if (
+      created.id !== expected.id ||
+      created.ownerUserId !== expected.ownerUserId ||
+      created.resource !== expected.resource ||
+      !sameFields
+    ) {
+      this.logger.error('[exports] 仓储返回的入口记录与写入不一致（主键/归属/资源/字段被替换）');
+      throw new InternalServerErrorException(EXPORT_REQUEST_INTEGRITY_MESSAGE);
+    }
+  }
+
+  /**
    * 写回复核：仓储返回的记录必须与本次结论一致。
    * 状态未推进或产物句柄未被持久化都属服务端缺陷（500，共用同一文案），
    * 调用方因此无法据此区分「仓储坏了」与「数据被改写」。
@@ -280,6 +315,14 @@ export class ExportsService {
 interface ExportMaterializationOutcome {
   readonly status: ExportStatus;
   readonly artifactId?: string;
+}
+
+/** 入口写入的服务端期望值：用于复核仓储是否如实保存了本次入口记录 */
+interface ExportEntryExpectation {
+  readonly id: string;
+  readonly ownerUserId: string;
+  readonly resource: ExportResource;
+  readonly fields: readonly string[];
 }
 
 /**

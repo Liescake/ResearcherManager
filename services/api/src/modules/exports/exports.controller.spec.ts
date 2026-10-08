@@ -1495,11 +1495,29 @@ describe('导出切片：状态机（pending → completed / failed）', () => {
     expect(() =>
       assertExportTransition(ExportStatus.Pending, ExportStatus.Completed),
     ).not.toThrow();
-    try {
-      assertExportTransition(ExportStatus.Completed, ExportStatus.Completed);
-      throw new Error('状态机未拦截非法转移');
-    } catch (error) {
-      expect((error as { code?: string }).code).toBe('STATE_TRANSITION_INVALID');
+
+    // 非法转移（入口自环、终态回退、终态互转、终态自环）必须真正被拦截为
+    // STATE_TRANSITION_INVALID，而不是静默通过（门禁非恒真）
+    const illegalTransitions: ReadonlyArray<readonly [ExportStatus, ExportStatus]> = [
+      [ExportStatus.Pending, ExportStatus.Pending],
+      [ExportStatus.Completed, ExportStatus.Pending],
+      [ExportStatus.Completed, ExportStatus.Failed],
+      [ExportStatus.Completed, ExportStatus.Completed],
+      [ExportStatus.Failed, ExportStatus.Pending],
+      [ExportStatus.Failed, ExportStatus.Completed],
+      [ExportStatus.Failed, ExportStatus.Failed],
+    ];
+    for (const [from, to] of illegalTransitions) {
+      expect(canTransitionExport(from, to), `${from} -> ${to}`).toBe(false);
+      let caught: unknown;
+      try {
+        assertExportTransition(from, to);
+      } catch (error) {
+        caught = error;
+      }
+      expect((caught as { code?: string } | undefined)?.code, `${from} -> ${to}`).toBe(
+        'STATE_TRANSITION_INVALID',
+      );
     }
   });
 });
@@ -1700,6 +1718,48 @@ describe('导出切片：PII 与 fail-closed 500', () => {
 });
 
 describe('导出切片：存储异常（仓储端口抛错 → 500，不泄露内部细节）', () => {
+  it('入口写回被替换（他人归属/别的资源/别的字段/别的主键）→ 500，且不生成任何产物', async () => {
+    vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+
+    const replacements: ReadonlyArray<Partial<ExportRequest>> = [
+      { ownerUserId: STUDENT_2 },
+      {
+        resource: ExportResource.Achievement,
+        fields: [...EXPORTABLE_FIELDS[ExportResource.Achievement]],
+      },
+      { fields: ['title'] },
+      { id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' },
+    ];
+
+    for (const replacement of replacements) {
+      const app = await startExportsApp({ seed: false });
+      const store = vi.spyOn(app.artifacts, 'store');
+      const save = vi.spyOn(app.repository, 'save');
+      vi.spyOn(app.repository, 'create').mockImplementation((record) => ({
+        ...record,
+        ...replacement,
+        fields: replacement.fields ? [...replacement.fields] : [...record.fields],
+      }));
+
+      const res = await call(app.baseUrl, 'POST', '/me/exports', {
+        headers: bearer(SESSION_STUDENT_1),
+        body: { resource: ExportResource.Profile },
+      });
+
+      expect(res.status).toBe(500);
+      expect(res.body.data).toBeNull();
+      expect(res.body.error?.code).toBe('INTERNAL_ERROR');
+      expect(res.body.error?.message).toBe(INTERNAL_ERROR_MESSAGE);
+      // 身份/范围被替换时不得为他人或别的导出范围产出服务端产物
+      expect(store).not.toHaveBeenCalled();
+      expect(save).not.toHaveBeenCalled();
+      const content = contentText(res);
+      for (const leaked of [STUDENT_2, STUDENT_1, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa']) {
+        expect(content).not.toContain(leaked);
+      }
+    }
+  });
+
   it('create 抛异常（含敏感原文）→ 500，响应不含错误名/堆栈/原文，且不生成产物', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const app = await startExportsApp({ seed: false });
