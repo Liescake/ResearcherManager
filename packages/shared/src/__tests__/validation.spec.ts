@@ -25,6 +25,11 @@ import { paginationSchema } from '../validation/query';
 import { applicationReviewInputSchema } from '../validation/application';
 import { educationRecordInputSchema } from '../validation/education-record';
 import {
+  matchingRecommendationItemSchema,
+  matchingRecommendationListSchema,
+  matchingRequestInputSchema,
+} from '../validation/matching';
+import {
   adminProfileCorrectionSchema,
   studentProfileInputSchema,
   studentProfileUpdateSchema,
@@ -181,8 +186,84 @@ describe('审核与升学校验', () => {
   });
 });
 
-describe('响应信封', () => {
-  it('成功与失败信封结构稳定', () => {
+describe('匹配请求与推荐契约', () => {
+  it('输入只接收可选的画像版本，且不接受非整数/越界值', () => {
+    expect(matchingRequestInputSchema.parse({})).toEqual({});
+    expect(matchingRequestInputSchema.parse({ profileVersion: 3 })).toEqual({ profileVersion: 3 });
+    for (const invalid of [0, -1, 1.5, 1_000_001]) {
+      expect(matchingRequestInputSchema.safeParse({ profileVersion: invalid }).success).toBe(false);
+    }
+    expect(matchingRequestInputSchema.safeParse({ profileVersion: '3' }).success).toBe(false);
+  });
+
+  it('归属/权限/范围字段不在输入 schema 内，会被 zod 静默剥离（必须由 API 层闭集门禁拒绝）', () => {
+    const parsed = matchingRequestInputSchema.parse({
+      profileVersion: 1,
+      userId: 'u-victim-1',
+      roles: ['super_admin'],
+      scope: 'GLOBAL',
+      groupId: '11111111-1111-4111-8111-111111111111',
+    });
+    expect(parsed).toEqual({ profileVersion: 1 });
+    expect(Object.keys(parsed).sort()).toEqual(['profileVersion']);
+  });
+
+  it('推荐条目：UUID 小组、0—100 整数分、非空限长理由与建议', () => {
+    const valid = {
+      groupId: '11111111-1111-4111-8111-111111111111',
+      score: 82,
+      reason: '你的机器学习兴趣与该组方向一致',
+      advice: '建议补充相关技能并联系小组负责人',
+    };
+    expect(matchingRecommendationItemSchema.safeParse(valid).success).toBe(true);
+    expect(matchingRecommendationItemSchema.safeParse({ ...valid, groupId: 'g-1' }).success).toBe(
+      false,
+    );
+    expect(matchingRecommendationItemSchema.safeParse({ ...valid, score: 101 }).success).toBe(
+      false,
+    );
+    expect(matchingRecommendationItemSchema.safeParse({ ...valid, score: 82.5 }).success).toBe(
+      false,
+    );
+    expect(matchingRecommendationItemSchema.safeParse({ ...valid, reason: '' }).success).toBe(false);
+  });
+
+  it('推荐文本不得携带身份证号/长数字标识/密钥等敏感内容', () => {
+    const base = {
+      groupId: '11111111-1111-4111-8111-111111111111',
+      score: 60,
+      advice: '建议联系负责人',
+    };
+    expect(
+      matchingRecommendationItemSchema.safeParse({
+        ...base,
+        reason: '身份证 11010119900307617X 可直接报名',
+      }).success,
+    ).toBe(false);
+    expect(
+      matchingRecommendationItemSchema.safeParse({
+        ...base,
+        reason: '参考 api_key: sk-abcdefghijklmn 提交',
+      }).success,
+    ).toBe(false);
+  });
+
+  it('推荐列表上限 3 条，且允许空列表（no_candidate / failed 终态）', () => {
+    const item = {
+      groupId: '11111111-1111-4111-8111-111111111111',
+      score: 50,
+      reason: '方向一致',
+      advice: '建议先沟通',
+    };
+    expect(matchingRecommendationListSchema.safeParse([]).success).toBe(true);
+    expect(matchingRecommendationListSchema.safeParse([item, item, item]).success).toBe(true);
+    expect(matchingRecommendationListSchema.safeParse([item, item, item, item]).success).toBe(
+      false,
+    );
+  });
+});
+
+describe('响应信封', () => {  it('成功与失败信封结构稳定', () => {
     const success = ok({ id: 'x' }, { requestId: 'req-1' });
     expect(success.error).toBeNull();
     expect(success.data).toEqual({ id: 'x' });

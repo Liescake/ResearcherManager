@@ -55,6 +55,28 @@ export const REVIEW_STATUS_VALUES = [
 ] as const;
 export const isReviewStatus = createValueGuard(REVIEW_STATUS_VALUES);
 
+/**
+ * 匹配请求状态（ai_match_records.status）。
+ * `completed` 只表示「已产出可用推荐」，AI 与规则降级共用该终态，
+ * 是否降级由 `fallbackUsed` 表达；`no_candidate` 是「没有可推荐的小组」这一业务事实，
+ * 与 `failed`（处理失败，无可展示结果）严格区分。
+ */
+export const MatchingRequestStatus = {
+  Pending: 'pending',
+  Completed: 'completed',
+  NoCandidate: 'no_candidate',
+  Failed: 'failed',
+} as const;
+export type MatchingRequestStatus =
+  (typeof MatchingRequestStatus)[keyof typeof MatchingRequestStatus];
+export const MATCHING_REQUEST_STATUS_VALUES = [
+  MatchingRequestStatus.Pending,
+  MatchingRequestStatus.Completed,
+  MatchingRequestStatus.NoCandidate,
+  MatchingRequestStatus.Failed,
+] as const;
+export const isMatchingRequestStatus = createValueGuard(MATCHING_REQUEST_STATUS_VALUES);
+
 /** 小组状态（research_groups.status） */
 export const GroupStatus = {
   Open: 'open',

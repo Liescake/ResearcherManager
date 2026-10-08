@@ -5,3 +5,4 @@ export * from './group';
 export * from './application';
 export * from './achievement';
 export * from './education-record';
+export * from './matching';

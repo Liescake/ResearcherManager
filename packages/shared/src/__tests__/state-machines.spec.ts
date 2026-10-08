@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { ApplicationStatus, MembershipStatus } from '../enums/status';
+import {
+  ApplicationStatus,
+  MATCHING_REQUEST_STATUS_VALUES,
+  MatchingRequestStatus,
+  MembershipStatus,
+} from '../enums/status';
 import { StateTransitionError } from '../errors';
 import {
   APPLICATION_TERMINAL_STATUSES,
@@ -9,6 +14,15 @@ import {
   isApplicationReviewable,
   isApplicationTerminal,
 } from '../states/application-state-machine';
+import {
+  MATCHING_REQUEST_ENTRY_STATUS,
+  MATCHING_REQUEST_TERMINAL_STATUSES,
+  assertMatchingRequestTransition,
+  canTransitionMatchingRequest,
+  isMatchingRequestProcessable,
+  isMatchingRequestTerminal,
+  nextMatchingRequestStatuses,
+} from '../states/matching-state-machine';
 import {
   assertMembershipActiveForLeave,
   canCreateMembership,
@@ -80,5 +94,61 @@ describe('成员关系状态机', () => {
     expect(canCreateMembership([])).toBe(true);
     expect(canCreateMembership([MembershipStatus.Ended])).toBe(true);
     expect(canCreateMembership([MembershipStatus.Ended, MembershipStatus.Active])).toBe(false);
+  });
+});
+
+describe('匹配请求状态机', () => {
+  it('入口状态是 pending，且只允许推进到三个终态', () => {
+    expect(MATCHING_REQUEST_ENTRY_STATUS).toBe(MatchingRequestStatus.Pending);
+    expect([...nextMatchingRequestStatuses(MatchingRequestStatus.Pending)].sort()).toEqual(
+      [
+        MatchingRequestStatus.Completed,
+        MatchingRequestStatus.Failed,
+        MatchingRequestStatus.NoCandidate,
+      ].sort(),
+    );
+  });
+
+  it('终态不可再转移（结果一旦落库就不再被覆盖）', () => {
+    for (const terminal of MATCHING_REQUEST_TERMINAL_STATUSES) {
+      expect(isMatchingRequestTerminal(terminal)).toBe(true);
+      expect(isMatchingRequestProcessable(terminal)).toBe(false);
+      expect(nextMatchingRequestStatuses(terminal)).toEqual([]);
+      for (const target of MATCHING_REQUEST_STATUS_VALUES) {
+        expect(canTransitionMatchingRequest(terminal, target)).toBe(false);
+      }
+    }
+    // 只有 pending 可处理，也只有它能转入终态
+    expect(isMatchingRequestProcessable(MatchingRequestStatus.Pending)).toBe(true);
+    expect(canTransitionMatchingRequest(MatchingRequestStatus.Pending, MatchingRequestStatus.Pending))
+      .toBe(false);
+  });
+
+  it('非法转移抛出 STATE_TRANSITION_INVALID', () => {
+    expect(() =>
+      assertMatchingRequestTransition(
+        MatchingRequestStatus.Completed,
+        MatchingRequestStatus.Completed,
+      ),
+    ).toThrowError(StateTransitionError);
+    try {
+      assertMatchingRequestTransition(
+        MatchingRequestStatus.Completed,
+        MatchingRequestStatus.Completed,
+      );
+    } catch (error) {
+      expect((error as StateTransitionError).code).toBe('STATE_TRANSITION_INVALID');
+    }
+    expect(() =>
+      assertMatchingRequestTransition(
+        MatchingRequestStatus.Pending,
+        MatchingRequestStatus.Completed,
+      ),
+    ).not.toThrow();
+  });
+
+  it('三个终态互不包含：completed / no_candidate / failed 语义不重叠', () => {
+    expect(new Set(MATCHING_REQUEST_TERMINAL_STATUSES).size).toBe(3);
+    expect(MATCHING_REQUEST_STATUS_VALUES).toHaveLength(4);
   });
 });
