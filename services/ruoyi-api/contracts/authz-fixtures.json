@@ -1,0 +1,713 @@
+{
+  "contract": "researcher-manager.authz-fixtures",
+  "contractVersion": "0.1.0",
+  "module": "services/ruoyi-api",
+  "slice": "authz",
+  "status": "POC 契约夹具；语言无关，不包含 RuoYi 源码或 Maven 依赖",
+  "binding": {
+    "referenceImplementation": "packages/shared/src/enums/authorization.ts",
+    "baselineConsumer": "services/api/src/modules/access-control/authorization-policy.ts",
+    "authorizeEntrypoint": "isAuthorized(subject, request) -> boolean",
+    "grantEntrypoint": "canGrantPermissions(actor, grants) -> boolean",
+    "policy": "默认拒绝：未登记权限、角色范围不匹配、缺少服务端解析的归属信息一律拒绝；客户端提交的 scope/groupId/role/资源归属永不作为判定输入",
+    "serverResolvedFields": [
+      "subject.userId",
+      "subject.roles",
+      "subject.groupIds",
+      "subject.assignedResourceIds",
+      "request.resourceUserId",
+      "request.groupId"
+    ],
+    "ruoyiMapping": "RuoYi 菜单/按钮/角色 RBAC 只能作为粗粒度入口；上述谓词必须由业务服务独立执行，RuoYi 数据权限必须映射到 SELF/GROUP/ASSIGNED/SYSTEM/GLOBAL 并由本夹具回归证明"
+  },
+  "evaluation": {
+    "authorize": "以 subject 与 request 调用 isAuthorized，返回值必须等于 expect.allowed",
+    "grant": "以 actor 与 grants 调用 canGrantPermissions，返回值必须等于 expect.allowed",
+    "clientClaims": "仅供评审阅读，执行器必须忽略；携带 clientClaims 的夹具必须与移除该字段后得到相同结论",
+    "deniedBy": "失败原因分类标签，便于定位，不参与断言",
+    "additionalAllowedKeys": ["clientClaims", "tags", "rationale", "title"]
+  },
+  "enums": {
+    "roles": ["student", "group_leader", "admin", "system_admin", "super_admin"],
+    "dataScopes": ["SELF", "GROUP", "ASSIGNED", "GLOBAL", "SYSTEM"],
+    "roleDefaultScope": {
+      "student": "SELF",
+      "group_leader": "GROUP",
+      "admin": "ASSIGNED",
+      "system_admin": "SYSTEM",
+      "super_admin": "GLOBAL"
+    },
+    "permissions": [
+      "profile:self:read",
+      "profile:self:update",
+      "profile:admin:read",
+      "profile:admin:correct",
+      "group:read:open",
+      "group:manage",
+      "membership:self:create",
+      "membership:self:withdraw",
+      "membership:review:group",
+      "membership:review:global",
+      "achievement:self:create",
+      "achievement:self:update",
+      "achievement:self:read",
+      "achievement:review",
+      "education:self:create",
+      "education:self:update",
+      "education:self:read",
+      "education:review",
+      "matching:self:request",
+      "matching:records:read",
+      "statistics:flow:read",
+      "statistics:achievement:read",
+      "statistics:education:read",
+      "export:profile:create",
+      "export:profile:download",
+      "export:achievement:create",
+      "export:achievement:download",
+      "export:education:create",
+      "export:education:download",
+      "export:statistics:create",
+      "export:statistics:download",
+      "announcement:manage",
+      "user:manage",
+      "role:assign",
+      "permission:configure",
+      "audit:read"
+    ],
+    "grantRestrictedPermissions": ["role:assign", "permission:configure"]
+  },
+  "fixtures": [
+    {
+      "id": "authorize-self-profile-read-owner",
+      "kind": "authorize",
+      "title": "学生读取本人画像",
+      "tags": ["self", "positive"],
+      "subject": {
+        "userId": "u-student-1",
+        "roles": ["student"],
+        "groupIds": [],
+        "assignedResourceIds": []
+      },
+      "request": {
+        "permission": "profile:self:read",
+        "scope": "SELF",
+        "resourceUserId": "u-student-1"
+      },
+      "expect": { "allowed": true },
+      "rationale": "服务端解析的 resourceUserId 等于当前主体，student 默认持有 profile:self:read 且默认范围为 SELF"
+    },
+    {
+      "id": "authorize-self-profile-read-other-user",
+      "kind": "authorize",
+      "title": "学生读取他人 SELF 资源（越权）",
+      "tags": ["self", "negative", "cross-user"],
+      "subject": { "userId": "u-student-1", "roles": ["student"] },
+      "request": {
+        "permission": "profile:self:read",
+        "scope": "SELF",
+        "resourceUserId": "u-student-2"
+      },
+      "expect": { "allowed": false, "deniedBy": "scope-self-not-owner" },
+      "rationale": "SELF 范围内资源主体必须等于当前主体"
+    },
+    {
+      "id": "authorize-self-profile-read-missing-resource-user",
+      "kind": "authorize",
+      "title": "服务端未解析出资源归属",
+      "tags": ["self", "negative", "fail-closed"],
+      "subject": { "userId": "u-student-1", "roles": ["student"] },
+      "request": { "permission": "profile:self:read", "scope": "SELF" },
+      "expect": { "allowed": false, "deniedBy": "scope-self-not-owner" },
+      "rationale": "缺少服务端解析的资源归属时默认拒绝，而不是按客户端声明放行"
+    },
+    {
+      "id": "authorize-self-achievement-update-owner",
+      "kind": "authorize",
+      "title": "学生更新本人成果",
+      "tags": ["self", "positive"],
+      "subject": { "userId": "u-student-1", "roles": ["student"] },
+      "request": {
+        "permission": "achievement:self:update",
+        "scope": "SELF",
+        "resourceUserId": "u-student-1"
+      },
+      "expect": { "allowed": true },
+      "rationale": "student 持有 achievement:self:update，范围为 SELF"
+    },
+    {
+      "id": "authorize-self-audit-read-denied",
+      "kind": "authorize",
+      "title": "学生申请审计读取权限",
+      "tags": ["self", "negative", "permission-not-in-role"],
+      "subject": { "userId": "u-student-1", "roles": ["student"] },
+      "request": { "permission": "audit:read", "scope": "SELF" },
+      "expect": { "allowed": false, "deniedBy": "permission-not-in-role" },
+      "rationale": "原子权限必须精确匹配角色目录；audit:read 不在 student 默认权限内"
+    },
+    {
+      "id": "authorize-self-group-manage-denied",
+      "kind": "authorize",
+      "title": "学生调用 group:manage",
+      "tags": ["self", "negative", "permission-not-in-role"],
+      "subject": { "userId": "u-student-1", "roles": ["student"] },
+      "request": { "permission": "group:manage", "scope": "SELF" },
+      "expect": { "allowed": false, "deniedBy": "permission-not-in-role" },
+      "rationale": "学生只能 group:read:open，不能管理小组"
+    },
+    {
+      "id": "authorize-group-review-owned-group",
+      "kind": "authorize",
+      "title": "负责人审核本组申请",
+      "tags": ["group", "positive"],
+      "subject": { "userId": "u-leader-1", "roles": ["group_leader"], "groupIds": ["g-1"] },
+      "request": { "permission": "membership:review:group", "scope": "GROUP", "groupId": "g-1" },
+      "expect": { "allowed": true },
+      "rationale": "groupId 属于服务端已解析的负责人小组集合"
+    },
+    {
+      "id": "authorize-group-review-other-group",
+      "kind": "authorize",
+      "title": "负责人审核非所属小组（越权）",
+      "tags": ["group", "negative", "cross-group"],
+      "subject": { "userId": "u-leader-1", "roles": ["group_leader"], "groupIds": ["g-1"] },
+      "request": { "permission": "membership:review:group", "scope": "GROUP", "groupId": "g-2" },
+      "expect": { "allowed": false, "deniedBy": "groupId-not-owned" },
+      "rationale": "GROUP 范围必须落在服务端解析的 groupIds 内"
+    },
+    {
+      "id": "authorize-group-review-without-group-id",
+      "kind": "authorize",
+      "title": "GROUP 判定缺少 groupId",
+      "tags": ["group", "negative", "fail-closed"],
+      "subject": { "userId": "u-leader-1", "roles": ["group_leader"], "groupIds": ["g-1"] },
+      "request": { "permission": "membership:review:group", "scope": "GROUP" },
+      "expect": { "allowed": false, "deniedBy": "missing-group-id" },
+      "rationale": "无 groupId 时默认拒绝，不能退化为「本人所有小组」或全局放行"
+    },
+    {
+      "id": "authorize-group-review-forged-group-id",
+      "kind": "authorize",
+      "title": "客户端伪造 groupId 与 role",
+      "tags": ["group", "negative", "forged-client-claim"],
+      "subject": { "userId": "u-student-1", "roles": ["student"], "groupIds": [] },
+      "request": { "permission": "membership:review:group", "scope": "GROUP", "groupId": "g-1" },
+      "clientClaims": { "role": "group_leader", "scope": "GROUP", "groupId": "g-1" },
+      "expect": { "allowed": false, "deniedBy": "scope-role-mismatch" },
+      "rationale": "客户端声明的角色与范围不参与判定；服务端解析结果为 student 且无组关系"
+    },
+    {
+      "id": "authorize-group-statistics-flow-owned-group",
+      "kind": "authorize",
+      "title": "负责人读取本组人员流动统计",
+      "tags": ["group", "positive"],
+      "subject": { "userId": "u-leader-1", "roles": ["group_leader"], "groupIds": ["g-1"] },
+      "request": { "permission": "statistics:flow:read", "scope": "GROUP", "groupId": "g-1" },
+      "expect": { "allowed": true },
+      "rationale": "group_leader 持有 statistics:flow:read，范围为本组"
+    },
+    {
+      "id": "authorize-group-statistics-global-scope-denied",
+      "kind": "authorize",
+      "title": "负责人以 GLOBAL 范围读取统计（越权）",
+      "tags": ["group", "negative", "scope-escalation"],
+      "subject": { "userId": "u-leader-1", "roles": ["group_leader"], "groupIds": ["g-1"] },
+      "request": { "permission": "statistics:flow:read", "scope": "GLOBAL" },
+      "expect": { "allowed": false, "deniedBy": "scope-role-mismatch" },
+      "rationale": "角色的默认范围不可被请求声明的 scope 提升"
+    },
+    {
+      "id": "authorize-group-self-profile-read-leader-role-only",
+      "kind": "authorize",
+      "title": "仅持 group_leader 角色以 SELF 范围读取本人画像",
+      "tags": ["group", "negative", "scope-role-mismatch"],
+      "subject": { "userId": "u-leader-1", "roles": ["group_leader"], "groupIds": ["g-1"] },
+      "request": {
+        "permission": "profile:self:read",
+        "scope": "SELF",
+        "resourceUserId": "u-leader-1"
+      },
+      "expect": { "allowed": false, "deniedBy": "scope-role-mismatch" },
+      "rationale": "group_leader 默认范围为 GROUP；本人 SELF 读取需要主体同时持有 student 角色（见下一条夹具）"
+    },
+    {
+      "id": "authorize-self-profile-read-leader-with-student-role",
+      "kind": "authorize",
+      "title": "负责人同时持有 student 角色后读取本人画像",
+      "tags": ["self", "positive", "multi-role"],
+      "subject": {
+        "userId": "u-leader-1",
+        "roles": ["group_leader", "student"],
+        "groupIds": ["g-1"]
+      },
+      "request": {
+        "permission": "profile:self:read",
+        "scope": "SELF",
+        "resourceUserId": "u-leader-1"
+      },
+      "expect": { "allowed": true },
+      "rationale": "多角色取并集：student 角色满足 SELF 范围与资源归属校验"
+    },
+    {
+      "id": "authorize-assigned-profile-admin-read-granted-resource",
+      "kind": "authorize",
+      "title": "普通管理员读取已分配资源",
+      "tags": ["assigned", "positive"],
+      "subject": { "userId": "u-admin-1", "roles": ["admin"], "assignedResourceIds": ["r-1"] },
+      "request": {
+        "permission": "profile:admin:read",
+        "scope": "ASSIGNED",
+        "resourceUserId": "r-1"
+      },
+      "expect": { "allowed": true },
+      "rationale": "ASSIGNED 范围要求资源属于服务端计算的授权资源集合"
+    },
+    {
+      "id": "authorize-assigned-profile-admin-read-unassigned-resource",
+      "kind": "authorize",
+      "title": "普通管理员读取未分配资源（越权）",
+      "tags": ["assigned", "negative", "cross-resource"],
+      "subject": { "userId": "u-admin-1", "roles": ["admin"], "assignedResourceIds": ["r-1"] },
+      "request": {
+        "permission": "profile:admin:read",
+        "scope": "ASSIGNED",
+        "resourceUserId": "r-2"
+      },
+      "expect": { "allowed": false, "deniedBy": "resource-not-assigned" },
+      "rationale": "资源不在 assignedResourceIds 内即拒绝"
+    },
+    {
+      "id": "authorize-assigned-without-assigned-resource-ids",
+      "kind": "authorize",
+      "title": "管理员主体未携带授权资源集合",
+      "tags": ["assigned", "negative", "fail-closed"],
+      "subject": { "userId": "u-admin-1", "roles": ["admin"] },
+      "request": {
+        "permission": "profile:admin:read",
+        "scope": "ASSIGNED",
+        "resourceUserId": "r-1"
+      },
+      "expect": { "allowed": false, "deniedBy": "resource-not-assigned" },
+      "rationale": "缺少服务端资源集合时默认拒绝"
+    },
+    {
+      "id": "authorize-assigned-achievement-review-not-granted",
+      "kind": "authorize",
+      "title": "普通管理员审核成果但未获授予",
+      "tags": ["assigned", "negative", "permission-not-in-role"],
+      "subject": { "userId": "u-admin-1", "roles": ["admin"], "assignedResourceIds": ["r-1"] },
+      "request": {
+        "permission": "achievement:review",
+        "scope": "ASSIGNED",
+        "resourceUserId": "r-1"
+      },
+      "expect": { "allowed": false, "deniedBy": "permission-not-in-role" },
+      "rationale": "普通管理员只能用超级管理员明确授予的原子权限；未授予即拒绝"
+    },
+    {
+      "id": "authorize-assigned-global-scope-denied",
+      "kind": "authorize",
+      "title": "普通管理员请求 GLOBAL 范围",
+      "tags": ["assigned", "negative", "scope-escalation"],
+      "subject": { "userId": "u-admin-1", "roles": ["admin"], "assignedResourceIds": ["r-1"] },
+      "request": { "permission": "profile:admin:read", "scope": "GLOBAL" },
+      "expect": { "allowed": false, "deniedBy": "scope-role-mismatch" },
+      "rationale": "admin 默认范围为 ASSIGNED，不能被请求提升为 GLOBAL"
+    },
+    {
+      "id": "authorize-system-user-manage",
+      "kind": "authorize",
+      "title": "系统管理员管理账号",
+      "tags": ["system", "positive"],
+      "subject": { "userId": "u-sysadmin-1", "roles": ["system_admin"] },
+      "request": { "permission": "user:manage", "scope": "SYSTEM" },
+      "expect": { "allowed": true },
+      "rationale": "system_admin 默认范围 SYSTEM，持有 user:manage"
+    },
+    {
+      "id": "authorize-system-audit-read",
+      "kind": "authorize",
+      "title": "系统管理员读取审计",
+      "tags": ["system", "positive"],
+      "subject": { "userId": "u-sysadmin-1", "roles": ["system_admin"] },
+      "request": { "permission": "audit:read", "scope": "SYSTEM" },
+      "expect": { "allowed": true },
+      "rationale": "审计只可追加读取，不提供删除能力"
+    },
+    {
+      "id": "authorize-system-statistics-flow-denied",
+      "kind": "authorize",
+      "title": "系统管理员读取业务统计",
+      "tags": ["system", "negative", "permission-not-in-role"],
+      "subject": { "userId": "u-sysadmin-1", "roles": ["system_admin"] },
+      "request": { "permission": "statistics:flow:read", "scope": "SYSTEM" },
+      "expect": { "allowed": false, "deniedBy": "permission-not-in-role" },
+      "rationale": "系统管理员不自动获得业务数据权限，必须另行授予"
+    },
+    {
+      "id": "authorize-system-global-scope-denied",
+      "kind": "authorize",
+      "title": "系统管理员请求 GLOBAL 范围",
+      "tags": ["system", "negative", "scope-escalation"],
+      "subject": { "userId": "u-sysadmin-1", "roles": ["system_admin"] },
+      "request": { "permission": "user:manage", "scope": "GLOBAL" },
+      "expect": { "allowed": false, "deniedBy": "scope-role-mismatch" },
+      "rationale": "系统管理员不得自动获得全局业务数据"
+    },
+    {
+      "id": "authorize-system-role-assign-denied",
+      "kind": "authorize",
+      "title": "系统管理员执行 role:assign",
+      "tags": ["system", "negative", "restricted-permission"],
+      "subject": { "userId": "u-sysadmin-1", "roles": ["system_admin"] },
+      "request": { "permission": "role:assign", "scope": "SYSTEM" },
+      "expect": { "allowed": false, "deniedBy": "permission-not-in-role" },
+      "rationale": "role:assign 只能走独立二次确认流程，不进入任何角色的默认权限集合"
+    },
+    {
+      "id": "authorize-global-statistics-flow",
+      "kind": "authorize",
+      "title": "超级管理员读取全局统计",
+      "tags": ["global", "positive"],
+      "subject": { "userId": "u-super-1", "roles": ["super_admin"] },
+      "request": { "permission": "statistics:flow:read", "scope": "GLOBAL" },
+      "expect": { "allowed": true },
+      "rationale": "super_admin 默认范围 GLOBAL，持有全部业务原子权限"
+    },
+    {
+      "id": "authorize-global-export-profile-create",
+      "kind": "authorize",
+      "title": "超级管理员创建画像导出",
+      "tags": ["global", "positive", "export"],
+      "subject": { "userId": "u-super-1", "roles": ["super_admin"] },
+      "request": {
+        "permission": "export:profile:create",
+        "scope": "GLOBAL",
+        "resourceUserId": "u-student-9"
+      },
+      "expect": { "allowed": true },
+      "rationale": "导出按原子权限分别授权，不使用 export:* 通配"
+    },
+    {
+      "id": "authorize-global-export-wildcard-denied",
+      "kind": "authorize",
+      "title": "使用 export:* 通配权限",
+      "tags": ["global", "negative", "unlisted-permission"],
+      "subject": { "userId": "u-super-1", "roles": ["super_admin"] },
+      "request": { "permission": "export:*", "scope": "GLOBAL" },
+      "expect": { "allowed": false, "deniedBy": "unlisted-permission" },
+      "rationale": "未列出的权限一律拒绝，通配形式不是合法权限点"
+    },
+    {
+      "id": "authorize-global-profile-wildcard-denied",
+      "kind": "authorize",
+      "title": "使用 profile:* 通配权限",
+      "tags": ["global", "negative", "unlisted-permission"],
+      "subject": { "userId": "u-super-1", "roles": ["super_admin"] },
+      "request": { "permission": "profile:*", "scope": "GLOBAL" },
+      "expect": { "allowed": false, "deniedBy": "unlisted-permission" },
+      "rationale": "权限点必须精确匹配目录中的登记值"
+    },
+    {
+      "id": "authorize-global-not-registered-permission-denied",
+      "kind": "authorize",
+      "title": "使用未登记的自造权限",
+      "tags": ["global", "negative", "unlisted-permission"],
+      "subject": { "userId": "u-super-1", "roles": ["super_admin"] },
+      "request": { "permission": "system:everything", "scope": "GLOBAL" },
+      "expect": { "allowed": false, "deniedBy": "unlisted-permission" },
+      "rationale": "未在权限目录登记的值一律拒绝"
+    },
+    {
+      "id": "authorize-global-role-assign-denied",
+      "kind": "authorize",
+      "title": "超级管理员执行 role:assign",
+      "tags": ["global", "negative", "restricted-permission"],
+      "subject": { "userId": "u-super-1", "roles": ["super_admin"] },
+      "request": { "permission": "role:assign", "scope": "GLOBAL" },
+      "expect": { "allowed": false, "deniedBy": "permission-not-in-role" },
+      "rationale": "超级管理员默认权限集合排除 role:assign"
+    },
+    {
+      "id": "authorize-global-forged-roles-and-scope",
+      "kind": "authorize",
+      "title": "学生伪造 super_admin 角色与 GLOBAL 范围",
+      "tags": ["global", "negative", "forged-client-claim"],
+      "subject": { "userId": "u-student-1", "roles": ["student"], "groupIds": [] },
+      "request": { "permission": "statistics:flow:read", "scope": "GLOBAL" },
+      "clientClaims": { "roles": ["super_admin"], "scope": "GLOBAL" },
+      "expect": { "allowed": false, "deniedBy": "scope-role-mismatch" },
+      "rationale": "客户端声明的角色与范围必须被忽略，只使用服务端会话解析结果"
+    },
+    {
+      "id": "authorize-empty-user-id-denied",
+      "kind": "authorize",
+      "title": "主体缺少 userId",
+      "tags": ["structural", "negative", "fail-closed"],
+      "subject": { "userId": "", "roles": ["super_admin"] },
+      "request": { "permission": "statistics:flow:read", "scope": "GLOBAL" },
+      "expect": { "allowed": false, "deniedBy": "invalid-subject" },
+      "rationale": "无认证主体时默认拒绝，即使声明了最高角色"
+    },
+    {
+      "id": "authorize-empty-roles-denied",
+      "kind": "authorize",
+      "title": "主体没有任何角色",
+      "tags": ["structural", "negative", "fail-closed"],
+      "subject": { "userId": "u-nobody-1", "roles": [] },
+      "request": { "permission": "group:read:open", "scope": "SELF" },
+      "expect": { "allowed": false, "deniedBy": "no-role-match" },
+      "rationale": "角色集合为空即无匹配分支，默认拒绝"
+    },
+    {
+      "id": "authorize-unknown-role-denied",
+      "kind": "authorize",
+      "title": "主体携带未登记角色",
+      "tags": ["structural", "negative", "unlisted-role"],
+      "subject": { "userId": "u-x-1", "roles": ["vip"] },
+      "request": { "permission": "statistics:flow:read", "scope": "GLOBAL" },
+      "expect": { "allowed": false, "deniedBy": "invalid-subject" },
+      "rationale": "角色不在登记枚举内即拒绝，避免自造角色绕过"
+    },
+    {
+      "id": "authorize-unknown-scope-denied",
+      "kind": "authorize",
+      "title": "请求使用未登记数据范围",
+      "tags": ["structural", "negative", "unlisted-scope"],
+      "subject": { "userId": "u-super-1", "roles": ["super_admin"] },
+      "request": { "permission": "statistics:flow:read", "scope": "TEAM" },
+      "expect": { "allowed": false, "deniedBy": "invalid-request" },
+      "rationale": "数据范围只允许 SELF/GROUP/ASSIGNED/SYSTEM/GLOBAL"
+    }
+  ],
+  "grantFixtures": [
+    {
+      "id": "grant-system-admin-read-assigned",
+      "kind": "grant",
+      "title": "系统管理员把 ASSIGNED 读取权限授予普通管理员",
+      "tags": ["grant", "positive"],
+      "actor": { "userId": "u-sysadmin-1", "roles": ["system_admin"] },
+      "grants": [
+        { "targetUserId": "u-admin-1", "permission": "profile:admin:read", "scope": "ASSIGNED" }
+      ],
+      "expect": { "allowed": true },
+      "rationale": "系统管理员可配置权限，但不得授予受限权限或 GLOBAL/SYSTEM 范围"
+    },
+    {
+      "id": "grant-system-admin-group-scope",
+      "kind": "grant",
+      "title": "系统管理员授予组范围审核权",
+      "tags": ["grant", "positive", "group"],
+      "actor": { "userId": "u-sysadmin-1", "roles": ["system_admin"] },
+      "grants": [
+        {
+          "targetUserId": "u-leader-1",
+          "permission": "membership:review:group",
+          "scope": "GROUP",
+          "groupId": "g-1"
+        }
+      ],
+      "expect": { "allowed": true },
+      "rationale": "GROUP 授权必须携带服务端解析出的 groupId；具体组归属在业务层再次校验"
+    },
+    {
+      "id": "grant-group-leader-own-group",
+      "kind": "grant",
+      "title": "同时持有超级管理员与负责人角色的主体授予本组权限",
+      "tags": ["grant", "positive", "multi-role", "group"],
+      "actor": {
+        "userId": "u-super-1",
+        "roles": ["super_admin", "group_leader"],
+        "groupIds": ["g-1"]
+      },
+      "grants": [
+        {
+          "targetUserId": "u-leader-2",
+          "permission": "membership:review:group",
+          "scope": "GROUP",
+          "groupId": "g-1"
+        }
+      ],
+      "expect": { "allowed": true },
+      "rationale": "持负责人角色时授权范围被限制在本人负责小组内"
+    },
+    {
+      "id": "grant-group-leader-other-group-denied",
+      "kind": "grant",
+      "title": "负责人在非所属小组上配置权限（越权）",
+      "tags": ["grant", "negative", "cross-group"],
+      "actor": {
+        "userId": "u-super-1",
+        "roles": ["super_admin", "group_leader"],
+        "groupIds": ["g-1"]
+      },
+      "grants": [
+        {
+          "targetUserId": "u-leader-2",
+          "permission": "membership:review:group",
+          "scope": "GROUP",
+          "groupId": "g-2"
+        }
+      ],
+      "expect": { "allowed": false, "deniedBy": "groupId-not-owned" },
+      "rationale": "负责人不得在非所属小组上做任何授权配置"
+    },
+    {
+      "id": "grant-super-admin-global",
+      "kind": "grant",
+      "title": "超级管理员授予 GLOBAL 业务读取",
+      "tags": ["grant", "positive", "global"],
+      "actor": { "userId": "u-super-1", "roles": ["super_admin"] },
+      "grants": [
+        { "targetUserId": "u-admin-1", "permission": "statistics:flow:read", "scope": "GLOBAL" }
+      ],
+      "expect": { "allowed": true },
+      "rationale": "只有超级管理员可配置 GLOBAL 范围"
+    },
+    {
+      "id": "grant-super-admin-system-scope",
+      "kind": "grant",
+      "title": "超级管理员授予 SYSTEM 范围账号权限",
+      "tags": ["grant", "positive", "system"],
+      "actor": { "userId": "u-super-1", "roles": ["super_admin"] },
+      "grants": [
+        { "targetUserId": "u-sysadmin-2", "permission": "user:manage", "scope": "SYSTEM" }
+      ],
+      "expect": { "allowed": true },
+      "rationale": "SYSTEM 范围同样只允许超级管理员配置"
+    },
+    {
+      "id": "grant-ordinary-admin-denied",
+      "kind": "grant",
+      "title": "普通管理员配置权限（越权）",
+      "tags": ["grant", "negative", "actor-not-configurator"],
+      "actor": { "userId": "u-admin-1", "roles": ["admin"] },
+      "grants": [
+        { "targetUserId": "u-admin-1", "permission": "profile:admin:read", "scope": "ASSIGNED" }
+      ],
+      "expect": { "allowed": false, "deniedBy": "actor-not-configurator" },
+      "rationale": "普通管理员不得授予任何权限，也不得自我提权"
+    },
+    {
+      "id": "grant-system-admin-global-denied",
+      "kind": "grant",
+      "title": "系统管理员授予 GLOBAL 范围",
+      "tags": ["grant", "negative", "scope-escalation"],
+      "actor": { "userId": "u-sysadmin-1", "roles": ["system_admin"] },
+      "grants": [
+        { "targetUserId": "u-admin-1", "permission": "statistics:flow:read", "scope": "GLOBAL" }
+      ],
+      "expect": { "allowed": false, "deniedBy": "scope-above-actor" },
+      "rationale": "GLOBAL 范围超出系统管理员的授权上限"
+    },
+    {
+      "id": "grant-system-admin-system-scope-denied",
+      "kind": "grant",
+      "title": "系统管理员授予 SYSTEM 范围",
+      "tags": ["grant", "negative", "scope-escalation"],
+      "actor": { "userId": "u-sysadmin-1", "roles": ["system_admin"] },
+      "grants": [
+        { "targetUserId": "u-sysadmin-2", "permission": "user:manage", "scope": "SYSTEM" }
+      ],
+      "expect": { "allowed": false, "deniedBy": "scope-above-actor" },
+      "rationale": "SYSTEM 范围配置需要超级管理员"
+    },
+    {
+      "id": "grant-role-assign-denied",
+      "kind": "grant",
+      "title": "授予 role:assign",
+      "tags": ["grant", "negative", "restricted-permission"],
+      "actor": { "userId": "u-super-1", "roles": ["super_admin"] },
+      "grants": [
+        { "targetUserId": "u-sysadmin-1", "permission": "role:assign", "scope": "SYSTEM" }
+      ],
+      "expect": { "allowed": false, "deniedBy": "restricted-permission" },
+      "rationale": "role:assign 不得经通用配置接口授予，必须走独立二次确认流程"
+    },
+    {
+      "id": "grant-permission-configure-denied",
+      "kind": "grant",
+      "title": "授予 permission:configure",
+      "tags": ["grant", "negative", "restricted-permission"],
+      "actor": { "userId": "u-super-1", "roles": ["super_admin"] },
+      "grants": [
+        { "targetUserId": "u-sysadmin-1", "permission": "permission:configure", "scope": "SYSTEM" }
+      ],
+      "expect": { "allowed": false, "deniedBy": "restricted-permission" },
+      "rationale": "权限配置权本身不可被授予，避免授权链自我复制"
+    },
+    {
+      "id": "grant-wildcard-permission-denied",
+      "kind": "grant",
+      "title": "授予 export:* 通配权限",
+      "tags": ["grant", "negative", "unlisted-permission"],
+      "actor": { "userId": "u-super-1", "roles": ["super_admin"] },
+      "grants": [{ "targetUserId": "u-admin-1", "permission": "export:*", "scope": "GLOBAL" }],
+      "expect": { "allowed": false, "deniedBy": "unlisted-permission" },
+      "rationale": "未列出的权限一律拒绝"
+    },
+    {
+      "id": "grant-unknown-scope-denied",
+      "kind": "grant",
+      "title": "授予未登记数据范围",
+      "tags": ["grant", "negative", "unlisted-scope"],
+      "actor": { "userId": "u-super-1", "roles": ["super_admin"] },
+      "grants": [
+        { "targetUserId": "u-admin-1", "permission": "profile:admin:read", "scope": "TEAM" }
+      ],
+      "expect": { "allowed": false, "deniedBy": "invalid-request" },
+      "rationale": "范围枚举之外的取值一律拒绝"
+    },
+    {
+      "id": "grant-missing-target-denied",
+      "kind": "grant",
+      "title": "授权缺少被授权人",
+      "tags": ["grant", "negative", "fail-closed"],
+      "actor": { "userId": "u-super-1", "roles": ["super_admin"] },
+      "grants": [{ "targetUserId": "", "permission": "profile:admin:read", "scope": "GLOBAL" }],
+      "expect": { "allowed": false, "deniedBy": "invalid-request" },
+      "rationale": "缺少被授权主体时不得产生任何授权"
+    },
+    {
+      "id": "grant-actor-unknown-role-denied",
+      "kind": "grant",
+      "title": "携带未登记角色的主体配置权限",
+      "tags": ["grant", "negative", "unlisted-role"],
+      "actor": { "userId": "u-x-1", "roles": ["vip"] },
+      "grants": [
+        { "targetUserId": "u-admin-1", "permission": "profile:admin:read", "scope": "ASSIGNED" }
+      ],
+      "expect": { "allowed": false, "deniedBy": "invalid-subject" },
+      "rationale": "角色必须来自登记枚举"
+    },
+    {
+      "id": "grant-empty-actor-user-id-denied",
+      "kind": "grant",
+      "title": "缺少操作者 userId 的配置请求",
+      "tags": ["grant", "negative", "fail-closed"],
+      "actor": { "userId": "", "roles": ["super_admin"] },
+      "grants": [
+        { "targetUserId": "u-admin-1", "permission": "profile:admin:read", "scope": "ASSIGNED" }
+      ],
+      "expect": { "allowed": false, "deniedBy": "invalid-subject" },
+      "rationale": "无认证操作者时默认拒绝"
+    },
+    {
+      "id": "grant-empty-grants-vacuous-true",
+      "kind": "grant",
+      "title": "空授权集合视为无操作",
+      "tags": ["grant", "edge-case"],
+      "actor": { "userId": "u-super-1", "roles": ["super_admin"] },
+      "grants": [],
+      "expect": { "allowed": true },
+      "rationale": "谓词按 every 语义对空集合返回 true；这不代表允许授予任何权限，只表示无副作用，接口层仍须拒绝空变更请求"
+    }
+  ],
+  "nonGoals": [
+    "认证与会话失效（UNAUTHENTICATED/401）：由认证切片覆盖，本夹具只处理已认证主体",
+    "join application 的幂等键、状态机与版本冲突：由 membership 切片覆盖",
+    "字段脱敏、审计事件与导出文件生命周期：由隐私/审计切片覆盖",
+    "RuoYi 菜单、按钮与角色 RBAC 的具体实现：本夹具只规定映射后必须满足的资源级判定",
+    "性能与并发：本夹具为纯判定语义，不覆盖数据库行锁与并发重查"
+  ]
+}

@@ -1,0 +1,323 @@
+openapi: 3.0.3
+info:
+  title: Researcher Manager 健康检查契约（ruoyi-api 边界骨架）
+  version: 0.1.0
+  description: |
+    services/ruoyi-api 边界骨架的第一个公开契约切片，只描述健康探针。
+
+    语义与 NestJS 基线（services/api）一致：响应使用统一信封
+    { data, meta, error }，失败时 data 为 null，错误码取自
+    packages/shared/src/api/error-codes.ts。
+
+    本文件不包含 RuoYi 源码、Java 实现或 Maven 依赖；健康端点不返回连接串、
+    密钥、内部地址或依赖版本明细。
+  license:
+    name: UNLICENSED
+servers:
+  - url: /api/v1
+    description: 与 NestJS 基线一致的 API 前缀（API_PREFIX）
+tags:
+  - name: health
+    description: 存活与就绪探针；公开访问，不要求会话
+security:
+  - bearerAuth: []
+paths:
+  /health:
+    get:
+      tags:
+        - health
+      operationId: getHealth
+      summary: 存活与版本信息
+      description: 返回服务名、版本、运行时长、当前时间与 API 前缀；不访问数据库，也不读取业务数据。
+      security: []
+      responses:
+        "200":
+          description: 服务存活；data.status 恒为 ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthEnvelope"
+              examples:
+                default:
+                  summary: 本地 POC（无数据库）
+                  value:
+                    data:
+                      status: ok
+                      service: researcher-manager-api
+                      version: 0.1.0
+                      uptimeSeconds: 42
+                      timestamp: "2026-01-01T00:00:00.000Z"
+                      prefix: /api/v1
+                    meta:
+                      requestId: 5f2b1c9a-0d3e-4a71-9c4e-2a6b7d8e0f11
+                      generatedAt: "2026-01-01T00:00:00.000Z"
+                    error: null
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /health/ready:
+    get:
+      tags:
+        - health
+      operationId: getHealthReady
+      summary: 依赖配置就绪情况
+      description: |
+        逐项返回 database、sessionSecret、aiMatching 的配置状态。
+        缺少可选配置时整体为 degraded，HTTP 仍为 200：P3 骨架允许无数据库启动，
+        degraded 是业务事实而不是传输失败，因此不映射为 503。
+      security: []
+      responses:
+        "200":
+          description: 就绪（ready）或降级（degraded），两者均为 200
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadinessEnvelope"
+              examples:
+                ready:
+                  summary: 全部依赖已配置
+                  value:
+                    data:
+                      status: ready
+                      checks:
+                        - name: database
+                          status: ok
+                        - name: sessionSecret
+                          status: ok
+                        - name: aiMatching
+                          status: ok
+                    meta:
+                      requestId: 5f2b1c9a-0d3e-4a71-9c4e-2a6b7d8e0f12
+                      generatedAt: "2026-01-01T00:00:00.000Z"
+                    error: null
+                degraded:
+                  summary: 缺少可选依赖（本地 POC 默认形态）
+                  value:
+                    data:
+                      status: degraded
+                      checks:
+                        - name: database
+                          status: not_configured
+                          detail: 未配置 DATABASE_URL：P3 骨架允许无数据库启动，业务接口尚未实现
+                        - name: sessionSecret
+                          status: not_configured
+                          detail: 未配置 SESSION_SECRET
+                        - name: aiMatching
+                          status: degraded
+                          detail: AI 匹配未启用，走规则降级
+                    meta:
+                      requestId: 5f2b1c9a-0d3e-4a71-9c4e-2a6b7d8e0f13
+                      generatedAt: "2026-01-01T00:00:00.000Z"
+                    error: null
+        "500":
+          $ref: "#/components/responses/InternalError"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 健康端点不使用该方案；为后续受保护切片预留。
+  responses:
+    InternalError:
+      description: 未处理异常；只暴露稳定错误码与用户安全消息，不返回内部细节
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          examples:
+            default:
+              value:
+                data: null
+                meta:
+                  requestId: 5f2b1c9a-0d3e-4a71-9c4e-2a6b7d8e0f14
+                error:
+                  code: INTERNAL_ERROR
+                  message: 服务器内部错误，请稍后重试
+  schemas:
+    Meta:
+      type: object
+      description: 与 packages/shared 的 ApiMeta 对齐；requestId 必填，其余字段由各切片按需扩展。
+      required:
+        - requestId
+      properties:
+        requestId:
+          type: string
+          minLength: 1
+          description: 服务端生成的请求标识；日志与审计使用同一标识。
+        generatedAt:
+          type: string
+          format: date-time
+        page:
+          type: integer
+          minimum: 1
+        pageSize:
+          type: integer
+          minimum: 1
+        total:
+          type: integer
+          minimum: 0
+        totalPages:
+          type: integer
+          minimum: 0
+        fallbackUsed:
+          type: boolean
+          description: 仅在 AI 降级切片使用；健康探针不返回该字段。
+      additionalProperties: true
+    ErrorBody:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          minLength: 1
+          description: 稳定错误码，取值见 contracts/README.md 错误码注册表（不改写该注册表）。
+        message:
+          type: string
+          minLength: 1
+          description: 用户安全消息；不得泄露他组资源是否存在或敏感字段原文。
+        requestId:
+          type: string
+        details:
+          type: object
+          description: 结构化补充信息（例如字段级校验 issues）；不得包含隐私原文。
+          additionalProperties: true
+      additionalProperties: false
+    HealthData:
+      type: object
+      required:
+        - status
+        - service
+        - version
+        - uptimeSeconds
+        - timestamp
+        - prefix
+      properties:
+        status:
+          type: string
+          enum:
+            - ok
+        service:
+          type: string
+          minLength: 1
+          example: researcher-manager-api
+        version:
+          type: string
+          pattern: '^\d+\.\d+\.\d+$'
+          example: 0.1.0
+        uptimeSeconds:
+          type: integer
+          minimum: 0
+          description: 进程运行时长（秒，四舍五入）。
+        timestamp:
+          type: string
+          format: date-time
+        prefix:
+          type: string
+          pattern: "^/"
+          example: /api/v1
+      additionalProperties: false
+    HealthEnvelope:
+      type: object
+      required:
+        - data
+        - meta
+        - error
+      properties:
+        data:
+          $ref: "#/components/schemas/HealthData"
+        meta:
+          $ref: "#/components/schemas/Meta"
+        error:
+          description: 成功响应恒为 null
+          type: object
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/ErrorBody"
+      additionalProperties: false
+    ReadinessCheckStatus:
+      type: string
+      enum:
+        - ok
+        - not_configured
+        - degraded
+    ReadinessCheck:
+      type: object
+      required:
+        - name
+        - status
+      properties:
+        name:
+          type: string
+          minLength: 1
+          enum:
+            - database
+            - sessionSecret
+            - aiMatching
+        status:
+          $ref: "#/components/schemas/ReadinessCheckStatus"
+        detail:
+          type: string
+          description: 面向运维的安全说明；不得包含连接串、密钥或内部地址。
+      additionalProperties: false
+    ReadinessData:
+      type: object
+      required:
+        - status
+        - checks
+      properties:
+        status:
+          type: string
+          enum:
+            - ready
+            - degraded
+        checks:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/ReadinessCheck"
+      additionalProperties: false
+    ReadinessEnvelope:
+      type: object
+      required:
+        - data
+        - meta
+        - error
+      properties:
+        data:
+          $ref: "#/components/schemas/ReadinessData"
+        meta:
+          $ref: "#/components/schemas/Meta"
+        error:
+          description: 成功响应恒为 null
+          type: object
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/ErrorBody"
+      additionalProperties: false
+    ErrorEnvelope:
+      type: object
+      required:
+        - data
+        - meta
+        - error
+      properties:
+        data:
+          type: object
+          nullable: true
+          description: 失败响应恒为 null
+        meta:
+          $ref: "#/components/schemas/Meta"
+        error:
+          allOf:
+            - $ref: "#/components/schemas/ErrorBody"
+      additionalProperties: false
+x-boundary:
+  module: ruoyi-api
+  slice: health
+  contractsVersion: 0.1.0
+  baseline: services/api (NestJS，回滚基线，不修改)
+  ruoyiSourceIncluded: false
+  mavenDependencyIntroduced: false
+  errorCodeRegistry: packages/shared/src/api/error-codes.ts

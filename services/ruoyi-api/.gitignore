@@ -1,0 +1,10 @@
+# Java/Maven build output (when the POC is admitted)
+target/
+*.class
+*.log
+
+# Local IDE and environment files
+.idea/
+.vscode/
+*.iml
+.env
