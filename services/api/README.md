@@ -12,7 +12,7 @@ NestJS API 服务：**唯一业务规则入口**，前端不直接访问数据�
 - 统一响应信封 `{ data, meta, error }` + 稳定错误码 + 请求 ID。
 - 领域模块边界（auth、access-control、profiles、groups、memberships、achievements、education、matching、
   statistics、exports、compliance、audit、notifications）：P3 期间都是空模块占位，自 P4 起逐个填充实现；
-  当前 `education` 已落地第一个业务切片，其余仍只声明边界。
+  当前 `education` 与 `profiles` 已落地业务切片，其余仍只声明边界。
 - **升学记录切片（`education`，学生自服务）**：`src/modules/education/`。它同时是「认证 → 授权 →
   校验 → 存储端口 → 统一响应」的端到端样板：
   - 路由：`GET/POST /api/v1/me/education-records`、`GET /api/v1/me/education-records/{recordId}`
@@ -25,9 +25,24 @@ NestJS API 服务：**唯一业务规则入口**，前端不直接访问数据�
   - 授权：资源级判定只经 `AuthorizationGuard`（`RUOYI_AUTHZ_ADAPTER` 端口 → canonical 谓词），
     `resourceUserId` 取自服务端主体或存储记录，客户端无法影响；越权/缺权限点 → 403；
   - 输出：存储记录离开进程前再按读取契约校验（枚举闭集 + ISO 时间戳），违者 500 且不泄露字段取值。
-- **存储端口（无数据库阶段）**：`EDUCATION_RECORD_REPOSITORY` 与 `SESSION_STORE` 都是**显式可替换端口**，
-  默认绑定内存基线（`persistent = false`、`productionReady = false`，`NODE_ENV=production` 下拒绝构造，
-  默认不预置任何会话/记录）；引入 PostgreSQL 时只替换 provider 绑定，controller/service 不改动。
+- **学生画像切片（`profiles`，本人自服务）**：`src/modules/profiles/`。复用与升学记录相同的
+  「认证 → 授权 → 校验 → 存储端口 → 统一响应」链路：
+  - 路由：`GET /api/v1/me/profile`、`PATCH /api/v1/me/profile`
+    （权限点 `profile:self:read` / `profile:self:update`，数据范围固定 `SELF`；
+    契约基线的 `PUT /me/profile`（首次提交）与更正申请不在本切片）；
+  - 请求校验：`@rm/shared` 的 `studentProfileUpdateSchema`（复用创建 schema 的字段级规则：
+    未登记枚举、越界数值、控制字符、「未同意隐私政策」→ 400 `VALIDATION_FAILED` + 字段路径）；
+    另有**字段闭集**：请求体出现 `roles`/`scope`/`groupId`/`userId`/`permissions`/`reviewStatus`
+    等未声明字段直接 400（身份/权限字段给出可区分的拒绝原因），不是静默忽略；
+  - 认证：主体只来自 `SESSION_SUBJECT_RESOLVER`；授权：资源级判定只经 `AuthorizationGuard`
+    （`RUOYI_AUTHZ_ADAPTER` 端口），`resourceUserId` 取自**存储归属**（纵深防御：仓储返回他人归属
+    即 403），客户端无法影响权限点/范围/归属；
+  - 输出：对外视图不含 `userId`，且学号（`studentNo`）与联系方式（`phone`）**只写不读**——
+    任何状态码的响应都不出现这两个字段与其明文；读取契约仍校验其存储形状（违规 500）。
+- **存储端口（无数据库阶段）**：`EDUCATION_RECORD_REPOSITORY`、`PROFILE_REPOSITORY` 与 `SESSION_STORE`
+  都是**显式可替换端口**，默认绑定内存基线（`persistent = false`、`productionReady = false`，
+  `NODE_ENV=production` 下拒绝构造，默认不预置任何会话/记录/画像）；引入 PostgreSQL 时只替换
+  provider 绑定，controller/service 不改动。
 - 统一响应信封 `{ data, meta, error }` + 稳定错误码 + 请求 ID。
 - **RuoYi 兼容适配器（可回退基线）**：`src/modules/ruoyi-adapter/`。只注册端口
   `RUOYI_AUTHZ_ADAPTER`，不注册路由、不改动现有响应，因此不改变对外行为：
@@ -37,14 +52,15 @@ NestJS API 服务：**唯一业务规则入口**，前端不直接访问数据�
     （**仅测试期读取**，应用启动不依赖契约目录）。
 - 环境变量在启动时校验，非法配置立即失败。
 
-**未包含**：数据库连接、微信登录、RuoYi RBAC 实现，以及升学记录之外的业务接口
-（升学记录的状态流转/审核、更新与撤回、升学率统计、幂等键与审计落库）。它们属于后续切片。
+**未包含**：数据库连接、微信登录、RuoYi RBAC 实现，以及升学记录/学生画像之外的其他业务接口
+（画像首次提交锁定与管理员代改、升学记录的状态流转/审核、更新与撤回、升学率统计、幂等键与审计落库）。
+它们属于后续切片。
 
 ## 命令
 
 ```bash
 pnpm --filter @rm/api typecheck   # 直接对源码做类型检查（经 tsconfig paths 引用工作区包源码）
-pnpm --filter @rm/api test        # vitest：env 校验、信封、异常映射、健康检查、运维信息白名单、RuoYi 契约、升学记录切片
+pnpm --filter @rm/api test        # vitest：env 校验、信封、异常映射、健康检查、运维信息白名单、RuoYi 契约、升学记录切片、学生画像切片
 pnpm --filter @rm/api build       # tsc 产出 dist（CommonJS + decorator metadata）
 pnpm --filter @rm/api start       # node dist/main.js
 ```
@@ -85,7 +101,7 @@ curl http://127.0.0.1:3000/api/v1/health
 7. **认证与授权分离，主体只来自服务端**：认证（会话凭证 → 服务端主体）在 `AuthModule` 经
    `SESSION_SUBJECT_RESOLVER` 端口完成，授权（权限点 + 数据范围 + 资源归属）经
    `AuthorizationGuard` → `RUOYI_AUTHZ_ADAPTER` 端口完成。控制器不解析角色字段、不自行判断权限，
-   客户端提交的 `roles`/`scope`/`groupId`/`userId` 不进入判定（升学记录切片直接以字段闭集拒绝）；
+   客户端提交的 `roles`/`scope`/`groupId`/`userId` 不进入判定（升学记录与画像切片直接以字段闭集拒绝）；
    持久化一律经仓储端口注入，不用模块级/全局内存冒充生产存储。
 
 ## 依赖

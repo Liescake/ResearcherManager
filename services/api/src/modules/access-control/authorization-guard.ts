@@ -3,6 +3,12 @@ import type { AuthorizationRequest, AuthorizationSubject, PermissionGrant } from
 import { RUOYI_AUTHZ_ADAPTER, type RuoYiAuthzAdapter } from '../ruoyi-adapter/ruoyi-adapter.port';
 
 /**
+ * 403 统一文案：授权拒绝与服务端发现「存储归属与主体不一致」时共用同一句话，
+ * 使调用方无法据此区分「无权」与「数据异常」，避免泄露判定内部状态。
+ */
+export const AUTHORIZATION_FORBIDDEN_MESSAGE = '无权执行该操作';
+
+/**
  * 可复用的 API 授权边界：调用方必须传入服务端解析的主体与资源范围。
  *
  * 判定**只经由适配器端口** `RUOYI_AUTHZ_ADAPTER` 执行，不直接依赖 `AuthorizationPolicy`：
@@ -21,7 +27,7 @@ export class AuthorizationGuard {
 
   assertAuthorized(subject: AuthorizationSubject, request: AuthorizationRequest): void {
     if (!this.adapter.checkAuthorization(subject, request).allowed) {
-      throw new ForbiddenException('无权执行该操作');
+      throw new ForbiddenException(AUTHORIZATION_FORBIDDEN_MESSAGE);
     }
   }
 

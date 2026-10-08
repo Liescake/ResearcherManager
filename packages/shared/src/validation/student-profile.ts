@@ -55,6 +55,29 @@ export const studentProfileInputSchema = z.object({
 export type StudentProfileInput = z.infer<typeof studentProfileInputSchema>;
 
 /**
+ * 学生本人画像更新（`PATCH /me/profile`）：上面输入 schema 的**部分**形态。
+ *
+ * - 与 `educationRecordUpdateSchema` 同构：字段级规则完全复用创建 schema（长度、枚举、
+ *   内容安全、隐私同意 `agreed: true`），只把字段变为可选，并要求「至少一个变更字段」；
+ * - **不含**未知键拒绝：zod `object` 默认静默剥离未知键，所以「请求体不得携带未声明字段
+ *   （`userId`/`roles`/`scope`/`groupId`…）」必须由 API 层闭集门禁
+ *   （`services/api` 的 `assertDeclaredProfileInputFields`）fail-closed 拒绝，而不是依赖本 schema；
+ * - 本 schema 只回答「字段值是否合法」，不回答「谁可以改」：授权在 `AuthorizationGuard`。
+ */
+export const studentProfileUpdateSchema = studentProfileInputSchema
+  .partial()
+  .superRefine((value, ctx) => {
+    if (Object.keys(value).length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: '至少需要提交一个变更字段',
+      });
+    }
+  });
+
+export type StudentProfileUpdateInput = z.infer<typeof studentProfileUpdateSchema>;
+
+/**
  * 管理员代改：必须携带理由，且至少要修改一个业务字段。
  * 代改必须全量留痕（改前值、改后值、操作人、理由、时间、请求 ID）。
  */

@@ -26,6 +26,7 @@ import { educationRecordInputSchema } from '../validation/education-record';
 import {
   adminProfileCorrectionSchema,
   studentProfileInputSchema,
+  studentProfileUpdateSchema,
 } from '../validation/student-profile';
 
 function validProfile(): z.input<typeof studentProfileInputSchema> {
@@ -83,6 +84,39 @@ describe('学生画像校验', () => {
         reason: '学生提交申请，管理员核实后更正专业名称',
       }).success,
     ).toBe(true);
+  });
+});
+
+describe('学生画像更新（PATCH /me/profile 的部分输入）', () => {
+  it('接受部分字段，并复用创建 schema 的字段级规则（含标签去重）', () => {
+    const parsed = studentProfileUpdateSchema.parse({
+      college: '数学学院',
+      skills: ['SQL', 'SQL'],
+    });
+    expect(parsed).toEqual({ college: '数学学院', skills: ['SQL'] });
+  });
+
+  it('空对象（没有任何变更字段）被拒绝', () => {
+    expect(studentProfileUpdateSchema.safeParse({}).success).toBe(false);
+  });
+
+  it('字段级规则不放宽：未登记枚举、非法联系方式、未同意隐私政策仍被拒绝', () => {
+    expect(studentProfileUpdateSchema.safeParse({ grade: 'unknown_grade' }).success).toBe(false);
+    expect(studentProfileUpdateSchema.safeParse({ phone: '12345' }).success).toBe(false);
+    expect(
+      studentProfileUpdateSchema.safeParse({
+        privacyConsent: { policyVersion: 'v1.0', agreed: false },
+      }).success,
+    ).toBe(false);
+  });
+
+  it('未知字段被静默剥离：因此「不得携带未声明字段」必须由 API 层闭集门禁拒绝', () => {
+    const parsed = studentProfileUpdateSchema.parse({
+      college: '数学学院',
+      roles: ['super_admin'],
+    });
+    expect(parsed).toEqual({ college: '数学学院' });
+    expect(Object.keys(parsed)).not.toContain('roles');
   });
 });
 
