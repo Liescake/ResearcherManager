@@ -42,7 +42,7 @@ node services/ruoyi-api/contracts/validate.mjs
 
 校验范围与判定语义见 `contracts/README.md` §7：结构校验 + 授权场景重放 + 全量 `$ref` 解析。
 
-## 工具链与准入门禁检查
+## 工具链门禁与来源证据检查
 
 `toolchain/` 下的公开检查器（只用 Node 内置模块，不联网、不下载依赖、不写仓库）在创建 `pom.xml` 或 Java 源码之前核验本机工具链、候选 commit 元数据占位与准入前置：
 
@@ -51,6 +51,18 @@ node services/ruoyi-api/toolchain/check-gate.mjs
 ```
 
 判定语义与探测方式见 `toolchain/README.md`：退出码 0 通过；1 违规（门禁前出现 `pom.xml`、Java 源码或 RuoYi 源码副本，或占位/状态与事实不符）；2 未准入（本机 JDK/Maven 未达标或准入前置未满足）。只有在清单把 `stage` 提升为 `admitted`（要求候选 commit 已冻结、全部准入前置带证据满足、合规产物就位）之后，本目录才允许出现 Maven 工程与 Java 源码；本机当前为 Java 8 且未安装 Maven，因此该检查按设计返回未准入。
+
+同一目录下的来源与合规证据清单（`provenance-manifest.json` + `check-provenance.mjs`）回答另一个问题：候选 commit/tag、许可证/NOTICE、SBOM、漏洞与 PostgreSQL 兼容性证据是否已真正核验。非 `pending` 的证据必须给出与证据文件实际字节一致的 SHA-256 摘要、必需内容标记，`verified` 还必须给出核验时间与署名，并与 `gate-manifest.json` 的候选固定值交叉核验：
+
+```bash
+# 默认检查：当前五项证据全部 pending、compliance 目录尚未创建 → 未就绪（退出码 2）
+node services/ruoyi-api/toolchain/check-provenance.mjs
+
+# 判定规则自检（合成输入，不读磁盘）；机器可读输出用 --json，信息性运行用 --report
+node services/ruoyi-api/toolchain/check-provenance.mjs --self-test
+```
+
+`poc-ready` 阶段要求五项证据全部 `verified` 且证据文件存在、摘要与内容标记匹配，候选已冻结且门禁已 `admitted`；任何「先写 verified 再补文件」或「先把阶段改到 poc-ready」都会被判违规（退出码 1），而不是未就绪。语义与状态阶梯见 `toolchain/README.md` §4。
 
 ## 保留的现有边界
 
@@ -72,6 +84,7 @@ node services/ruoyi-api/toolchain/check-gate.mjs
 创建 `pom.xml` 和 Java 源码前，必须完成：
 
 - 固定实际 Spring Boot 3 候选 commit，并核对其 POM 与 JDK 要求。
+- 把 `toolchain/provenance-manifest.json` 的五项证据逐项推进到 `verified`（证据文件存在、摘要与内容标记匹配、带核验时间与署名），再把 `stage` 提升为 `poc-ready`。
 - 本地保留 LICENSE/NOTICE/第三方许可清单。
 - 生成依赖树、SBOM、漏洞扫描和许可证扫描报告。
 - 在隔离 PostgreSQL 实例中验证 DDL、分页、时间、事务、索引和迁移回滚。

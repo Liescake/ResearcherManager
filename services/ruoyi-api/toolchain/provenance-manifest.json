@@ -1,0 +1,69 @@
+{
+  "contract": "ruoyi-provenance-manifest",
+  "manifestVersion": "0.1.0",
+  "stage": "pre-poc",
+  "purpose": "在真实 RuoYi POC 之前，逐项记录候选来源与合规证据（候选 commit/tag、许可证/NOTICE、SBOM、漏洞、PostgreSQL 兼容性）的收集状态。只有当五项证据全部 verified 且证据文件存在、摘要与内容标记匹配时，才允许把 stage 提升为 poc-ready。本清单当前保持 pending，不预填任何证据。",
+  "pocGate": {
+    "requireAllEvidenceVerified": true,
+    "requireEvidenceFilesExist": true,
+    "requireDigestMatch": true,
+    "requireContentMarkers": true,
+    "requireAttestation": true,
+    "crossCheckToolchainGate": true,
+    "rejectFabricatedEvidence": true
+  },
+  "candidate": {
+    "project": "RuoYi-Vue",
+    "line": "spring-boot-3",
+    "tag": null,
+    "commit": null,
+    "resolved": false
+  },
+  "evidence": [
+    {
+      "id": "candidate-commit-tag",
+      "requirement": "固定实际 Spring Boot 3 候选 commit（40 位小写 SHA）与对应 tag，并记录来源仓库、抓取方式与抓取时间",
+      "status": "pending",
+      "path": "services/ruoyi-api/compliance/provenance/candidate-commit-tag.md",
+      "requiredMarkers": ["repository:", "commit:", "tag:", "collected-at:"],
+      "howToObtain": "在仓库外的本地审计目录克隆/解包候选源码，记录 commit、tag、来源仓库与抓取时间；本公开目录不保存源码副本。"
+    },
+    {
+      "id": "license-notice",
+      "requirement": "保留候选仓库原始 LICENSE 与 NOTICE 的证据：SPDX 标识、原文文件摘要、NOTICE 存在性与再分发说明",
+      "status": "pending",
+      "path": "services/ruoyi-api/compliance/provenance/license-notice.md",
+      "requiredMarkers": ["spdx-license-identifier:", "license-file-sha256:", "notice:"],
+      "howToObtain": "在本地审计目录核对候选仓库根目录的 LICENSE/NOTICE 原文，记录 SPDX 标识与原文摘要；原文副本按准入门禁的合规产物清单另行登记。"
+    },
+    {
+      "id": "sbom",
+      "requirement": "生成依赖 SBOM（CycloneDX），记录工具与版本、输入锁定文件、组件数量与生成时间",
+      "status": "pending",
+      "path": "services/ruoyi-api/compliance/provenance/sbom.cyclonedx.json",
+      "requiredMarkers": ["bomFormat", "specVersion", "components"],
+      "howToObtain": "在门禁通过、Maven 工程建立后用 SBOM 工具对已锁定依赖生成 CycloneDX 文件；证据文件本身即 SBOM，不得手写伪造组件列表。"
+    },
+    {
+      "id": "vulnerability-scan",
+      "requirement": "完成依赖漏洞扫描，记录扫描器、规则库版本、发现项与逐项处置结论",
+      "status": "pending",
+      "path": "services/ruoyi-api/compliance/provenance/vulnerability-scan.md",
+      "requiredMarkers": ["scanner:", "database:", "findings:", "conclusion:"],
+      "howToObtain": "在离线/受控环境用漏洞扫描器扫描已锁定依赖，记录工具与规则库版本、发现项和处置结论；不得以网页检索结果充当扫描证据。"
+    },
+    {
+      "id": "postgresql-compatibility",
+      "requirement": "在隔离 PostgreSQL 实例验证 DDL、分页、时间、事务、隔离级别、索引与迁移回滚，并记录实例版本",
+      "status": "pending",
+      "path": "services/ruoyi-api/compliance/provenance/postgresql-compatibility.md",
+      "requiredMarkers": ["server-version:", "ddl:", "pagination:", "isolation:", "rollback:"],
+      "howToObtain": "在本地隔离 PostgreSQL 实例执行目标方言的 DDL、分页、时间、事务与回滚用例，记录结论与实例版本；未执行前保持 pending。"
+    }
+  ],
+  "nonGoals": [
+    "本清单不保存 RuoYi 源码、候选 POM 副本、依赖锁定文件或任何构建产物，只记录证据文件的位置、摘要与结论。",
+    "本清单不替代准入门禁（toolchain/check-gate.mjs）、公开契约校验（contracts/validate.mjs）与人工许可证/安全评审。",
+    "本清单不预填、不推测、不引用网页检索结果作为证据；未实际完成的项目必须保持 pending。"
+  ]
+}
