@@ -1244,9 +1244,7 @@ function evaluateAudit(input) {
       'audit-worktree-inside',
       'git rev-parse --is-inside-work-tree 严格输出 true',
       insideWorkTree,
-      insideWorkTree
-        ? 'true'
-        : `不是 true（输出 ${formatValue(git.insideWorkTreeRaw ?? null)}）`,
+      insideWorkTree ? 'true' : `不是 true（输出 ${formatValue(git.insideWorkTreeRaw ?? null)}）`,
     ),
     precondition(
       'audit-git-head',
@@ -1274,7 +1272,9 @@ function evaluateAudit(input) {
       pomAtHead,
       pomAtHead
         ? `HEAD:${AUDIT_ROOT_POM} 存在${
-            pomSummary === null ? '（未取摘要）' : `（${pomSummary.bytes} 字节、${pomSummary.lines} 行）`
+            pomSummary === null
+              ? '（未取摘要）'
+              : `（${pomSummary.bytes} 字节、${pomSummary.lines} 行）`
           }`
         : `HEAD:${AUDIT_ROOT_POM} 不存在或探测失败`,
     ),
@@ -1551,7 +1551,9 @@ function renderAuditText(report, context) {
       `- 根 ${AUDIT_ROOT_POM} 摘要（内存读取，未复制文件）: ${audit.pom.summary.bytes} 字节、${audit.pom.summary.lines} 行、artifactId=${audit.pom.summary.artifactId ?? 'null'}、java.version=${audit.pom.summary.javaVersion ?? 'null'}、spring-boot.version=${audit.pom.summary.springBootVersion ?? 'null'}、sha256=${audit.pom.contentSha256 ?? 'null'}`,
     );
   } else {
-    lines.push(`- 根 ${AUDIT_ROOT_POM} 摘要: 未取得（sha256=${audit.pom.contentSha256 ?? 'null'}）`);
+    lines.push(
+      `- 根 ${AUDIT_ROOT_POM} 摘要: 未取得（sha256=${audit.pom.contentSha256 ?? 'null'}）`,
+    );
   }
   lines.push(
     `- 前置: ${report.summary.met}/${report.summary.preconditions} 满足（verdict=${report.summary.verdict}${
@@ -2582,16 +2584,8 @@ function auditFixtureInput(overrides = {}) {
       pomAtHead: overrides.pomAtHead ?? true,
       pomAtHeadError: overrides.pomAtHeadError ?? null,
       pomBlobSha1: overrides.pomBlobSha1 ?? AUDIT_FIXTURE_POM_BLOB_SHA1,
-      pomContentSha256: auditOverride(
-        overrides,
-        'pomContentSha256',
-        AUDIT_FIXTURE_POM_SHA256,
-      ),
-      pomSummary: auditOverride(
-        overrides,
-        'pomSummary',
-        summarizePomText(AUDIT_FIXTURE_POM_TEXT),
-      ),
+      pomContentSha256: auditOverride(overrides, 'pomContentSha256', AUDIT_FIXTURE_POM_SHA256),
+      pomSummary: auditOverride(overrides, 'pomSummary', summarizePomText(AUDIT_FIXTURE_POM_TEXT)),
     },
   };
 }
@@ -3096,14 +3090,22 @@ function auditUnitChecks() {
   check('verdict 只有两个取值', new Set(Object.values(AUDIT_VERDICT)).size, 2);
   check('ready verdict 名称', AUDIT_VERDICT.ready, 'external-audit-ready');
   check('blocked verdict 名称', AUDIT_VERDICT.blocked, 'blocked');
-  check('违规同样归入 blocked（不产生第三个 verdict）', AUDIT_VERDICT.blockedByViolation, 'blocked');
+  check(
+    '违规同样归入 blocked（不产生第三个 verdict）',
+    AUDIT_VERDICT.blockedByViolation,
+    'blocked',
+  );
   check('单次探测超时为 15 秒', PROBE_TIMEOUT_MS, 15000);
   check('HEAD 严格解析：整段 40 位小写 → 接受', strictSha('a'.repeat(40)), 'a'.repeat(40));
   check('HEAD 严格解析：带前后噪声 → 拒绝', strictSha(`head is ${'a'.repeat(40)}`), null);
   check('HEAD 严格解析：大写 → 拒绝', strictSha('A'.repeat(40)), null);
   check('HEAD 严格解析：短 SHA → 拒绝', strictSha('a'.repeat(12)), null);
   check('porcelain 严格解析：空输出 → 0 条目', strictPorcelain('', true).entries.length, 0);
-  check('porcelain 严格解析：未跟踪+已跟踪两条 → 2', strictPorcelain('?? a\n M b\n', true).entries.length, 2);
+  check(
+    'porcelain 严格解析：未跟踪+已跟踪两条 → 2',
+    strictPorcelain('?? a\n M b\n', true).entries.length,
+    2,
+  );
   check(
     'porcelain 严格解析：含非条目行 → null（fail-closed）',
     strictPorcelain('warning: LF will be replaced\n', true),
@@ -3132,7 +3134,11 @@ function auditUnitChecks() {
   );
   check('pom 摘要：空文本仍返回结构化摘要', summarizePomText('').lines, 0);
   const baseVerdict = evaluateAudit(auditFixtureInput({}));
-  check('合法合成输入的 verdict 为 external-audit-ready', baseVerdict.summary.verdict, 'external-audit-ready');
+  check(
+    '合法合成输入的 verdict 为 external-audit-ready',
+    baseVerdict.summary.verdict,
+    'external-audit-ready',
+  );
   check('合法合成输入的退出码为 0', baseVerdict.exitCode, 0);
   const withStage = evaluateAudit({ ...auditFixtureInput({}), gateStage: 'admitted' });
   check(
