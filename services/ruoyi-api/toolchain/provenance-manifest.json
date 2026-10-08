@@ -34,7 +34,7 @@
       "status": "pending",
       "path": "services/ruoyi-api/compliance/provenance/license-notice.md",
       "requiredMarkers": ["spdx-license-identifier:", "license-file-sha256:", "notice:"],
-      "howToObtain": "在本地审计目录核对候选仓库根目录的 LICENSE/NOTICE 原文，记录 SPDX 标识与原文摘要；原文副本按准入门禁的合规产物清单另行登记。"
+      "howToObtain": "在本地审计目录核对候选仓库根目录的 LICENSE/NOTICE 原文，记录 SPDX 标识与原文摘要；NOTICE 存在性要按整个提交树核验（上游可能只有一个根 LICENSE），原文副本按准入门禁的合规产物清单另行登记。记录 sha256 时必须写明字节流：公共提交的 blob 字节（`git cat-file blob <sha>` 后用 sha256sum）与 core.autocrlf=true 的工作区检出字节会得到不同摘要，两者不得混用。"
     },
     {
       "id": "sbom",
@@ -42,7 +42,7 @@
       "status": "pending",
       "path": "services/ruoyi-api/compliance/provenance/sbom.cyclonedx.json",
       "requiredMarkers": ["bomFormat", "specVersion", "components"],
-      "howToObtain": "在门禁通过、Maven 工程建立后用 SBOM 工具对已锁定依赖生成 CycloneDX 文件；证据文件本身即 SBOM，不得手写伪造组件列表。"
+      "howToObtain": "在门禁通过、Maven 工程建立后用 SBOM 工具对已锁定依赖生成 CycloneDX 文件；证据文件本身即 SBOM，不得手写伪造组件列表。生成前先运行 services/ruoyi-api/toolchain/check-capability.mjs 复核前置（门禁 admitted、pom.xml 就位、JDK 17+/Maven 3.9+ 达标、SBOM 工具可用）。"
     },
     {
       "id": "vulnerability-scan",
@@ -50,7 +50,7 @@
       "status": "pending",
       "path": "services/ruoyi-api/compliance/provenance/vulnerability-scan.md",
       "requiredMarkers": ["scanner:", "database:", "findings:", "conclusion:"],
-      "howToObtain": "在离线/受控环境用漏洞扫描器扫描已锁定依赖，记录工具与规则库版本、发现项和处置结论；不得以网页检索结果充当扫描证据。"
+      "howToObtain": "在离线/受控环境用漏洞扫描器扫描已锁定依赖，记录工具与规则库版本、发现项和处置结论；不得以网页检索结果充当扫描证据。扫描前先运行 services/ruoyi-api/toolchain/check-capability.mjs 确认依赖清单与扫描器前置，未处置项不得写成已修复。"
     },
     {
       "id": "postgresql-compatibility",
@@ -58,9 +58,63 @@
       "status": "pending",
       "path": "services/ruoyi-api/compliance/provenance/postgresql-compatibility.md",
       "requiredMarkers": ["server-version:", "ddl:", "pagination:", "isolation:", "rollback:"],
-      "howToObtain": "在本地隔离 PostgreSQL 实例执行目标方言的 DDL、分页、时间、事务与回滚用例，记录结论与实例版本；未执行前保持 pending。"
+      "howToObtain": "在本地隔离 PostgreSQL 实例执行目标方言的 DDL、分页、时间、事务与回滚用例，记录结论与实例版本；未执行前保持 pending。起实例前先运行 services/ruoyi-api/toolchain/check-capability.mjs 确认 PostgreSQL 客户端或可达的容器运行时前置。"
     }
   ],
+  "capabilityAssessment": {
+    "assessedAt": "2026-10-08T21:07:00+08:00",
+    "tool": "services/ruoyi-api/toolchain/check-capability.mjs",
+    "verdict": "blocked",
+    "hardening": "探测器在独立审查（BLOCK）后加固：可用判定收紧为「定位到文件 + 退出码 0 + 输出非空且能解析出版本号形状」（不再只凭同名文件存在），含引号/控制字符/危险元字符的路径直接拒绝执行，单次探测 15 秒超时。加固后重跑结论不变：仍为 0/3 就绪，缺口与下表一致。",
+    "note": "本块只是「当前环境能否产出真实证据」的能力评估，不是证据本身，也不改变上面五项 evidence 的状态：它们仍全部为 pending。评估只做只读探测（不联网、不下依赖、不写仓库），未生成、未预填、未伪造任何证据文件。",
+    "items": [
+      {
+        "id": "sbom",
+        "status": "blocked",
+        "missing": [
+          "门禁未 admitted（gate-manifest.json stage=pre-poc-gate）：提升前禁止创建 pom.xml 与 Java 源码",
+          "services/ruoyi-api/pom.xml 不存在，没有可生成 SBOM 的 Maven 工程",
+          "PATH 上的 java 为 1.8.0_501 且未安装 Maven；只有显式 --java-home/--maven-home 才探测到 JDK 17.0.12 与 Maven 3.9.16",
+          "PATH 上未发现 cyclonedx / syft / cdxgen / jbom 任一 SBOM 工具"
+        ],
+        "nextSteps": [
+          "node services/ruoyi-api/toolchain/check-gate.mjs --java-home \"<JDK17 home>\" --maven-home \"<仓库外临时目录>/apache-maven-3.9.16\"",
+          "先在隔离环境完成准入（stage=admitted）后再创建 pom.xml",
+          "在仓库外隔离目录用 Maven CycloneDX 插件生成 SBOM，并记录工具版本、输入锁定文件与生成时间"
+        ]
+      },
+      {
+        "id": "vulnerability-scan",
+        "status": "blocked",
+        "missing": [
+          "没有可扫描的依赖清单：pom.xml 与 compliance/sbom.cyclonedx.json 均不存在",
+          "PATH 上未发现 trivy / grype / osv-scanner / dependency-check 任一扫描器，也没有本地规则库/漏洞库版本可记录"
+        ],
+        "nextSteps": [
+          "在受控环境提供扫描器并保留规则库或漏洞库版本",
+          "扫描输入必须是已锁定的依赖清单或已生成的 SBOM，不得用网页检索结果充当扫描证据",
+          "逐项记录发现项的处置结论；未处置项不得写成已修复"
+        ]
+      },
+      {
+        "id": "postgresql-compatibility",
+        "status": "blocked",
+        "missing": [
+          "PATH 上未发现 psql / pg_ctl / pg_isready，本机未安装 PostgreSQL",
+          "docker CLI 存在（29.8.0）但守护进程不可达（failed to connect to the docker API），无法拉起隔离实例"
+        ],
+        "nextSteps": [
+          "启动容器运行时后用固定小版本起隔离实例（口令用本地随机值，端口避开默认 5432）",
+          "或安装本地 PostgreSQL 并把 bin 目录加入 PATH",
+          "逐项记录 server-version、DDL、分页、隔离级别与迁移回滚的实际执行结论"
+        ]
+      }
+    ],
+    "boundaries": [
+      "本块不推进任何证据状态：五项 evidence 仍全部 pending，stage 仍为 pre-poc。",
+      "探测结论只代表本机当前环境，不代表证据已完成；结论以 check-capability.mjs 的默认模式或 --json 输出为准。"
+    ]
+  },
   "nonGoals": [
     "本清单不保存 RuoYi 源码、候选 POM 副本、依赖锁定文件或任何构建产物，只记录证据文件的位置、摘要与结论。",
     "本清单不替代准入门禁（toolchain/check-gate.mjs）、公开契约校验（contracts/validate.mjs）与人工许可证/安全评审。",

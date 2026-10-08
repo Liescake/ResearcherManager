@@ -1,10 +1,12 @@
 {
   "contract": "ruoyi-candidate-metadata",
-  "manifestVersion": "0.1.0",
+  "manifestVersion": "0.2.0",
   "status": "pending-verification",
   "frozen": false,
   "recordedAt": "2026-10-08T20:20:47+08:00",
-  "purpose": "记录 RuoYi-Vue spring-boot-3 候选仓库/分支/commit/tag 的公开元数据核验结果。候选被冻结只有一种条件：同一个提交同时满足「40 位小写 commit + 该 commit 有对应 tag + 其 POM 声明 Spring Boot 3 与 JDK 17」。截至本次核验，commit 与 POM/JDK 已核验，但该 commit 没有任何对应 tag，因此候选保持未冻结，status 恒为 pending-verification。本文件只记录观测值、摘要与核验方法，不保存 RuoYi 源码、POM 副本或构建产物，也不是工具链门禁与来源证据检查器的输入（两条闸门只读 gate-manifest.json 与 provenance-manifest.json，见 README §3.2、§4）。",
+  "lastVerifiedAt": "2026-10-08T21:07:00+08:00",
+  "verificationRounds": 2,
+  "purpose": "记录 RuoYi-Vue spring-boot-3 候选仓库/分支/commit/tag 的公开元数据核验结果，以及候选 LICENSE/NOTICE 的公开元数据与摘要。候选被冻结只有一种条件：同一个提交同时满足「40 位小写 commit + 该 commit 有对应 tag + 其 POM 声明 Spring Boot 3 与 JDK 17」。截至本次（第二轮）核验，commit 与 POM/JDK 已再次核验，但该 commit 仍然没有任何对应 tag，因此候选保持未冻结，status 恒为 pending-verification。本文件只记录观测值、摘要与核验方法，不保存 RuoYi 源码、POM 副本、LICENSE 原文或构建产物，也不是工具链门禁与来源证据检查器的输入（两条闸门只读 gate-manifest.json 与 provenance-manifest.json，见 README §3.2、§4）。",
   "candidate": {
     "project": "RuoYi-Vue",
     "line": "spring-boot-3",
@@ -37,16 +39,18 @@
         "authoredAtUtc": "2026-08-26T00:13:58Z",
         "message": "添加新群号：113071109",
         "parent": "9e3fb55f46d9998c6cecefd04fcf55c5d17158af",
-        "signed": false
+        "tree": "408ccdb2ae9879fff34501ca7b587bfb81dff7dd",
+        "signed": false,
+        "changeScope": "该提交相对父提交只改动了 README.md（1 增 1 删，群号），不改变构建配置"
       },
-      "method": "三源一致：①仓库外本地只读审计副本（浅克隆，仓库外，只读）的 .git/FETCH_HEAD 与 .git/HEAD；②Gitee API v5 分支端点；③GitHub 镜像分支端点。三处给出的 springboot3 分支头 SHA 完全相同，且都是 40 位小写十六进制。",
+      "method": "第二轮三源一致：①Gitee API v5 分支端点；②GitHub 镜像分支端点；③仓库外本地只读审计副本的 `git rev-parse HEAD`。三处给出的 springboot3 分支头 SHA 完全相同（均为 40 位小写十六进制），且与第一轮记录一致。",
       "sources": [
-        "<audit-root>/RuoYi-Vue-springboot3-current/.git/FETCH_HEAD（branch 'springboot3' of https://gitee.com/y_project/RuoYi-Vue）",
         "https://gitee.com/api/v5/repos/y_project/RuoYi-Vue/branches/springboot3",
         "https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/branches",
-        "https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/commits/a51a838b71b446ea27256900efe7ed2faa2a02fd"
+        "https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/commits/a51a838b71b446ea27256900efe7ed2faa2a02fd",
+        "<audit-root>/RuoYi-Vue-springboot3-current（只读查询 git rev-parse HEAD）"
       ],
-      "caveat": "上游提交未做 GPG 签名（GitHub 提交端点 verification.verified=false、reason=unsigned），因此本次核验只能依靠「Gitee 与 GitHub 两个主机 + 本地 FETCH_HEAD 三处一致」，不存在可验证的签名链。"
+      "caveat": "上游提交未做 GPG 签名（GitHub 提交端点 verification.verified=false、reason=unsigned），因此本次核验只能依靠「Gitee 与 GitHub 两个主机 + 本地只读副本」三处一致，不存在可验证的签名链。"
     },
     {
       "id": "commit-tag-correspondence",
@@ -56,15 +60,20 @@
         "tagsChecked": 27,
         "latestTag": "v3.9.2",
         "latestTagCommit": "0e2d75c23c0d7a1fa85f660f06a59a4dd1ba14c0",
-        "anyTagPointsAtCandidate": false
+        "anyTagPointsAtCandidate": false,
+        "anyTagPointsAtParent": false,
+        "tagTypeAll": "lightweight（Gitee 与 GitHub 两侧的 27 个 tag 都直接指向 commit，tagger 均为 null）",
+        "candidateTreeSha": "408ccdb2ae9879fff34501ca7b587bfb81dff7dd",
+        "localDescribeExactMatch": "无：`git describe --tags --exact-match HEAD` 报 no tag exactly matches",
+        "tagRelationEvidenceScope": "tag↔commit 关系只以两个公共主机的 27 条 refs 为证据。仓库外只读副本是浅克隆（is-shallow-repository=true、`rev-list --count HEAD`=1），其 `git tag --contains` 与 `merge-base` 结果不可作为 tag 关系证据，本轮未采用"
       },
-      "method": "①Gitee tags 端点（per_page=100，返回 27 个 tag：v1.0…v3.9.2）与 GitHub tags 端点逐条比对：两者 tag 名与指向的 commit 完全一致，且没有任何条目指向 a51a838b71b446ea27256900efe7ed2faa2a02fd；②仓库外只读审计副本内 `git tag --points-at HEAD` 为空，`git for-each-ref refs/tags` 的 27 条 tag 中也没有该 commit。",
+      "method": "第二轮逐条比对两个主机的 tag 清单：①Gitee tags 端点（per_page=100）返回 27 个 tag（v1.0…v3.9.2）及其 commit.sha；②GitHub git/refs/tags 端点返回同样的 27 个 refs，逐个 ref 的名称与 object.sha 与 Gitee 完全一致；③仓库外只读副本内 `git tag --points-at HEAD` 为空、`git tag` 共 27 条。候选 commit a51a838b… 及其父提交 9e3fb55f… 均不在这 27 个 tag 指向的 commit 集合中。另外，仓库外只读副本是浅克隆（`rev-list --count HEAD`=1），本地祖先/包含关系不可靠，因此本轮只把它的 27 条 refs 与两个公共主机逐条对照，不用它做可达性推断；本地 `git describe --tags --exact-match HEAD` 直接报「no tag exactly matches」，与本结论一致。",
       "sources": [
         "https://gitee.com/api/v5/repos/y_project/RuoYi-Vue/tags?per_page=100",
-        "https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/tags?per_page=100",
+        "https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/git/refs/tags",
         "<audit-root>/RuoYi-Vue-springboot3-current 内的 refs/tags（只读查询）"
       ],
-      "reason": "最新 tag v3.9.2（2026-03-26）指向 0e2d75c2…，其树包含 ruoyi-ui 前端目录且根 POM 声明 spring-boot 4.0.3；候选提交所在的 springboot3 分支树不含 ruoyi-ui，根 POM 声明 spring-boot 3.5.16。两者不是同一条线，因此 v3.9.2 不能充当候选提交的对应 tag。缺失的不只是「最新 tag」，而是「该 commit 上的任何 tag」。"
+      "reason": "最新 tag v3.9.2（2026-03-26）指向 0e2d75c2…，其根树包含 ruoyi-ui 前端目录、根 POM 的 blob 为 8123fb86…（两轮均未重新读取其内容，版本声明沿用第一轮只读审计记录）；候选提交所在的 springboot3 分支树不含 ruoyi-ui、根 POM 的 blob 为 699a3bcc…。两者根树条目不同、POM blob 不同，不是同一条线，因此 v3.9.2 不能充当候选提交的对应 tag。缺失的不只是「最新 tag」，而是「该 commit 上的任何 tag」，连父提交也没有 tag。"
     },
     {
       "id": "pom-spring-boot-and-jdk",
@@ -77,7 +86,7 @@
         "mybatisSpringBootVersion": "3.0.5",
         "druidStarter": "druid-spring-boot-3-starter"
       },
-      "method": "在仓库外只读审计副本中直接读取已提交内容（`git show HEAD:pom.xml`，不落盘、不复制进仓库），确认根 POM 声明 spring-boot.version=3.5.16 与 java.version=17；再用公共 tree 端点核对 pom.xml 的 blob 摘要一致，证明本地读取的就是该公共提交的同一份内容，无需下载源码本体。",
+      "method": "在仓库外只读审计副本中直接读取已提交内容（`git cat-file blob 699a3bcc…`，不落盘进仓库、不复制内容），确认根 POM 声明 spring-boot.version=3.5.16 与 java.version=17；本轮只用公共 tree 端点核对 pom.xml 的 blob 摘要一致，未在仓库内保留 POM 副本。",
       "sources": [
         "<audit-root>/RuoYi-Vue-springboot3-current 的 HEAD:pom.xml（只读）",
         "https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/git/trees/a51a838b71b446ea27256900efe7ed2faa2a02fd"
@@ -89,12 +98,100 @@
       "value": {
         "pomBlobSha1": "699a3bcc6a6df052525984b2a96628e3c6c5664e",
         "pomBlobSize": 8513,
+        "pomContentSha256": "16bf030a8e4c79c978bbf11eb6f6e18475771c10f4708d9e62e219480a172c9a",
         "licenseBlobSha1": "8564f294c7781cbbbdb22ae5927a96f859db0054",
-        "licenseBlobSize": 1071
+        "licenseBlobSize": 1071,
+        "licenseContentSha256": "7296da00ac5dfc56c36e6ac10ce5abdb2900898c101d5c4720d7b6c1254dd993",
+        "sha256ByteStream": "上面两个 SHA-256 都是「公共提交的 blob 字节」的摘要（LF 原样），可用 `git cat-file blob <sha> | sha256sum` 从任何克隆复现",
+        "licenseWorkingTreeSha256UnderAutocrlf": "46973d260eabeaf43df2478bf00dacf862911988eba72387596fcafbc4888cab（1090 B、19 组 CRLF；本机 core.autocrlf=true 检出后工作区文件的摘要，与 blob 摘要不同，两者不得混用）",
+        "pomWorkingTreeSha256UnderAutocrlf": "与 blob 摘要相同（8513 B）：pom.xml 对换行不敏感，两种字节流一致"
       },
-      "method": "本地 `git rev-parse HEAD:pom.xml` 与 `git rev-parse HEAD:LICENSE` 得到的 blob SHA-1，与公共 tree 端点返回的同名条目 sha/size 完全一致。这两个摘要是提交身份的锚点，只记录摘要，不记录文件内容；LICENSE 的 SPDX 标识与原文核验仍属来源证据项 license-notice，保持 pending。",
+      "method": "本轮把「公共 tree 端点给出的 blob SHA-1/size」与「仓库外只读副本取出的字节重新计算的 git blob SHA-1」做了双向核对：对 `git cat-file blob <sha>` 取出的字节按 git 对象格式（`blob <长度>\\0` + 内容）重算 SHA-1，两个文件都与公共 tree 端点完全相同，证明本地读到的就是该公共提交的同一份字节；再对同一份字节计算 SHA-256（只记录摘要，不记录内容）。",
       "sources": [
-        "https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/git/trees/a51a838b71b446ea27256900efe7ed2faa2a02fd"
+        "https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/git/trees/a51a838b71b446ea27256900efe7ed2faa2a02fd",
+        "<audit-root>/RuoYi-Vue-springboot3-current（只读 `git cat-file blob`，字节在系统临时目录内核对后删除）"
+      ]
+    },
+    {
+      "id": "license-notice-metadata",
+      "status": "verified-public-metadata",
+      "value": {
+        "spdxLicenseIdentifier": "MIT",
+        "spdxSource": "GitHub 仓库元数据 license.spdx_id（仓库级、启发式识别）",
+        "licenseFirstLine": "The MIT License (MIT)",
+        "licenseBlobSha1": "8564f294c7781cbbbdb22ae5927a96f859db0054",
+        "licenseBlobSize": 1071,
+        "licenseContentSha256": "7296da00ac5dfc56c36e6ac10ce5abdb2900898c101d5c4720d7b6c1254dd993",
+        "noticePresentAtCandidate": false,
+        "noticeCheckedScope": "整个候选提交树（334 个文件，`git ls-tree -r --name-only` 全量列出）",
+        "noticeExpectedPath": "NOTICE / NOTICE.txt / COPYING / COPYRIGHT：整个树中均不存在；唯一的许可类文件是根目录 LICENSE（全树大小写不敏感检索到的其余 “notice” 命中都是 RuoYi 业务的 SysNotice 类与映射文件，与 NOTICE 合规文件无关）",
+        "licenseByteStreamNote": "记录 SHA-256 时必须写明字节流：公共提交 blob 字节（LF、1071 B）为 7296da00…，而 core.autocrlf=true 的工作区检出（CRLF、1090 B）为 46973d26…；本文件两个值都记录，引用时以其一为准并注明来源"
+      },
+      "method": "只取公开元数据与摘要，不复制原文：①公共 tree 端点列出候选 commit 根树，确认存在 LICENSE（blob 8564f294…，size 1071）；②再在仓库外只读副本里对同一提交做全树列举（`git ls-tree -r --name-only`，334 个文件），确认整个树中没有任何 NOTICE/COPYING/COPYRIGHT 类文件；③GitHub 仓库端点给出 license.spdx_id=MIT；④只读副本中读取 LICENSE 首行（仅首行，用于标识）并按 git 对象格式重算 blob SHA-1，与公共 tree 端点一致；⑤对同一份字节（blob 字节，LF）计算 SHA-256，并另测工作区检出（core.autocrlf=true 的 CRLF 字节）的 SHA-256，两者一并记录以避免字节流混用。",
+      "sources": [
+        "https://api.github.com/repos/yangzongzhuan/RuoYi-Vue",
+        "https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/git/trees/a51a838b71b446ea27256900efe7ed2faa2a02fd",
+        "<audit-root>/RuoYi-Vue-springboot3-current（只读 `git cat-file blob 8564f294…` 与首行读取）"
+      ],
+      "caveat": "只覆盖「公开元数据 + 字节摘要 + NOTICE 存在性」。GitHub 的 license 字段是启发式识别，不能替代人工逐条复核原文；原文副本（compliance/LICENSE、compliance/NOTICE）与再分发说明尚未登记，因此 provenance 证据 license-notice 保持 pending，本轮不推进其状态。另需注意：本机克隆 core.autocrlf=true，LICENSE 的工作区文件是 CRLF（1090 B，SHA-256 46973d26…），与公共提交 blob 字节（LF，1071 B，7296da00…）不同——将来登记 license-file-sha256 时必须写明采用哪一种字节流，否则可从公共提交复现的只有 blob 那一份摘要。",
+      "notClaimed": [
+        "未把 LICENSE 原文、NOTICE 内容或任何 RuoYi 文件复制进本仓库",
+        "不声明许可证/NOTICE 证据已就位，也不声明依赖许可证清单已核验"
+      ]
+    },
+    {
+      "id": "evidence-generation-capability",
+      "status": "blocked",
+      "value": {
+        "probeTool": "services/ruoyi-api/toolchain/check-capability.mjs",
+        "verdict": "blocked（0/3 项能力就绪）",
+        "items": [
+          {
+            "id": "sbom",
+            "status": "blocked",
+            "reasons": [
+              "gate-manifest.json 的 stage 仍为 pre-poc-gate：门禁提升前禁止创建 pom.xml，没有可生成 SBOM 的 Maven 工程",
+              "services/ruoyi-api/pom.xml 不存在",
+              "PATH 上的 java 为 1.8.0_501、且 PATH 上没有 Maven；只有用显式 --java-home/--maven-home 才探测到 JDK 17.0.12 与 Maven 3.9.16（探针已在本轮复核达标）",
+              "PATH 上未发现 cyclonedx / syft / cdxgen / jbom 任一 SBOM 工具"
+            ]
+          },
+          {
+            "id": "vulnerability-scan",
+            "status": "blocked",
+            "reasons": [
+              "没有可扫描的依赖清单：pom.xml 与 compliance/sbom.cyclonedx.json 均不存在",
+              "PATH 上未发现 trivy / grype / osv-scanner / dependency-check 任一扫描器，也没有本地漏洞库/规则库版本可记录"
+            ]
+          },
+          {
+            "id": "postgresql-compatibility",
+            "status": "blocked",
+            "reasons": [
+              "PATH 上未发现 psql / pg_ctl / pg_isready，本机未安装 PostgreSQL（无 PostgreSQL 服务，Program Files 下无 PostgreSQL 目录）",
+              "docker CLI 存在（29.8.0）但守护进程不可达：failed to connect to the docker API at npipe:////./pipe/dockerDesktopLinuxEngine（Docker Desktop 未运行），因此无法拉起隔离实例"
+            ]
+          }
+        ],
+        "environmentFacts": {
+          "jdkOnPath": "1.8.0_501（不达标）",
+          "jdkExplicit": "17.0.12（C:\\Program Files\\Java\\jdk-17，达标）",
+          "mavenOnPath": "未安装（未找到 mvn）",
+          "mavenExplicit": "3.9.16（由仓库根 apache-maven-3.9.16-bin.zip 只读解压到仓库外系统临时目录后探测，达标；压缩包解压前后 SHA-256 均为 5af3b743dd8b876b5c45da33b676251e5f1687712644abb4ee519ca56e1d89ce）",
+          "postgresTools": "未安装",
+          "docker": "CLI 29.8.0 存在，守护进程不可达",
+          "processEgress": "本会话实测：node 的 fetch 可访问 registry.npmjs.org / repo.maven.apache.org / github.com（HTTP 200），而同一环境的 curl.exe（HTTP 000）与 Invoke-RestMethod（TLS 失败）不可用；这只说明「取包与取插件在 node 侧可行」，不代表可以跳过门禁去建 Maven 工程"
+        }
+      },
+      "method": "运行 services/ruoyi-api/toolchain/check-capability.mjs（只读、只用 node 内置模块、不联网、不下依赖），默认探测取得「三项能力全部被阻断」；再用 --java-home/--maven-home 复核工具链前置可达标（build-toolchain=ok），其余前置仍不足。该探测器在独立审查（BLOCK）后加固——可用判定要求「定位到文件 + 退出码 0 + 输出非空且能解析出版本号形状」、拒绝含引号/控制字符/危险元字符的路径、单次探测 15 秒超时——加固后重跑，本观测的三项结论与缺口均未变化。",
+      "sources": [
+        "node services/ruoyi-api/toolchain/check-capability.mjs --report",
+        "node services/ruoyi-api/toolchain/check-capability.mjs --java-home \"C:\\Program Files\\Java\\jdk-17\" --maven-home \"<仓库外临时目录>/apache-maven-3.9.16\""
+      ],
+      "caveat": "这是能力评估，不是证据：SBOM、漏洞扫描与 PostgreSQL 兼容性的 evidence 仍全部为 pending，本轮没有生成任何证据文件，也没有把网页检索结果当作证据。",
+      "notClaimed": [
+        "不声明已生成 SBOM、已完成漏洞扫描或在 PostgreSQL 上验证过任何行为",
+        "不声明可以被绕过门禁创建 Maven 工程：仍然要先把 stage 提升为 admitted"
       ]
     }
   ],
@@ -107,17 +204,18 @@
     },
     "outcome": "unfrozen",
     "reasons": [
-      "candidate-tag: springboot3 分支头提交没有任何对应 tag；最新 tag v3.9.2 属于另一条线（树含 ruoyi-ui、根 POM 为 spring-boot 4.0.3）",
+      "candidate-tag：springboot3 分支头提交及其父提交都没有任何对应 tag；最新 tag v3.9.2 属于另一条线（根树含 ruoyi-ui、根 POM blob 为 8123fb86…，与候选的 699a3bcc… 不同）",
       "冻结后必须能同时给出 tag，而门禁清单的 candidate.pinned 规则禁止「固定 commit 却不固定 tag」（README §3.2）"
     ],
     "unchanged": [
       "services/ruoyi-api/toolchain/gate-manifest.json：candidate.pinned.tag=null、commit=null、resolved=false、stage=pre-poc-gate，未改动",
-      "services/ruoyi-api/toolchain/provenance-manifest.json：candidate.tag=null、commit=null、resolved=false、stage=pre-poc，未改动",
+      "services/ruoyi-api/toolchain/provenance-manifest.json：candidate.tag=null、commit=null、resolved=false、stage=pre-poc、五项证据全部 pending，未改动（只新增能力评估块）",
       "准入前置 candidate-commit 仍为 pending：该前置把 commit、tag 与 POM/JDK 三项绑在一起，缺 tag 即整体未满足"
     ],
     "notClaimed": [
-      "不声明候选已固定、不声明许可证/NOTICE、SBOM、漏洞或 PostgreSQL 兼容性证据已收集",
-      "不声明可构建、可运行或生产就绪；本次未创建 pom.xml 或任何 Java 源码，也未把 Maven 压缩包入库"
+      "不声明候选已固定，不声明许可证/NOTICE、SBOM、漏洞或 PostgreSQL 兼容性证据已收集",
+      "不声明可构建、可运行或生产就绪；本次未创建 pom.xml 或任何 Java 源码，也未把 Maven 压缩包入库",
+      "不声明「已核验许可证原文」：本轮只核验公开元数据、blob 摘要与 NOTICE 存在性"
     ]
   },
   "reproduce": [
@@ -136,32 +234,58 @@
     {
       "step": 3,
       "title": "核验「对应 tag」是否成立（本候选的关键缺口）",
-      "command": "curl -s \"https://gitee.com/api/v5/repos/y_project/RuoYi-Vue/tags?per_page=100\"",
-      "expect": "返回 v1.0…v3.9.2 共 27 个 tag，逐个比对 commit.sha：没有任何一个等于 a51a838b…；最新的 v3.9.2 指向 0e2d75c2…。GitHub 镜像的 tags 端点结果相同"
+      "command": "curl -s \"https://gitee.com/api/v5/repos/y_project/RuoYi-Vue/tags?per_page=100\"; curl -s https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/git/refs/tags",
+      "expect": "两侧各返回 v1.0…v3.9.2 共 27 个 tag，名称与指向的 commit 逐一相同，且没有任何一个等于 a51a838b…（也不等于父提交 9e3fb55f…）；最新的 v3.9.2 指向 0e2d75c2…"
     },
     {
       "step": 4,
-      "title": "核验 POM/JDK 且不下载源码本体",
-      "command": "curl -s https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/git/trees/a51a838b71b446ea27256900efe7ed2faa2a02fd",
-      "expect": "pom.xml 条目 sha=699a3bcc6a6df052525984b2a96628e3c6c5664e（size=8513）、LICENSE 条目 sha=8564f294c7781cbbbdb22ae5927a96f859db0054（size=1071）；如需读 POM 内容，必须在仓库外的审计目录内只读进行（见步骤 5），不得复制进本仓库"
+      "title": "核对两条线不是同一条（根树与 POM blob 不同）",
+      "command": "curl -s https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/git/trees/a51a838b71b446ea27256900efe7ed2faa2a02fd; curl -s https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/git/trees/0e2d75c23c0d7a1fa85f660f06a59a4dd1ba14c0",
+      "expect": "候选树含 ruoyi-admin/ruoyi-common/…/pom.xml(699a3bcc…) 但不含 ruoyi-ui；v3.9.2 树额外含 ruoyi-ui，且 pom.xml blob 为 8123fb86…"
     },
     {
       "step": 5,
-      "title": "复用仓库外只读审计副本（本机为 D:\\ruoyi-audit\\RuoYi-Vue-springboot3-current）",
-      "command": "git -C <audit-root>/RuoYi-Vue-springboot3-current rev-parse HEAD; git -C <audit-root>/RuoYi-Vue-springboot3-current rev-parse HEAD:pom.xml; git -C <audit-root>/RuoYi-Vue-springboot3-current show HEAD:pom.xml | Select-String 'java.version|spring-boot.version'; git -C <audit-root>/RuoYi-Vue-springboot3-current tag --points-at HEAD",
-      "expect": "HEAD=a51a838b…；HEAD:pom.xml=699a3bcc…；committed POM 行为 <java.version>17</java.version> 与 <spring-boot.version>3.5.16</spring-boot.version>；`tag --points-at HEAD` 输出为空"
+      "title": "核验 POM/JDK 与许可证摘要且不下载源码本体",
+      "command": "curl -s https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/git/trees/a51a838b71b446ea27256900efe7ed2faa2a02fd",
+      "expect": "pom.xml 条目 sha=699a3bcc6a6df052525984b2a96628e3c6c5664e（size=8513）、LICENSE 条目 sha=8564f294c7781cbbbdb22ae5927a96f859db0054（size=1071），根树中不存在 NOTICE；如需读 POM 内容，必须在仓库外的审计目录内只读进行（见步骤 6），不得复制进本仓库"
     },
     {
       "step": 6,
+      "title": "复用仓库外只读审计副本（本机为 D:\\ruoyi-audit\\RuoYi-Vue-springboot3-current）",
+      "command": "git -C <audit-root>/RuoYi-Vue-springboot3-current rev-parse HEAD; git -C <audit-root>/RuoYi-Vue-springboot3-current show HEAD:pom.xml | Select-String 'java.version|spring-boot.version'; git -C <audit-root>/RuoYi-Vue-springboot3-current tag --points-at HEAD",
+      "expect": "HEAD=a51a838b…；committed POM 行为 <java.version>17</java.version> 与 <spring-boot.version>3.5.16</spring-boot.version>；`tag --points-at HEAD` 输出为空"
+    },
+    {
+      "step": 7,
+      "title": "复算 LICENSE/POM 的字节摘要（证明读到的就是该公共提交的同一份字节）",
+      "command": "git -C <audit-root>/RuoYi-Vue-springboot3-current cat-file blob 8564f294c7781cbbbdb22ae5927a96f859db0054 > %TEMP%\\license.blob; node -e \"const fs=require('fs'),c=require('crypto');const b=fs.readFileSync(process.env.TEMP+'/license.blob');console.log(c.createHash('sha1').update(Buffer.concat([Buffer.from('blob '+b.length+String.fromCharCode(0)),b])).digest('hex'),c.createHash('sha256').update(b).digest('hex'))\"",
+      "expect": "重算的 git blob SHA-1 与公共 tree 端点一致（8564f294…），SHA-256 为 7296da00ac5dfc56c36e6ac10ce5abdb2900898c101d5c4720d7b6c1254dd993；对 pom.xml（blob 699a3bcc…）同理，SHA-256 为 16bf030a8e4c79c978bbf11eb6f6e18475771c10f4708d9e62e219480a172c9a。注意字节流：同一 LICENSE 在工作区检出（core.autocrlf=true，CRLF、1090 B）的 SHA-256 是 46973d26…，与 blob 字节不同，登记证据时必须写明采用哪一种。临时字节文件不得留在本仓库"
+    },
+    {
+      "step": 8,
+      "title": "核验 NOTICE 全树存在性，并界定 tag 关系的证据范围",
+      "command": "git -C <audit-root>/RuoYi-Vue-springboot3-current ls-tree -r --name-only HEAD | Select-String -Pattern 'NOTICE|COPYING|COPYRIGHT|LICENSE'; git -C <audit-root>/RuoYi-Vue-springboot3-current rev-parse --is-shallow-repository; git -C <audit-root>/RuoYi-Vue-springboot3-current describe --tags --exact-match HEAD",
+      "expect": "全树 334 个文件中许可类文件只有根 LICENSE（大小写不敏感检索到的其余 “notice” 命中都是 SysNotice 业务类）；`--is-shallow-repository` 输出 true（浅克隆，本地祖先/包含关系不作为 tag 关系证据），`describe --tags --exact-match HEAD` 报 no tag exactly matches —— tag 关系以两个公共主机的 27 条 refs 为唯一证据"
+    },
+    {
+      "step": 9,
+      "title": "复核当前环境能否产出真实证据（SBOM / 漏洞扫描 / PostgreSQL）",
+      "command": "node services/ruoyi-api/toolchain/check-capability.mjs --report; node services/ruoyi-api/toolchain/check-capability.mjs --java-home \"C:\\Program Files\\Java\\jdk-17\" --maven-home \"<仓库外临时目录>/apache-maven-3.9.16\"",
+      "expect": "默认探测三项能力全部被阻断（退出码 2），逐项列出缺失的工具与前置；带显式工具链参数时 build-toolchain 前置变为 ok，但门禁未 admitted、无 pom.xml、无扫描器/PostgreSQL 运行时，结论仍是 0/3 就绪"
+    },
+    {
+      "step": 10,
       "title": "复核两条闸门仍是未准入/未就绪（本文件不参与判定）",
       "command": "node services/ruoyi-api/toolchain/check-gate.mjs --report; node services/ruoyi-api/toolchain/check-provenance.mjs --report",
       "expect": "两份报告都保持阻断：候选未冻结、准入前置未满足、五项证据仍 pending；两条闸门都不读本文件，判定不因本文件而放宽"
     }
   ],
   "boundaries": [
-    "本次未下载、未解包、未复制 RuoYi 源码或 POM 内容进本仓库；仓库外只读审计副本不属于本仓库产物。",
-    "本次未创建 pom.xml、Maven 包装脚本或任何 Java/Kotlin 源码；本地 Maven 压缩包（apache-maven-3.9.16-bin.zip）保持只读且不入库。",
-    "本文件只记录公开可复核的元数据、blob 摘要与核验方法，不替代真实 POC 前的许可证/NOTICE、SBOM、漏洞扫描、PostgreSQL 兼容性与独立安全评审。",
-    "本文件不是 gate-manifest.json 或 provenance-manifest.json 的替代或预填：两条闸门不读它，候选固定值仍以门禁清单为准。"
+    "本次未下载、未解包、未复制 RuoYi 源码、POM 内容或 LICENSE 原文进本仓库；仓库外只读审计副本与系统临时目录中的核对字节不属于本仓库产物。",
+    "本次未创建 pom.xml、Maven 包装脚本或任何 Java/Kotlin 源码；本地 Maven 压缩包（apache-maven-3.9.16-bin.zip）保持只读、不入库，解压只发生在仓库外系统临时目录，解压前后其 SHA-256 不变。",
+    "本文件只记录公开可复核的元数据、blob 摘要与核验方法，不替代真实 POC 前的许可证/NOTICE 原文复核、SBOM、漏洞扫描、PostgreSQL 兼容性与独立安全评审。",
+    "本文件不是 gate-manifest.json 或 provenance-manifest.json 的替代或预填：两条闸门不读它，候选固定值仍以门禁清单为准；能力评估结论也不是证据。",
+    "仓库外只读审计副本是浅克隆（depth=1），因此本文件不用它的 `git tag --contains` / `merge-base` 结果推断 tag 关系；tag 关系只以两个公共主机的 refs 为证据，浅克隆只用于读取该提交自身的字节与全树清单。",
+    "本文件记录的 SHA-256 明确区分字节流：默认指公共提交的 blob 字节；core.autocrlf=true 的工作区检出字节另记一值，两者不混用、不互相替代。"
   ]
 }

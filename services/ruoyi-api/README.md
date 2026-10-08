@@ -13,6 +13,7 @@
 - 目标数据库：PostgreSQL（必须先完成方言和迁移验证）
 - 本机工具链实测（2026-10-08，可复现，详见 `toolchain/README.md` §5.2）：JDK 17.0.12 与 Maven 3.9.16 在**显式探测路径**下达标——JDK 用 `--java-home` 指向 `C:\Program Files\Java\jdk-17`，Maven 用 `--maven-home` 指向仓库外系统临时目录中的解压结果（压缩包 `apache-maven-3.9.16-bin.zip` 只读、不入库，解压只在仓库外）。不带显式参数时，PATH 上的 `java` 仍是 1.8.0_501 且系统未安装 Maven，因此默认运行按设计返回未准入。
 - 工具链就绪**不等于**准入：准入前置当前只有 2/10 满足，候选 commit 未冻结，五项合规产物全部 `pending`，`stage` 仍为 `pre-poc-gate`。因此当前目录不包含 `pom.xml`，也不声明可构建。可用 `toolchain/check-gate.mjs` 随时复核（见下节）。
+- 证据生成能力（2026-10-08 实测）：SBOM、漏洞扫描与 PostgreSQL 兼容性三项**当前都无法在本机产出真实证据**——门禁未 `admitted` 且 `pom.xml` 不存在、PATH 上没有 SBOM 工具与漏洞扫描器、本机未安装 PostgreSQL 且容器运行时守护进程不可达。能力探测与可复现步骤见 `toolchain/check-capability.mjs` 与 `toolchain/README.md` §11；能力评估不是证据，五项来源/合规证据仍全部 `pending`。
 - RuoYi 候选源码位于仓库外审计目录，不属于本目录和本仓库。
 
 ## POC 范围（后续实现）
@@ -69,6 +70,21 @@ node services/ruoyi-api/toolchain/check-provenance.mjs
 node services/ruoyi-api/toolchain/check-provenance.mjs --self-test
 ```
 
+同一目录下的能力探测器（`check-capability.mjs`）回答第三个问题：本机是否具备产出 SBOM、漏洞扫描与 PostgreSQL 兼容性证据的前置。它只做只读探测（不联网、不下依赖、不写仓库、不生成任何证据），被阻断时打印可复现的下一步：
+
+```bash
+# 默认探测：当前三项能力全部被阻断（退出码 2）
+node services/ruoyi-api/toolchain/check-capability.mjs
+
+# 显式工具链探测（build-toolchain 前置达标），以及判定规则自检
+node services/ruoyi-api/toolchain/check-capability.mjs \
+  --java-home "C:\Program Files\Java\jdk-17" \
+  --maven-home "<仓库外临时目录>/apache-maven-3.9.16"
+node services/ruoyi-api/toolchain/check-capability.mjs --self-test
+```
+
+能力口径、本机实测与复现方式见 `toolchain/README.md` §11。
+
 `poc-ready` 阶段要求五项证据全部 `verified` 且证据文件存在、摘要与内容标记匹配，候选已冻结且门禁已 `admitted`；任何「先写 verified 再补文件」或「先把阶段改到 poc-ready」都会被判违规（退出码 1），而不是未就绪。语义与状态阶梯见 `toolchain/README.md` §4。
 
 ## 保留的现有边界
@@ -91,14 +107,14 @@ node services/ruoyi-api/toolchain/check-provenance.mjs --self-test
 创建 `pom.xml` 和 Java 源码前，必须按 `toolchain/gate-manifest.json` 的 `candidate.admissionSteps` 逐项完成（步骤与前置的机器约束、每步的验收证据见 `toolchain/README.md` §3.3–§3.4）：
 
 1. **复现工具链**：用显式 `--java-home` / `--maven-home` 复现 JDK 17+ 与 Maven 3.9+ 探测（已完成，见「当前环境门禁」）。
-2. **固定候选**：固定实际 Spring Boot 3 候选 commit（40 位 SHA）并同时固定 tag，核对其 POM 与 JDK 要求。**当前状态：部分完成**——`springboot3` 分支头 `a51a838b71b446ea27256900efe7ed2faa2a02fd` 与其 POM（spring-boot 3.5.16 / JDK 17）已核验，但该提交没有任何对应 tag，故候选保持未冻结（核验记录与复现步骤见 `toolchain/candidate-metadata.json` 与 `toolchain/README.md` §10）。
-3. **许可证与 NOTICE**：保留候选原始 LICENSE/NOTICE 原文与哈希证据。
+2. **固定候选**：固定实际 Spring Boot 3 候选 commit（40 位 SHA）并同时固定 tag，核对其 POM 与 JDK 要求。**当前状态：部分完成**——`springboot3` 分支头 `a51a838b71b446ea27256900efe7ed2faa2a02fd` 与其 POM（spring-boot 3.5.16 / JDK 17）已核验，但第二轮复核确认 Gitee 与 GitHub 两侧各 27 个 tag（`v1.0`…`v3.9.2`）**无一指向该提交，连其父提交 `9e3fb55f…` 也没有**，故候选保持未冻结（核验记录与复现步骤见 `toolchain/candidate-metadata.json` 与 `toolchain/README.md` §10）。
+3. **许可证与 NOTICE**：保留候选原始 LICENSE/NOTICE 原文与哈希证据。**当前状态：公开元数据已核验，证据仍未就位**——候选 commit 的 LICENSE 为 MIT（blob `8564f294c7781cbbbdb22ae5927a96f859db0054`、字节 SHA-256 `7296da00…`），根树中**不存在 NOTICE**；原文副本与再分发说明尚未登记，`provenance` 证据 `license-notice` 保持 `pending`（见 `toolchain/README.md` §10.2）。
 4. **依赖清单与 SBOM**：在隔离目录生成依赖树、传递依赖许可证清单与 SBOM（记录工具、版本、生成时间）。
 5. **漏洞扫描**：完成依赖漏洞扫描并逐项记录处置结论（含扫描工具与规则版本）。
 6. **PostgreSQL 验证**：在隔离 PostgreSQL 实例中验证 DDL、分页、时间、事务、索引和迁移回滚。
 7. **独立审查**：完成架构/安全独立审查与终审并保留放行结论（实施方不自证）。
 8. **门禁提升**：全部前置 `satisfied` 且合规产物就位后，才把 `stage` 提升为 `admitted`；同时把五项来源/合规证据推进到 `verified`（证据文件存在、摘要与内容标记匹配、带核验时间与署名），再把 `provenance-manifest.json` 的 `stage` 提升为 `poc-ready`。
 
-第 2 步部分完成（commit 与 POM/JDK 已核验，对应 tag 无法确认 → 候选未冻结，见 `toolchain/candidate-metadata.json`）；第 3–7 步尚未开始；许可证/NOTICE、SBOM、漏洞与 PostgreSQL 证据一律保持 `pending`，不预填、不推测。
+第 2 步部分完成（commit 与 POM/JDK 已第二轮核验，对应 tag 无法确认 → 候选未冻结，见 `toolchain/candidate-metadata.json`）；第 3 步的公开元数据与摘要已核验，但原文副本与再分发说明未登记，证据仍为 `pending`；第 4–7 步尚未开始，且 2026-10-08 的能力探测确认 SBOM、漏洞扫描与 PostgreSQL 三项证据当前均无法在本机产出（缺前置工具，见 `toolchain/README.md` §11）。许可证/NOTICE、SBOM、漏洞与 PostgreSQL 证据一律保持 `pending`，不预填、不推测，工具不可用时只记录公开的待办与可复现步骤。
 
 本目录当前是隔离 POC 入口，不代表 RuoYi 已采用或迁移已完成。
