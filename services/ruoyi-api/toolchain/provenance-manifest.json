@@ -34,7 +34,7 @@
       "status": "pending",
       "path": "services/ruoyi-api/compliance/provenance/license-notice.md",
       "requiredMarkers": ["spdx-license-identifier:", "license-file-sha256:", "notice:"],
-      "howToObtain": "只用公开仓库 API/网页元数据即可复现摘要，不需要把上游原文带进本仓库：①公共递归 tree 端点（`https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/git/trees/a51a838b71b446ea27256900efe7ed2faa2a02fd?recursive=1`，truncated=false）统计全树 477 个条目 / 334 个 blob，并按精确文件名确认许可类文件只有根 `LICENSE`（`NOTICE`/`NOTICE.txt`/`COPYING`/`COPYRIGHT` 均不存在；含 “notice” 的 11 条路径逐条核对都是 RuoYi 业务类）；②blob 端点 `git/blobs/8564f294c7781cbbbdb22ae5927a96f859db0054` 取回 base64 字节，在内存中解码后按 git 对象格式（`blob <长度>\\0` + 内容）重算 blob SHA-1（与 tree 端点一致，证明是同一份字节）并计算 SHA-256，字节不落盘；③许可证类型用仓库端点 `license.spdx_id` 与该提交的单文件 license 端点（`?ref=<commit>`，path=LICENSE、sha=8564f294…）交叉印证，得到 MIT；④在 Gitee 主仓库用 `contents/LICENSE?ref=springboot3` 与递归 tree 端点交叉核验同一 blob 与同一棵树；⑤在 Gitee 网页 raw 端点 `https://gitee.com/y_project/RuoYi-Vue/raw/springboot3/LICENSE`（本机可达）取回同一份 1071 B 字节，内存计算 SHA-256 与 GitHub API blob 端点逐字节一致——两个独立主机各自的字节复现同一摘要。复现命令与实测输出见 `candidate-metadata.json` 的 `reproduce` 第 6–8 步（本机 curl 与 Invoke-RestMethod 不可用，命令写成 `node -e`；GitHub raw 的 raw.githubusercontent.com 在本机 DNS 不可解析，取字节以 GitHub API blob 端点与 Gitee 网页 raw 端点为准）。记录 sha256 时必须写明字节流：公共提交 blob 字节（LF、1071 B）为 7296da00…，core.autocrlf=true 的工作区检出（CRLF、1090 B）为 46973d26…，两者不得混用。**该项保持 pending**：证据项要求原文证据与再分发说明，而本仓库明确不保存上游原文副本（准入门禁的合规产物 `services/ruoyi-api/compliance/LICENSE` 因此无法登记），且 verified 还要求核验署名并与门禁候选固定值交叉核验（当前候选未冻结）；理由与解除条件见 `toolchain/README.md` §10.3。"
+      "howToObtain": "只用公开仓库 API/网页元数据即可复现摘要，不需要把上游原文带进本仓库：①公共递归 tree 端点（`https://api.github.com/repos/yangzongzhuan/RuoYi-Vue/git/trees/a51a838b71b446ea27256900efe7ed2faa2a02fd?recursive=1`，truncated=false）统计全树 477 个条目 / 334 个 blob，并按精确文件名确认许可类文件只有根 `LICENSE`（`NOTICE`/`NOTICE.txt`/`COPYING`/`COPYRIGHT` 均不存在；含 “notice” 的 11 条路径逐条核对都是 RuoYi 业务类）；②blob 端点 `git/blobs/8564f294c7781cbbbdb22ae5927a96f859db0054` 取回 base64 字节，在内存中解码后按 git 对象格式（`blob <长度>\\0` + 内容）重算 blob SHA-1（与 tree 端点一致，证明是同一份字节）并计算 SHA-256，字节不落盘；③许可证类型用仓库端点 `license.spdx_id` 与该提交的单文件 license 端点（`?ref=<commit>`，path=LICENSE、sha=8564f294…）交叉印证，得到 MIT；④在 Gitee 主仓库用 `contents/LICENSE?ref=springboot3` 与递归 tree 端点交叉核验同一 blob 与同一棵树；⑤在 Gitee 网页 raw 端点 `https://gitee.com/y_project/RuoYi-Vue/raw/springboot3/LICENSE`（本机可达）取回同一份 1071 B 字节，内存计算 SHA-256 与 GitHub API blob 端点逐字节一致——两个独立主机各自的字节复现同一摘要。复现命令与实测输出见 `candidate-metadata.json` 的 `reproduce` 第 6–8 步（本机 curl 与 Invoke-RestMethod 不可用，命令写成 `node -e`；GitHub raw 的 raw.githubusercontent.com 在本机 DNS 不可解析，取字节以 GitHub API blob 端点与 Gitee 网页 raw 端点为准）。记录 sha256 时必须写明字节流：公共提交 blob 字节（LF、1071 B）为 7296da00…，core.autocrlf=true 的工作区检出（CRLF、1090 B）为 46973d26…，两者不得混用。**该项保持 pending**：证据项要求原文证据与再分发说明，而本仓库明确不保存上游原文副本（准入门禁的合规产物 `services/ruoyi-api/compliance/LICENSE` 因此无法登记），且 verified 还要求核验署名并与门禁候选固定值交叉核验（当前候选未冻结）；理由与解除条件见 `toolchain/README.md` §10.3。NOTICE 的处置口径已记录为 absent-upstream（上游整个提交树不存在 NOTICE）与 not-applicable（没有第三方 NOTICE 需要再分发）：这只是观测口径，**不改变本项状态**——`license-notice` 仍为 pending，直到仓库外受控目录的 LICENSE 原文证据与非实施方的独立复核署名完成。"
     },
     {
       "id": "sbom",
@@ -42,7 +42,7 @@
       "status": "pending",
       "path": "services/ruoyi-api/compliance/provenance/sbom.cyclonedx.json",
       "requiredMarkers": ["bomFormat", "specVersion", "components"],
-      "howToObtain": "在门禁通过、Maven 工程建立后用 SBOM 工具对已锁定依赖生成 CycloneDX 文件；证据文件本身即 SBOM，不得手写伪造组件列表。生成前先运行 services/ruoyi-api/toolchain/check-capability.mjs 复核前置（门禁 admitted、pom.xml 就位、JDK 17+/Maven 3.9+ 达标、SBOM 工具可用）。"
+      "howToObtain": "**先在仓库外生成，再按此唯一路径回填**：在仓库之外的固定 commit 检出上（用 `check-capability.mjs --audit-root <检出> --audit-commit <40 位 SHA>` 先核验前置；生成物写到检出目录之外，使检出保持干净）用 SBOM 工具对已锁定依赖生成 CycloneDX 文件，再把生成的字节回填到本路径。证据文件本身即 SBOM，不得手写伪造组件列表，也不得由仓库内脚本生成或预填。`gate-manifest.json` 的 `complianceArtifacts[sbom].path` 与本字段指向同一路径（已统一）。仓库内准入（`stage=admitted` 与创建 `pom.xml`）排在真实证据就位之后，不是生成 SBOM 的前提。"
     },
     {
       "id": "vulnerability-scan",
@@ -50,7 +50,7 @@
       "status": "pending",
       "path": "services/ruoyi-api/compliance/provenance/vulnerability-scan.md",
       "requiredMarkers": ["scanner:", "database:", "findings:", "conclusion:"],
-      "howToObtain": "在离线/受控环境用漏洞扫描器扫描已锁定依赖，记录工具与规则库版本、发现项和处置结论；不得以网页检索结果充当扫描证据。扫描前先运行 services/ruoyi-api/toolchain/check-capability.mjs 确认依赖清单与扫描器前置，未处置项不得写成已修复。"
+      "howToObtain": "在离线/受控环境用漏洞扫描器扫描已锁定依赖，记录工具与规则库版本、发现项和处置结论；不得以网页检索结果充当扫描证据。扫描前先运行 services/ruoyi-api/toolchain/check-capability.mjs 确认依赖清单与扫描器前置，未处置项不得写成已修复。**生成顺序**：先在仓库之外的固定 commit 检出上扫描（用 `--audit-root <检出> --audit-commit <40 位 SHA>` 核验前置；生成物写到检出目录之外，使检出保持干净），再把结果回填到本路径；仓库内准入（`stage=admitted`）排在真实证据就位之后，不是生成扫描证据的前提。"
     },
     {
       "id": "postgresql-compatibility",
@@ -58,7 +58,7 @@
       "status": "pending",
       "path": "services/ruoyi-api/compliance/provenance/postgresql-compatibility.md",
       "requiredMarkers": ["server-version:", "ddl:", "pagination:", "isolation:", "rollback:"],
-      "howToObtain": "在本地隔离 PostgreSQL 实例执行目标方言的 DDL、分页、时间、事务与回滚用例，记录结论与实例版本；未执行前保持 pending。起实例前先运行 services/ruoyi-api/toolchain/check-capability.mjs 确认 PostgreSQL 客户端或可达的容器运行时前置。"
+      "howToObtain": "在本地隔离 PostgreSQL 实例执行目标方言的 DDL、分页、时间、事务与回滚用例，记录结论与实例版本；未执行前保持 pending。起实例前先运行 services/ruoyi-api/toolchain/check-capability.mjs 确认 PostgreSQL 客户端或可达的容器运行时前置。**生成顺序**：验证在仓库外进行（用 `--audit-root <检出> --audit-commit <40 位 SHA>` 核验固定 commit 检出；实例与记录都放在仓库之外），再把结论回填到本路径；仓库内准入（`stage=admitted`）排在真实证据就位之后，不是生成该证据的前提。"
     }
   ],
   "capabilityAssessment": {

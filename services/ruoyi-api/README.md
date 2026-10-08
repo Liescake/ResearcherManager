@@ -85,6 +85,21 @@ node services/ruoyi-api/toolchain/check-capability.mjs --self-test
 
 能力口径、本机实测与复现方式见 `toolchain/README.md` §11。
 
+### 仓库外证据先行（外部审计模式）
+
+推进顺序固定且不可颠倒：**先在仓库之外的固定 commit 检出上产出真实证据（许可证/NOTICE、SBOM、漏洞扫描、PostgreSQL 兼容性），按唯一路径回填到 `compliance/provenance/` 并由 `check-provenance.mjs` 判到 `verified`，之后才考虑仓库内准入（`stage=admitted`）与创建 `pom.xml`/Java 源码。** 仓库内准入不是生成证据的前提；恰恰相反，先有仓库外真实证据，仓库内准入才有依据。
+
+`check-capability.mjs` 的外部审计模式只核验这份仓库外检出**当前是否具备开始生成证据的前置**：它不生成、不复制、不预填任何证据，不推进任何状态，也不读取仓库内 `gate-manifest.json`（因此 `stage=admitted` 不会改变它的判定）；报告里 `admitted` 与 `verified` 恒为 `false`，verdict 只有 `external-audit-ready` 与 `blocked` 两个取值。
+
+```bash
+# 仓库外固定 commit 检出的只读前置核验（本机实测 verdict=external-audit-ready，退出码 0）
+node services/ruoyi-api/toolchain/check-capability.mjs \
+  --audit-root "D:\ruoyi-audit\RuoYi-Vue-springboot3-current" \
+  --audit-commit a51a838b71b446ea27256900efe7ed2faa2a02fd
+```
+
+统一后的证据目标路径**只允许由真实外部审计产物回填**（不得手写、不得由仓库内脚本生成或预填）：SBOM → `services/ruoyi-api/compliance/provenance/sbom.cyclonedx.json`（与 `gate-manifest.json` 的 `complianceArtifacts[sbom]` 已是同一路径）；漏洞扫描 → `services/ruoyi-api/compliance/provenance/vulnerability-scan.md`；PostgreSQL → `services/ruoyi-api/compliance/provenance/postgresql-compatibility.md`；许可证/NOTICE → `services/ruoyi-api/compliance/provenance/license-notice.md`；候选来源 → `services/ruoyi-api/compliance/provenance/candidate-commit-tag.md`。许可证/NOTICE 摘要已把上游「不存在 NOTICE」记录为 `absent-upstream` / `not-applicable`，但 `license-notice` 证据在仓库外受控原文证据与非实施方独立复核完成前仍为 `pending`（见 `toolchain/README.md` §10.3、§12）。
+
 `poc-ready` 阶段要求五项证据全部 `verified` 且证据文件存在、摘要与内容标记匹配，候选已冻结且门禁已 `admitted`；任何「先写 verified 再补文件」或「先把阶段改到 poc-ready」都会被判违规（退出码 1），而不是未就绪。语义与状态阶梯见 `toolchain/README.md` §4。
 
 ## 保留的现有边界
@@ -109,7 +124,7 @@ node services/ruoyi-api/toolchain/check-capability.mjs --self-test
 1. **复现工具链**：用显式 `--java-home` / `--maven-home` 复现 JDK 17+ 与 Maven 3.9+ 探测（已完成，见「当前环境门禁」）。
 2. **固定候选**：固定实际 Spring Boot 3 候选 commit（40 位 SHA）并同时固定 tag，核对其 POM 与 JDK 要求。**当前状态：部分完成**——`springboot3` 分支头 `a51a838b71b446ea27256900efe7ed2faa2a02fd` 与其 POM（spring-boot 3.5.16 / JDK 17）已核验，但第二轮复核确认 Gitee 与 GitHub 两侧各 27 个 tag（`v1.0`…`v3.9.2`）**无一指向该提交，连其父提交 `9e3fb55f…` 也没有**，故候选保持未冻结（核验记录与复现步骤见 `toolchain/candidate-metadata.json` 与 `toolchain/README.md` §10）。
 3. **许可证与 NOTICE**：保留候选原始 LICENSE/NOTICE 原文与哈希证据。**当前状态：公开元数据已核验，证据仍未就位（保持 `pending`）**——候选 commit `a51a838b…` 的 LICENSE 位于根目录 `LICENSE`（网页 `https://github.com/yangzongzhuan/RuoYi-Vue/blob/a51a838b71b446ea27256900efe7ed2faa2a02fd/LICENSE`；blob `8564f294c7781cbbbdb22ae5927a96f859db0054`、size 1071、字节 SHA-256 `7296da00…`），许可证类型 MIT；全树 477 个条目（334 blob）中**不存在 `NOTICE`/`COPYING`/`COPYRIGHT`**，Gitee 主仓库与 GitHub 镜像的全树逐条目比对一致（单侧独有 0、sha 不一致 0）。第三轮只用公开 API 即可复现上述摘要（不克隆、不落盘，命令见 `toolchain/candidate-metadata.json` 的 `reproduce` 第 6–8 步）；原文副本与再分发说明仍未登记，`provenance` 证据 `license-notice` 保持 `pending`，理由与解除条件见 `toolchain/README.md` §10.2–§10.3。 另：公开摘要里的「上游不存在 NOTICE」（`absent-upstream`）与「本项不适用」（`not-applicable`）只是观测标签，**不等于**合规产物 `services/ruoyi-api/compliance/NOTICE` 已 `verified`；`gate-manifest.json` 的 `notice` 项因此保持 `pending`，真正的再分发证据仍为 `pending`，不会靠伪造文件推进（见 `toolchain/README.md` §3.5、§10.3）。
-4. **依赖清单与 SBOM**：在隔离目录生成依赖树、传递依赖许可证清单与 SBOM（记录工具、版本、生成时间）。
+4. **依赖清单与 SBOM**：在隔离目录生成依赖树、传递依赖许可证清单与 SBOM（记录工具、版本、生成时间）；SBOM 的目标证据路径统一为 `services/ruoyi-api/compliance/provenance/sbom.cyclonedx.json`，且只允许由真实外部审计产物回填。
 5. **漏洞扫描**：完成依赖漏洞扫描并逐项记录处置结论（含扫描工具与规则版本）。
 6. **PostgreSQL 验证**：在隔离 PostgreSQL 实例中验证 DDL、分页、时间、事务、索引和迁移回滚。
 7. **独立审查**：完成架构/安全独立审查与终审并保留放行结论（实施方不自证）。
