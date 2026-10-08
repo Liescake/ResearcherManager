@@ -15,8 +15,11 @@ import { RuoYiAdapterModule } from './ruoyi-adapter/ruoyi-adapter.module';
 import { StatisticsModule } from './statistics/statistics.module';
 
 /**
- * 领域模块聚合入口：只声明模块边界（docs/P2-架构与数据设计.md §2），不含业务实现。
- * 后续阶段逐个模块填充 controller/service/repository，并保持「API 是唯一业务规则入口」。
+ * 领域模块聚合入口：模块边界来自 docs/P2-架构与数据设计.md §2，并保持
+ * 「API 是唯一业务规则入口」。
+ *
+ * P3 期间各模块只有边界声明；自 P4 起逐个填充 controller/service/repository，
+ * 当前已有业务实现的是 `EducationModule`（升学记录学生自服务切片），其余仍为占位。
  */
 @Module({
   imports: [
