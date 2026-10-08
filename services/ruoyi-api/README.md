@@ -11,7 +11,8 @@
 - 目标运行时：JDK 17+
 - 构建工具：Maven 3.9+
 - 目标数据库：PostgreSQL（必须先完成方言和迁移验证）
-- 当前工作区已知限制：本机核验时为 Java 8，未安装 Maven；因此当前目录不包含 `pom.xml`，也不声明可构建。该限制可用 `toolchain/check-gate.mjs` 随时复核（见下节）。
+- 本机工具链实测（2026-10-08，可复现，详见 `toolchain/README.md` §5.2）：JDK 17.0.12 与 Maven 3.9.16 在**显式探测路径**下达标——JDK 用 `--java-home` 指向 `C:\Program Files\Java\jdk-17`，Maven 用 `--maven-home` 指向仓库外系统临时目录中的解压结果（压缩包 `apache-maven-3.9.16-bin.zip` 只读、不入库，解压只在仓库外）。不带显式参数时，PATH 上的 `java` 仍是 1.8.0_501 且系统未安装 Maven，因此默认运行按设计返回未准入。
+- 工具链就绪**不等于**准入：准入前置当前只有 2/10 满足，候选 commit 未冻结，五项合规产物全部 `pending`，`stage` 仍为 `pre-poc-gate`。因此当前目录不包含 `pom.xml`，也不声明可构建。可用 `toolchain/check-gate.mjs` 随时复核（见下节）。
 - RuoYi 候选源码位于仓库外审计目录，不属于本目录和本仓库。
 
 ## POC 范围（后续实现）
@@ -47,10 +48,16 @@ node services/ruoyi-api/contracts/validate.mjs
 `toolchain/` 下的公开检查器（只用 Node 内置模块，不联网、不下载依赖、不写仓库）在创建 `pom.xml` 或 Java 源码之前核验本机工具链、候选 commit 元数据占位与准入前置：
 
 ```bash
+# 默认探测（当前环境：PATH 上的 java 为 1.8，无系统 Maven → 未准入，退出码 2）
 node services/ruoyi-api/toolchain/check-gate.mjs
+
+# 可复现探测：显式指定 JDK 与本地 Maven（优先于环境变量与 PATH）
+node services/ruoyi-api/toolchain/check-gate.mjs \
+  --java-home "C:\Program Files\Java\jdk-17" \
+  --maven-home "<仓库外临时目录>/apache-maven-3.9.16"
 ```
 
-判定语义与探测方式见 `toolchain/README.md`：退出码 0 通过；1 违规（门禁前出现 `pom.xml`、Java 源码或 RuoYi 源码副本，或占位/状态与事实不符）；2 未准入（本机 JDK/Maven 未达标或准入前置未满足）。只有在清单把 `stage` 提升为 `admitted`（要求候选 commit 已冻结、全部准入前置带证据满足、合规产物就位）之后，本目录才允许出现 Maven 工程与 Java 源码；本机当前为 Java 8 且未安装 Maven，因此该检查按设计返回未准入。
+判定语义与探测方式见 `toolchain/README.md`：退出码 0 通过；1 违规（门禁前出现 `pom.xml`、Java 源码或 RuoYi 源码副本，或占位/状态与事实不符）；2 未准入（本机 JDK/Maven 未达标或无法复现清单声明的达标状态、准入前置未满足、合规产物未就位）。**退出码 0 要求准入前置全部满足且合规产物全部就位**，因此本机即使显式探测到 JDK 17 与 Maven 3.9.16，当前仍按设计返回未准入（退出码 2）。只有在清单把 `stage` 提升为 `admitted`（要求候选 commit 已冻结、全部准入前置带证据满足、合规产物就位）之后，本目录才允许出现 Maven 工程与 Java 源码。
 
 同一目录下的来源与合规证据清单（`provenance-manifest.json` + `check-provenance.mjs`）回答另一个问题：候选 commit/tag、许可证/NOTICE、SBOM、漏洞与 PostgreSQL 兼容性证据是否已真正核验。非 `pending` 的证据必须给出与证据文件实际字节一致的 SHA-256 摘要、必需内容标记，`verified` 还必须给出核验时间与署名，并与 `gate-manifest.json` 的候选固定值交叉核验：
 
@@ -81,13 +88,17 @@ node services/ruoyi-api/toolchain/check-provenance.mjs --self-test
 
 ## 下一步准入
 
-创建 `pom.xml` 和 Java 源码前，必须完成：
+创建 `pom.xml` 和 Java 源码前，必须按 `toolchain/gate-manifest.json` 的 `candidate.admissionSteps` 逐项完成（步骤与前置的机器约束、每步的验收证据见 `toolchain/README.md` §3.3–§3.4）：
 
-- 固定实际 Spring Boot 3 候选 commit，并核对其 POM 与 JDK 要求。
-- 把 `toolchain/provenance-manifest.json` 的五项证据逐项推进到 `verified`（证据文件存在、摘要与内容标记匹配、带核验时间与署名），再把 `stage` 提升为 `poc-ready`。
-- 本地保留 LICENSE/NOTICE/第三方许可清单。
-- 生成依赖树、SBOM、漏洞扫描和许可证扫描报告。
-- 在隔离 PostgreSQL 实例中验证 DDL、分页、时间、事务、索引和迁移回滚。
-- 完成 GPT6sol 架构/安全审查和 GLM5.3 f 终审。
+1. **复现工具链**：用显式 `--java-home` / `--maven-home` 复现 JDK 17+ 与 Maven 3.9+ 探测（已完成，见「当前环境门禁」）。
+2. **固定候选**：固定实际 Spring Boot 3 候选 commit（40 位 SHA）并同时固定 tag，核对其 POM 与 JDK 要求。
+3. **许可证与 NOTICE**：保留候选原始 LICENSE/NOTICE 原文与哈希证据。
+4. **依赖清单与 SBOM**：在隔离目录生成依赖树、传递依赖许可证清单与 SBOM（记录工具、版本、生成时间）。
+5. **漏洞扫描**：完成依赖漏洞扫描并逐项记录处置结论（含扫描工具与规则版本）。
+6. **PostgreSQL 验证**：在隔离 PostgreSQL 实例中验证 DDL、分页、时间、事务、索引和迁移回滚。
+7. **独立审查**：完成架构/安全独立审查与终审并保留放行结论（实施方不自证）。
+8. **门禁提升**：全部前置 `satisfied` 且合规产物就位后，才把 `stage` 提升为 `admitted`；同时把五项来源/合规证据推进到 `verified`（证据文件存在、摘要与内容标记匹配、带核验时间与署名），再把 `provenance-manifest.json` 的 `stage` 提升为 `poc-ready`。
+
+第 2–7 步尚未开始；候选 commit、许可证、SBOM、漏洞与 PostgreSQL 证据一律保持 `pending`，不预填、不推测。
 
 本目录当前是隔离 POC 入口，不代表 RuoYi 已采用或迁移已完成。

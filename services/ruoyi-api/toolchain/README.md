@@ -4,24 +4,26 @@
 
 ## 1. 本目录内容
 
-| 文件                       | 用途                                                                                                | 静态校验                                                                    |
-| -------------------------- | --------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| `README.md`                | 门禁语义、探测方式与运行方式说明                                                                    | 人工评审（本文件不参与自动校验）                                            |
-| `check-gate.mjs`           | 公开只读检查器（仅用 Node 内置模块，不联网、不下载、不写仓库）                                      | 自身即检查入口，见 §6；`--self-test` 内置 32 项自检                         |
-| `gate-manifest.json`       | 工具链最低要求、禁止项、候选 commit 占位、准入前置与合规产物清单                                    | 结构、占位语义与磁盘一致性校验（§3）                                        |
-| `check-provenance.mjs`     | 来源与合规证据清单检查器（仅用 Node 内置模块，不联网、不下载、不写仓库；内置纯 JavaScript SHA-256） | 自身即检查入口，见 §6；`--self-test` 内置 48 项判定场景 + 3 项 SHA-256 向量 |
-| `provenance-manifest.json` | 候选来源与合规证据清单（候选 commit/tag、许可证/NOTICE、SBOM、漏洞、PostgreSQL 兼容性）             | 结构、状态与磁盘事实、摘要、内容标记、与门禁交叉核验（§4）                  |
+| 文件                       | 用途                                                                                                               | 静态校验                                                                    |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------- |
+| `README.md`                | 门禁语义、探测方式与运行方式说明                                                                                   | 人工评审（本文件不参与自动校验）                                            |
+| `check-gate.mjs`           | 公开只读检查器（仅用 Node 内置模块，不联网、不下载、不写仓库；支持显式 `--java-home` / `--maven-home` 可复现探测） | 自身即检查入口，见 §6；`--self-test` 内置 54 项自检                         |
+| `gate-manifest.json`       | 工具链最低要求与可复现探测配方、禁止项、候选 commit 占位、候选准入步骤、准入前置与合规产物清单                     | 结构、占位语义、探测配方与磁盘一致性校验（§3）                              |
+| `check-provenance.mjs`     | 来源与合规证据清单检查器（仅用 Node 内置模块，不联网、不下载、不写仓库；内置纯 JavaScript SHA-256）                | 自身即检查入口，见 §6；`--self-test` 内置 48 项判定场景 + 3 项 SHA-256 向量 |
+| `provenance-manifest.json` | 候选来源与合规证据清单（候选 commit/tag、许可证/NOTICE、SBOM、漏洞、PostgreSQL 兼容性）                            | 结构、状态与磁盘事实、摘要、内容标记、与门禁交叉核验（§4）                  |
 
 ## 2. 门禁语义
 
 检查器把三类问题分开判定，避免「还没到条件」与「已经违反规则」被混为一谈：
 
-| 判定     | 含义                                                                                     | 退出码 |
-| -------- | ---------------------------------------------------------------------------------------- | -----: |
-| 通过     | 边界无违规、清单合法、工具链达标且准入前置满足                                           |      0 |
-| 违规     | 门禁前出现 Maven 工程/Java 源码/RuoYi 源码副本；或清单非法（占位被伪造、状态与事实不符） |      1 |
-| 未准入   | 尚未满足条件：JDK/Maven 未达标、准入前置未满足、合规产物未就位                           |      2 |
-| 用法错误 | 传入了未知参数                                                                           |     64 |
+| 判定     | 含义                                                                                                                 | 退出码 |
+| -------- | -------------------------------------------------------------------------------------------------------------------- | -----: |
+| 通过     | 边界无违规、清单合法、工具链达标、准入前置**全部**满足且合规产物全部就位                                             |      0 |
+| 违规     | 门禁前出现 Maven 工程/Java 源码/RuoYi 源码副本；或清单非法（占位被伪造、状态与事实不符、实测记录高于本机可复现水平） |      1 |
+| 未准入   | 尚未满足条件：本机 JDK/Maven 未达标或无法复现清单声明的达标状态、准入前置未满足、合规产物未就位                      |      2 |
+| 用法错误 | 传入了未知参数，或显式探测路径不是可用的绝对 JDK/Maven home                                                          |     64 |
+
+退出码 0 只在「本阶段确实已经就绪」时出现：只要还有准入前置是 `pending`，或还有合规产物是 `pending`，就判**未准入**（退出码 2）。这一点在 0.2.0 之前是缺失的——旧实现只把工具链不达标记为阻断项，于是「JDK/Maven 就绪 + 八项前置仍 pending」会误判为**通过**。现在这类未就绪状态一律 fail-closed，不会给未完成的准入签发放行。
 
 **单一闸门：** 只有在清单把 `stage` 从 `pre-poc-gate` 提升为 `admitted` 之后，本目录才允许出现 `pom.xml` 与 Java 源码；而 `admitted` 又被强制要求：候选 commit 已冻结（`resolved = true`）、全部准入前置 `satisfied` 且各带证据、合规产物全部就位、工具链达标。因此在门禁前创建 `pom.xml` 或 Java 源码必然被判为**违规**（退出码 1），而不是「未准入」。
 
@@ -51,13 +53,42 @@
 
 必需 id 固定为十项（`toolchain-jdk`、`toolchain-maven`、`candidate-commit`、`license-notice`、`dependency-licenses`、`sbom`、`vulnerability-scan`、`postgresql-compatibility`、`security-review`、`final-review`），缺项即判清单非法；每项状态只能是 `pending`/`satisfied`，标记 `satisfied` 必须提供非空 `evidence`。
 
-其中两项与本机实测**双向**校验：本机 JDK 已达标却仍写 `pending`，或未达标却写 `satisfied`，都判为清单状态漂移（退出码 1）。这样「声明」与「证据」不能各写一半。
+其中两项与本机实测**双向**校验，但两个方向的性质不同：
 
-### 3.4 合规产物（`complianceArtifacts`）
+- **本机已达标却仍写 `pending`** 是可当场举证的清单滞后，判**违规**（退出码 1）：声明落后于证据，不允许把已经具备的条件继续挂着；
+- **本机测不到或不达标却写 `satisfied`** 只说明本次探测无法复现该声明，没有任何伪造的反证，因此判**未准入**（退出码 2）并给出复现指引——仍然不放行（`stage=admitted` 永远要求本机探测达标），但不冤枉清单。复现方式见 §5。
 
-每一项声明仓库内相对路径与状态 `pending`/`present`/`verified`，且必须与磁盘一致：标记 `pending` 却已存在、或标记 `present`/`verified` 却不存在，都判违规。路径不得为绝对路径，也不得包含 `..`。
+清单还用 `toolchain.probe.recorded` 记录「本机实测的主版本」：探测到达标工具时，若清单记录的主版本高于本机实际探测到的水平（例如记录 JDK 21、实测只有 17），判**违规**；这样「只写声明、不做测量」不能通过。
 
-### 3.5 源码自审（公开材料的机器约束）
+### 3.4 候选准入步骤（`candidate.admissionSteps`）
+
+`admissionSteps` 是有序的准入步骤表，每步给出 `id`、`title` 与 `requires`（引用的准入前置 id）。检查器要求：
+
+- 数组非空、每步 id 非空且不重复、title 非空；
+- `requires` 只能引用已登记的前置 id（未登记即判违规）；
+- 全部必需前置必须被至少一步覆盖（漏步即判违规）——「清单里列了前置」与「实际要走哪些步」不能各说一套。
+
+当前清单登记的候选 RuoYi Spring Boot 3 准入步骤（有序，与 `gate-manifest.json` 的 `candidate.admissionSteps` 逐条对应；**全部是「要做什么」，不是「已经做到」**）：
+
+| #   | 步骤 id                 | 内容                                                                                                      | 关联前置                                                  |
+| --- | ----------------------- | --------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| 1   | `toolchain-reproduce`   | 用显式路径复现 JDK 17+ 与 Maven 3.9+ 探测（本地压缩包只在仓库外临时目录解压）                             | `toolchain-jdk`、`toolchain-maven`（本机已达标，见 §5.2） |
+| 2   | `pin-candidate`         | 固定实际 Spring Boot 3 候选 commit（40 位 SHA）并同时固定 tag，核对其 POM 声明的 JDK 与 Spring Boot 版本  | `candidate-commit`                                        |
+| 3   | `license-and-notice`    | 保留候选原始 LICENSE/NOTICE 原文与哈希证据（不改写）                                                      | `license-notice`                                          |
+| 4   | `dependency-inventory`  | 在隔离目录生成依赖树、传递依赖许可证清单与 SBOM（记录工具、版本与生成时间）                               | `dependency-licenses`、`sbom`                             |
+| 5   | `vulnerability-scan`    | 完成依赖漏洞扫描并逐项记录处置结论（记录扫描工具与规则版本）                                              | `vulnerability-scan`                                      |
+| 6   | `postgresql-validation` | 在隔离 PostgreSQL 实例验证 DDL、分页、时间、事务、索引与迁移回滚                                          | `postgresql-compatibility`                                |
+| 7   | `independent-reviews`   | 完成架构/安全独立审查与终审并保留放行结论（不由实施方自证）                                               | `security-review`、`final-review`                         |
+| 8   | `gate-promotion`        | 全部前置 `satisfied` 且合规产物就位后，才把本清单 `stage` 提升为 `admitted`                               | —（具备上述全部前置才有意义）                             |
+| 9   | `provenance-promotion`  | 五项来源/合规证据全部 `verified` 并与本清单交叉核验后，才把 `provenance-manifest.json` 提升为 `poc-ready` | —（同上）                                                 |
+
+第 2–7 步尚未开始：清单不预填任何候选 commit、许可证、SBOM、漏洞或 PostgreSQL 证据，未完成的项目一律保持 `pending`，由检查器逐次核对。
+
+### 3.5 合规产物（`complianceArtifacts`）
+
+每一项声明仓库内相对路径与状态 `pending`/`present`/`verified`，且必须与磁盘一致：标记 `pending` 却已存在、或标记 `present`/`verified` 却不存在，都判违规。路径不得为绝对路径，也不得包含 `..`。仍为 `pending` 的产物会让整次判定停在**未准入**（退出码 2）。
+
+### 3.6 源码自审（公开材料的机器约束）
 
 对 `services/ruoyi-api` 下的公开代码与说明文件同时检查：
 
@@ -117,15 +148,55 @@
 | 未就绪   | 结构合法且未发现伪造，但证据仍未 `verified`、候选未冻结或门禁未 `admitted`             |      2 |
 | 用法错误 | 传入了未知参数                                                                         |     64 |
 
-## 5. 本机工具链探测方式
+## 5. 本机工具链探测方式（可复现探测）
 
-JDK 与 Maven 的候选按 `JAVA_HOME/bin`、`MAVEN_HOME`/`M2_HOME/bin`、`PATH` 顺序解析（Windows 兼容 `java.exe`、`mvn.cmd`），逐个按三级方式取版本：
+解析优先级固定为 **显式参数 → 环境变量 → PATH**，清单 `toolchain.probe` 必须逐项声明同一顺序；检查器会核对配方字段（显式参数名、环境变量名、顺序、压缩包约束），被改写或缺失即判清单非法。
 
-1. **管道捕获**：`spawnSync` 读取子进程输出（普通终端与 CI 的常规路径）；
-2. **临时文件句柄回退**：受限沙箱会以 `EPERM` 阻止管道捕获子进程输出。此时把子进程输出重定向到系统临时目录中的一个文件句柄，读完立即删除；该文件在仓库之外，内容由子进程写入，本模块自身不写入任何文件内容；
-3. **静态版本文件回退**：直接读取 JDK 安装目录的 `release` 文件（`JAVA_VERSION`）或 Maven 的 `lib/maven-core-<version>.jar` 文件名。
+| 工具  | 显式参数       | 环境变量                | 候选可执行文件（Windows / 其他平台）    |
+| ----- | -------------- | ----------------------- | --------------------------------------- |
+| JDK   | `--java-home`  | `JAVA_HOME`             | `bin\java.exe`、`bin\java` / `bin/java` |
+| Maven | `--maven-home` | `MAVEN_HOME`、`M2_HOME` | `bin\mvn.cmd`、`bin\mvn.exe`、`bin\mvn` |
+
+显式路径的约束（fail-closed）：必须是**绝对路径**、目录必须存在、`bin/` 下必须有对应可执行文件；任一不满足即以退出码 64 结束，**不会**退回到「换一个能用的路径试试」。相对路径一律拒绝，避免探测结果随工作目录漂移。
+
+Maven 探针需要 `JAVA_HOME` 才能启动，检查器按同一优先级注入（`--java-home` → 环境变量 `JAVA_HOME` → 由本次已解析出的 JDK 反推，且仅当该目录含 `release` 标记，以免把只有 `java.exe` 的转发目录当成 JDK home）。因此一条命令即可复现整套工具链：
+
+```bash
+node services/ruoyi-api/toolchain/check-gate.mjs \
+  --java-home "C:\Program Files\Java\jdk-17" \
+  --maven-home "<仓库外临时目录>/apache-maven-3.9.16"
+```
+
+取版本仍是三级方式：管道捕获 → 临时文件句柄回退 → 静态版本文件回退。报告会写明每一项的**探测来源**（`explicit-flag` / `env:变量名` / `path`）、探测方式（`pipe` / `temp-fd` / `static-file`）与最终路径，便于把一次探测原样留存为证据（`--json` 可机器读取）。
 
 保证：只执行 `java -version` / `mvn -v` 这类纯查询参数，**绝不**执行任何构建目标；不联网、不安装、不下载依赖；探测不确定时按 fail-closed 视为未达标。
+
+### 5.1 本地 Maven 压缩包（只读、只在仓库外解压）
+
+本机工具链来自仓库根目录的 `apache-maven-3.9.16-bin.zip`。该压缩包**不属于仓库产物**，保持只读：不修改、不移动、不入库；解压只允许发生在仓库外的系统临时目录。固定用法：
+
+```powershell
+# 1) 先记录压缩包摘要（用于证明是「只读使用」）
+Get-FileHash -Algorithm SHA256 .\apache-maven-3.9.16-bin.zip
+# 2) 只解压到仓库外的系统临时目录（不要解压进工作区，也不要安装到系统 PATH）
+Expand-Archive -LiteralPath .\apache-maven-3.9.16-bin.zip `
+  -DestinationPath "$env:TEMP\rm-toolchain-probe" -Force
+# 3) 用解压结果做一次可复现探测
+node services/ruoyi-api/toolchain/check-gate.mjs `
+  --java-home "C:\Program Files\Java\jdk-17" `
+  --maven-home "$env:TEMP\rm-toolchain-probe\apache-maven-3.9.16"
+```
+
+清单 `toolchain.probe.mavenArchive` 记录压缩包文件名、SHA-256、`inRepository: false` 与 `archivedReadOnly: true`、解压范围；检查器校验这些声明齐备、格式合法且摘要不是占位值，但**不做字节级复算**——摘要核验由上面第 1 步的脚本/人工步骤完成。本模块不含哈希实现，也不导入 `node:crypto`。
+
+### 5.2 本机实测状态（核验记录，可复现）
+
+| 工具  | 探测来源                | 版本    | 结论                                               |
+| ----- | ----------------------- | ------- | -------------------------------------------------- |
+| JDK   | `--java-home` 显式指定  | 17.0.12 | 达标（JDK home `C:\Program Files\Java\jdk-17`）    |
+| Maven | `--maven-home` 显式指定 | 3.9.16  | 达标（来自 §5.1 压缩包，解压于仓库外系统临时目录） |
+
+不带显式参数时，本机 PATH 上的 `java` 仍是 `1.8.0_501`（Oracle `java8path` 转发目录），系统也未安装 Maven，因此**默认运行按设计返回未准入**（退出码 2：JDK 版本不达标、Maven 未找到，并附「清单声明的工具链状态未能在本机复现」）。可复现探测的意义正在于此：清单记录的是**显式配方下的实测结果**，默认环境不达标是环境事实，不是清单撒谎。
 
 ## 6. 运行方式
 
@@ -134,34 +205,44 @@ JDK 与 Maven 的候选按 `JAVA_HOME/bin`、`MAVEN_HOME`/`M2_HOME/bin`、`PATH`
 node services/ruoyi-api/toolchain/check-gate.mjs
 cd services/ruoyi-api/toolchain && node check-gate.mjs
 
-# 6.2 机器可读输出（JSON：summary、violations、blockers、exitCode）
+# 6.2 机器可读输出（JSON：summary、violations、blockers、exitCode、context.probe）
 node services/ruoyi-api/toolchain/check-gate.mjs --json
 
 # 6.3 信息性运行：始终退出码 0，便于在未准入机器上采集报告
 node services/ruoyi-api/toolchain/check-gate.mjs --report
 
-# 6.4 判定规则自检：32 项合成场景，不读磁盘、不执行探测
+# 6.4 判定规则自检：54 项合成场景，不读磁盘、不执行探测
 node services/ruoyi-api/toolchain/check-gate.mjs --self-test
 
-# 6.5 来源与合规证据清单（真实 POC 前；当前为未就绪，退出码 2，按 §4 判定）
+# 6.5 可复现探测：显式指定 JDK 与本地 Maven（优先于环境变量与 PATH，见 §5.1）
+node services/ruoyi-api/toolchain/check-gate.mjs \
+  --java-home "C:\Program Files\Java\jdk-17" \
+  --maven-home "<仓库外临时目录>/apache-maven-3.9.16"
+node services/ruoyi-api/toolchain/check-gate.mjs --java-home="..." --maven-home="..." --json
+
+# 6.6 来源与合规证据清单（真实 POC 前；当前为未就绪，退出码 2，按 §4 判定）
 node services/ruoyi-api/toolchain/check-provenance.mjs
 cd services/ruoyi-api/toolchain && node check-provenance.mjs
 
-# 6.6 机器可读输出（JSON：summary、violations、blockers、exitCode）
+# 6.7 机器可读输出（JSON：summary、violations、blockers、exitCode）
 node services/ruoyi-api/toolchain/check-provenance.mjs --json
 
-# 6.7 信息性运行：始终退出码 0，便于在证据未齐备时采集报告
+# 6.8 信息性运行：始终退出码 0，便于在证据未齐备时采集报告
 node services/ruoyi-api/toolchain/check-provenance.mjs --report
 
-# 6.8 判定规则自检：48 项合成场景 + 3 项 SHA-256 向量，不读磁盘、不写文件
+# 6.9 判定规则自检：48 项合成场景 + 3 项 SHA-256 向量，不读磁盘、不写文件
 node services/ruoyi-api/toolchain/check-provenance.mjs --self-test
 ```
 
+`--help` 会打印含 `--java-home` / `--maven-home` 的完整用法；未知参数、重复指定、缺值或缺 `bin/` 可执行文件的显式路径都以退出码 64 结束。
+
 `--self-test` 覆盖的合成场景包括：准入前置齐备时通过；门禁前出现 `pom.xml`/Java 源码/RuoYi 源码副本/`src/main/java`；候选 commit 为短 SHA 或分支名；`resolved` 与 `commit` 不一致；固定 commit 未固定 tag；未固定原因与未满足前置不一致；`stage=admitted` 仍有未满足前置；合规产物状态与磁盘不一致；JDK 8 与 Maven 3.8.8 不达标、Maven/JDK 未安装；清单版本非 semver；工具链要求被下调；禁止项清单被清空；清单缺失；以及导入白名单/网络模块/内部文档引用/相对导入四类源码策略。
+
+0.2.0 追加的自检场景：清单标记 `satisfied` 但本机 JDK 未达标 / 找不到 Maven → 未准入而不是违规；清单实测记录主版本高于本机可复现水平；缺少 `toolchain.probe` 配方；配方解析优先级被改写；压缩包摘要写成占位值或被声明为可入库；准入步骤缺失、漏掉必需前置、引用未登记前置；工具链达标但准入前置未满足 → 未准入；前置齐备但合规产物仍 `pending` → 未准入；以及 `--java-home`/`--maven-home` 的合法/内联/缺值/相对路径/目录不存在/缺 `bin/` 可执行文件/重复指定与未知参数九种参数处理。
 
 来源与合规证据检查器的 `--self-test` 覆盖：SHA-256 的 NIST 向量（空串 / `abc` / 448 位两分组）；五项证据齐备且门禁 admitted 时通过；`pending` 却已有文件、`present`/`verified` 却无文件；摘要不匹配、摘要格式非法、占位摘要；文件为空或不可读；缺少内容标记；`verified` 缺少 `collectedAt`/`verifiedBy`，或 `verifiedBy`、`method` 使用占位词；缺少必需证据项、未登记 id、id 重复、路径为绝对路径/含 `..`/越出边界/两项共用同一文件；状态与阶段取值非法、`manifestVersion` 非 semver、`contract` 不匹配、`purpose`/`nonGoals` 被清空、`pocGate` 强制开关被关闭；候选短 SHA/分支名、`resolved` 与 `commit` 不一致、固定 commit 未固定 tag、与 `gate-manifest.json` 候选值不一致；候选未冻结但来源证据已 `verified`、候选已冻结但来源证据未 `verified`；`poc-ready` 时证据仍 pending、门禁未 admitted、门禁合规产物仍 pending；门禁清单不可读/contract 不匹配/缺少 `candidate.pinned`；以及 `present` 合法但不足以准入。
 
-本机当前状态（核验记录）：`java -version` 为 `1.8.0_501`，未安装 Maven，因此主门禁**按设计**返回「未准入」（退出码 2），阻断项为「JDK 版本不达标」「Maven 未找到」；此时本目录不含 `pom.xml`，也没有 Java 源码。来源与合规证据清单的五项证据**全部为 `pending`**，`services/ruoyi-api/compliance/` 目录尚未创建，因此证据检查器**按设计**返回「未就绪」（退出码 2）；清单不预填、不推测任何证据。
+本机当前状态（核验记录）：按 §5.2，显式探测下 JDK 17.0.12 与 Maven 3.9.16 均达标，但准入前置只有 2/10 满足、候选 commit 未冻结、五项合规产物全部为 `pending`，因此主门禁**按设计**返回「未准入」（退出码 2）；不带显式参数时另加「JDK 版本不达标」「Maven 未找到」两项阻断。无论哪种运行方式，退出码都不是 0，`stage` 仍是 `pre-poc-gate`，本目录不含 `pom.xml`，也没有 Java 源码。来源与合规证据清单的五项证据同样**全部为 `pending`**，`services/ruoyi-api/compliance/` 目录尚未创建，因此证据检查器**按设计**返回「未就绪」（退出码 2）；清单不预填、不推测任何证据。
 
 内置 SHA-256 实现另做过一次性交叉核对：0–200 字节全部长度与 1.5 MB 输入的结果都与 Node 内置 `crypto` 一致（核对脚本在仓库外临时运行，不进入本目录；本模块自身仍只导入白名单内的 `node:` 内置模块，不导入 `node:crypto`，也不调用外部命令）。
 
@@ -185,5 +266,6 @@ node services/ruoyi-api/toolchain/check-provenance.mjs --self-test
 ## 9. 版本规则
 
 - 清单 `manifestVersion` 为 semver；非破坏性新增递增次版本，字段语义或闸门收紧属破坏性变更，需提升主/次版本并在本文件记录兼容性说明。
+- `0.2.0` 的兼容性说明：`toolchain.probe`（可复现探测配方与实测记录）与 `candidate.admissionSteps`（候选准入步骤）成为**必需**字段，缺失即判清单非法；`admissionSteps` 必须覆盖全部必需前置。同一版本起，判定行为有两处修正并已在 §2/§3.3 记录：**未满足的前置与未就位的合规产物改为阻断项**（未准入，退出码 2；此前会被误判为「通过」），而**清单标记 `satisfied` 但本机无法复现**改为未准入（退出码 2）而不是违规（原为违规）。两处都只会让门禁更严或更准确，不放宽任何放行条件。
 - 禁止下调 `toolchain` 的最低要求（JDK 17+ / Maven 3.9+）或关闭边界开关：检查器会直接判为清单非法。
 - `provenance-manifest.json` 同样受此规则约束：必需证据 id、`pocGate` 强制开关与「非 pending 必须给出真实摘要」的语义不得弱化；证据状态只能由实际核验结果推进，不能为了过检查器而预先写成 `verified`。

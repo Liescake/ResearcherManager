@@ -13,6 +13,9 @@
  *   - 只用 `node:` 内置模块；不联网、不安装、不下载任何依赖；
  *   - 只读仓库：不创建、不修改、不移动、不删除仓库内任何文件；
  *   - 只以 `-version` / `-v` 之类的纯查询参数调用 `java` 与 `mvn`，绝不执行构建目标；
+ *   - 探测路径可显式指定（`--java-home` / `--maven-home`，见下），也可用 `JAVA_HOME` /
+ *     `MAVEN_HOME` / `M2_HOME` 环境变量；显式值必须是绝对路径且带 `bin/` 可执行文件，
+ *     否则按用法错误（退出码 64）fail-closed，绝不退回到「猜一个能用的 JDK」；
  *   - 受限环境可能阻止管道捕获子进程输出（Windows 沙箱为 EPERM）。此时回退为把子进程输出
  *     重定向到系统临时目录中的一个文件句柄，读完立即删除；该文件位于仓库之外，内容由子进程
  *     写入，本模块自身不写入任何文件内容；
@@ -26,8 +29,18 @@
  *   node check-gate.mjs --json
  *   node check-gate.mjs --report      # 信息性运行：始终以退出码 0 结束
  *   node check-gate.mjs --self-test   # 用合成输入验证判定规则（不读磁盘、不执行探测）
+ *   node check-gate.mjs --java-home <绝对路径> --maven-home <绝对路径>
+ *                                     # 可复现探测：显式指定 JDK 与 Maven（优先于环境变量与 PATH）
  */
-import { closeSync, existsSync, openSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+} from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -63,6 +76,12 @@ const REQUIRED_PREREQUISITE_IDS = [
 
 /** 已文档化的最低基线（services/ruoyi-api/README.md「当前环境门禁」）；清单不得下调。 */
 const DOCUMENTED_BASELINE = { jdkMinMajor: 17, mavenMinVersion: '3.9.0' };
+
+/** 可复现探测的解析优先级：显式参数 → 环境变量 → PATH。清单必须逐项声明同一顺序。 */
+const PROBE_RESOLUTION_ORDER = ['explicit-flag', 'env', 'path'];
+const PROBE_EXPLICIT_FLAGS = { jdk: '--java-home', maven: '--maven-home' };
+const PROBE_ENV_VARS = { jdk: ['JAVA_HOME'], maven: ['MAVEN_HOME', 'M2_HOME'] };
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 const SEMVER = /^\d+\.\d+\.\d+$/;
 const FULL_SHA = /^[0-9a-f]{40}$/;
@@ -202,20 +221,24 @@ function readSourceEntries(root) {
  * 工具链探测（只读；仅查询版本）
  * ------------------------------------------------------------------ */
 
+/** 每个候选都带来源标记，便于把「这一次探测究竟用了哪里」写进证据。 */
 function executableCandidates(names, homes) {
   const candidates = [];
-  for (const home of homes) {
+  for (const entry of homes) {
+    const home = entry?.home;
     if (typeof home !== 'string' || home.trim() === '') continue;
-    for (const name of names) candidates.push(join(home, 'bin', name));
+    for (const name of names) {
+      candidates.push({ path: join(home, 'bin', name), source: entry.source });
+    }
   }
   for (const dir of String(process.env.PATH ?? '').split(delimiter)) {
     if (!dir) continue;
-    for (const name of names) candidates.push(join(dir, name));
+    for (const name of names) candidates.push({ path: join(dir, name), source: 'path' });
   }
   const seen = new Set();
   const unique = [];
   for (const candidate of candidates) {
-    const key = process.platform === 'win32' ? candidate.toLowerCase() : candidate;
+    const key = process.platform === 'win32' ? candidate.path.toLowerCase() : candidate.path;
     if (seen.has(key)) continue;
     seen.add(key);
     unique.push(candidate);
@@ -223,23 +246,125 @@ function executableCandidates(names, homes) {
   return unique.slice(0, 60);
 }
 
-function javaCandidates() {
+function javaCandidates(options) {
   const names = process.platform === 'win32' ? ['java.exe', 'java'] : ['java'];
-  return executableCandidates(names, [process.env.JAVA_HOME]);
+  const homes = [];
+  if (options?.javaHome) homes.push({ home: options.javaHome, source: 'explicit-flag' });
+  for (const variable of PROBE_ENV_VARS.jdk) {
+    const value = String(process.env[variable] ?? '').trim();
+    if (value !== '') homes.push({ home: value, source: `env:${variable}` });
+  }
+  return executableCandidates(names, homes);
 }
 
-function mavenCandidates() {
+function mavenCandidates(options) {
   const names = process.platform === 'win32' ? ['mvn.cmd', 'mvn.exe', 'mvn'] : ['mvn'];
-  return executableCandidates(names, [process.env.MAVEN_HOME, process.env.M2_HOME]);
+  const homes = [];
+  if (options?.mavenHome) homes.push({ home: options.mavenHome, source: 'explicit-flag' });
+  for (const variable of PROBE_ENV_VARS.maven) {
+    const value = String(process.env[variable] ?? '').trim();
+    if (value !== '') homes.push({ home: value, source: `env:${variable}` });
+  }
+  return executableCandidates(names, homes);
+}
+
+/* ------------------------------------------------------------------ *
+ * 显式探测路径（可复现探测的入口；不猜路径、不静默回退）
+ * ------------------------------------------------------------------ */
+
+const EXPLICIT_HOME_SPECS = {
+  javaHome: {
+    flag: PROBE_EXPLICIT_FLAGS.jdk,
+    label: 'JDK home',
+    executables: () => (process.platform === 'win32' ? ['java.exe', 'java'] : ['java']),
+  },
+  mavenHome: {
+    flag: PROBE_EXPLICIT_FLAGS.maven,
+    label: 'Maven home',
+    executables: () => (process.platform === 'win32' ? ['mvn.cmd', 'mvn.exe', 'mvn'] : ['mvn']),
+  },
+};
+
+function defaultDirectoryExists(target) {
+  try {
+    return statSync(target).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function defaultFileExists(target) {
+  try {
+    return statSync(target).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 校验显式探测路径：必须绝对、目录存在、且 bin/ 下有对应可执行文件。
+ * 任一不满足即判定为用法错误（fail-closed），绝不退回到「换一个能用的路径试试」。
+ */
+function validateExplicitHome(kind, value, deps) {
+  const spec = EXPLICIT_HOME_SPECS[kind];
+  const directoryExists = deps?.directoryExists ?? defaultDirectoryExists;
+  const fileExists = deps?.fileExists ?? defaultFileExists;
+  if (typeof value !== 'string' || value.trim() === '') {
+    return { error: `${spec.flag} 需要一个非空路径值` };
+  }
+  const target = value.trim();
+  if (!isAbsolute(target)) {
+    return {
+      error: `${spec.flag} 必须是绝对路径（可复现探测不接受相对路径或空值）：${target}`,
+    };
+  }
+  const home = resolve(target);
+  if (!directoryExists(home)) {
+    return { error: `${spec.flag} 指向的目录不存在或不可读：${home}` };
+  }
+  const names = spec.executables();
+  const missing = names.join(' / ');
+  if (!names.some((name) => fileExists(join(home, 'bin', name)))) {
+    return { error: `${spec.flag} 不是有效的 ${spec.label}（bin 下缺少 ${missing}）：${home}` };
+  }
+  return { home };
+}
+
+function validateExplicitHomes(flags, deps) {
+  const java =
+    flags.javaHome === null ? {} : validateExplicitHome('javaHome', flags.javaHome, deps);
+  if (java.error) return { error: java.error };
+  const maven =
+    flags.mavenHome === null ? {} : validateExplicitHome('mavenHome', flags.mavenHome, deps);
+  if (maven.error) return { error: maven.error };
+  return { javaHome: java.home ?? null, mavenHome: maven.home ?? null };
+}
+
+/** `.cmd`/`.bat` 必须经 shell 启动；这里自建命令行并用空参数数组，避免 Node 24 的 shell+args 弃用警告。 */
+function buildInvocation(command, args) {
+  if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(command)) {
+    const quoted = /\s/.test(command) ? `"${command}"` : command;
+    return { command: [quoted, ...args].join(' '), args: [], shell: true };
+  }
+  return { command, args, shell: false };
 }
 
 /**
  * 捕获子进程输出：先管道，被环境阻止时回退为临时文件句柄（均只读仓库）。
+ * `environment` 用于给 Maven 探针注入 JAVA_HOME，使探测不依赖调用者的环境。
  * 返回 { ok, mode: 'pipe'|'temp-fd', text } 或 { ok: false, reason }。
  */
-function captureOutput(command, args) {
-  const baseOptions = { windowsHide: true, shell: /\.(cmd|bat)$/i.test(command) };
-  const piped = spawnSync(command, args, { ...baseOptions, encoding: 'utf8' });
+function captureOutput(command, args, environment) {
+  const invocation = buildInvocation(command, args);
+  const baseOptions = {
+    windowsHide: true,
+    shell: invocation.shell,
+  };
+  if (environment) baseOptions.env = environment;
+  const piped = spawnSync(invocation.command, invocation.args, {
+    ...baseOptions,
+    encoding: 'utf8',
+  });
   if (!piped.error) {
     return { ok: true, mode: 'pipe', text: `${piped.stdout ?? ''}${piped.stderr ?? ''}` };
   }
@@ -249,7 +374,7 @@ function captureOutput(command, args) {
   let descriptor = null;
   try {
     descriptor = openSync(tempFile, 'w');
-    const redirected = spawnSync(command, args, {
+    const redirected = spawnSync(invocation.command, invocation.args, {
       ...baseOptions,
       stdio: ['ignore', descriptor, descriptor],
     });
@@ -324,10 +449,11 @@ function mavenStaticVersion(executablePath) {
   return null;
 }
 
-function probeTool(probe) {
+function probeTool(probe, options) {
   const record = {
     name: probe.name,
     path: null,
+    source: null,
     version: null,
     major: null,
     mode: 'none',
@@ -335,15 +461,16 @@ function probeTool(probe) {
     checked: [],
     note: null,
   };
-  for (const candidate of probe.candidates()) {
-    record.checked.push(candidate);
-    if (!existsSync(candidate)) continue;
-    const captured = captureOutput(candidate, probe.args);
+  const environment = typeof probe.environment === 'function' ? probe.environment(options) : null;
+  for (const candidate of probe.candidates(options)) {
+    record.checked.push(candidate.path);
+    if (!existsSync(candidate.path)) continue;
+    const captured = captureOutput(candidate.path, probe.args, environment);
     let parsed = captured.ok ? probe.parse(captured.text) : null;
     let mode = captured.ok ? captured.mode : 'none';
     let note = null;
     if (!parsed) {
-      const fallback = probe.staticVersion(candidate);
+      const fallback = probe.staticVersion(candidate.path);
       if (fallback) {
         parsed = fallback;
         mode = 'static-file';
@@ -355,7 +482,8 @@ function probeTool(probe) {
       }
     }
     if (parsed) {
-      record.path = candidate;
+      record.path = candidate.path;
+      record.source = candidate.source;
       record.version = parsed.raw;
       record.major = parsed.major ?? null;
       record.mode = mode;
@@ -376,12 +504,31 @@ const JDK_PROBE = {
   staticVersion: javaStaticVersion,
 };
 
+/**
+ * Maven 探针需要 JAVA_HOME 才能启动（`mvn -v` 的 java.version 行依赖它）。
+ * 优先级与 JDK 探针一致：显式参数 → 环境变量 → 由本次已解析出的 JDK 反推（仅当该目录含
+ * `release` 标记，避免把 `java8path` 这类只有 java.exe 的转发目录当成 JDK home）。
+ */
+function mavenProbeJdkHome(options, jdkRecord) {
+  if (options?.javaHome) return options.javaHome;
+  const envHome = String(process.env.JAVA_HOME ?? '').trim();
+  if (envHome !== '') return envHome;
+  const derived = jdkRecord?.path ? javaHomeFromExecutable(jdkRecord.path) : null;
+  if (derived && existsSync(join(derived, 'release'))) return derived;
+  return null;
+}
+
 const MAVEN_PROBE = {
   name: 'Maven',
   args: ['-v'],
   candidates: mavenCandidates,
   parse: parseMavenVersion,
   staticVersion: mavenStaticVersion,
+  environment: (options) => {
+    const environment = { ...process.env };
+    if (options?.jdkHomeForMaven) environment.JAVA_HOME = options.jdkHomeForMaven;
+    return environment;
+  },
 };
 
 function jdkReady(record, minimumMajor) {
@@ -708,6 +855,55 @@ function checkCandidate(candidate, prerequisites, report) {
   };
 }
 
+/**
+ * 候选准入步骤（`candidate.admissionSteps`）：有序、可核对，且必须覆盖全部必需前置。
+ * 这样「清单里列了前置」与「实际准入要走哪些步」不能各说一套，也不能漏步。
+ */
+function checkAdmissionSteps(steps, prerequisites, report) {
+  if (!Array.isArray(steps) || steps.length === 0) {
+    report.violations.push(
+      'gate-manifest.json: candidate.admissionSteps 必须是非空数组（准入步骤不得省略）',
+    );
+    return;
+  }
+  const seen = new Set();
+  const covered = new Set();
+  for (const step of steps) {
+    if (!isPlainObject(step)) {
+      report.violations.push('candidate.admissionSteps 的每一项必须是对象');
+      continue;
+    }
+    const stepId = step.id;
+    if (typeof stepId !== 'string' || stepId.trim() === '') {
+      report.violations.push('candidate.admissionSteps 每项必须有非空 id');
+      continue;
+    }
+    if (seen.has(stepId)) report.violations.push(`candidate.admissionSteps 的 id 重复：${stepId}`);
+    seen.add(stepId);
+    if (typeof step.title !== 'string' || step.title.trim() === '') {
+      report.violations.push(`准入步骤 ${stepId} 必须有非空 title`);
+    }
+    if (step.requires !== undefined && !Array.isArray(step.requires)) {
+      report.violations.push(`准入步骤 ${stepId} 的 requires 必须是数组`);
+      continue;
+    }
+    for (const requiredId of step.requires ?? []) {
+      if (typeof requiredId !== 'string' || !prerequisites.has(requiredId)) {
+        report.violations.push(`准入步骤 ${stepId} 引用了未登记的前置：${formatValue(requiredId)}`);
+        continue;
+      }
+      covered.add(requiredId);
+    }
+  }
+  const uncovered = REQUIRED_PREREQUISITE_IDS.filter((id) => !covered.has(id));
+  if (uncovered.length > 0) {
+    report.violations.push(
+      `candidate.admissionSteps 必须覆盖全部必需前置，当前漏掉：${uncovered.join(',')}`,
+    );
+  }
+  report.summary.admissionSteps = { total: steps.length, covered: covered.size };
+}
+
 function checkArtifacts(artifacts, report, context) {
   if (!Array.isArray(artifacts) || artifacts.length === 0) {
     report.violations.push('gate-manifest.json: complianceArtifacts 必须是非空数组');
@@ -786,6 +982,31 @@ function checkStage(manifest, report, prerequisites, artifacts) {
   }
 }
 
+/**
+ * 阶段就绪性：未满足的准入前置与未就位的合规产物属于「未准入」（退出码 2），不是「违规」。
+ * 没有这一段时，只要本机工具链达标就会误判「通过」——即使候选未冻结、八项前置仍 pending，
+ * 那就等于给「还没做完」签发放行，属于 fail-open。
+ */
+function checkReadiness(prerequisites, artifacts, report) {
+  const unsatisfied = [...prerequisites.values()]
+    .filter((entry) => entry?.status !== 'satisfied')
+    .map((entry) => entry.id)
+    .sort();
+  if (unsatisfied.length > 0) {
+    report.blockers.push(
+      `准入前置未满足（${unsatisfied.length}/${prerequisites.size}）：${unsatisfied.join(', ')}`,
+    );
+  }
+  const pending = Array.isArray(artifacts)
+    ? artifacts.filter((item) => item?.status === 'pending')
+    : [];
+  if (pending.length > 0) {
+    report.blockers.push(
+      `合规产物未就位（${pending.length} 项 pending）：${pending.map((item) => item?.id ?? '(未命名)').join(', ')}`,
+    );
+  }
+}
+
 function checkManifestContent(manifest, report, context) {
   if (!isPlainObject(manifest)) {
     report.violations.push('gate-manifest.json: 内容必须是 JSON 对象');
@@ -820,8 +1041,10 @@ function checkManifestContent(manifest, report, context) {
   checkBoundaryShape(manifest.boundary, report);
   const prerequisites = checkPrerequisites(manifest.admissionPrerequisites, report);
   checkCandidate(manifest.candidate, prerequisites, report);
+  checkAdmissionSteps(manifest.candidate?.admissionSteps, prerequisites, report);
   checkArtifacts(manifest.complianceArtifacts, report, context);
   checkStage(manifest, report, prerequisites, manifest.complianceArtifacts);
+  checkReadiness(prerequisites, manifest.complianceArtifacts, report);
 
   const pinned = isPlainObject(manifest.candidate?.pinned) ? manifest.candidate.pinned : {};
   report.summary.manifest = {
@@ -856,7 +1079,7 @@ function checkToolchain(toolchain, requirements, report) {
   if (!jdk.path) {
     const suffix = jdk.note ? `；${jdk.note}` : '';
     report.blockers.push(
-      `JDK 未找到或无法核验（要求 ${jdkMin}+）：已检查 ${checkedJdk} 个候选路径（JAVA_HOME/bin 与 PATH 中的 java）${suffix}`,
+      `JDK 未找到或无法核验（要求 ${jdkMin}+）：已检查 ${checkedJdk} 个候选路径（--java-home、JAVA_HOME/bin 与 PATH 中的 java）${suffix}`,
     );
   } else if (typeof jdk.major !== 'number') {
     report.blockers.push(
@@ -864,14 +1087,14 @@ function checkToolchain(toolchain, requirements, report) {
     );
   } else if (jdk.major < jdkMin) {
     report.blockers.push(
-      `JDK 版本不达标：${jdk.version}（要求 ${jdkMin}+，探测方式 ${jdk.mode}，路径 ${jdk.path}）`,
+      `JDK 版本不达标：${jdk.version}（要求 ${jdkMin}+，探测方式 ${jdk.mode}，来源 ${jdk.source ?? 'none'}，路径 ${jdk.path}）`,
     );
   }
 
   if (!maven.path) {
     const suffix = maven.note ? `；${maven.note}` : '';
     report.blockers.push(
-      `Maven 未找到或无法核验（要求 ${mavenMin}+）：已检查 ${checkedMaven} 个候选路径（MAVEN_HOME/M2_HOME/bin 与 PATH 中的 mvn）${suffix}`,
+      `Maven 未找到或无法核验（要求 ${mavenMin}+）：已检查 ${checkedMaven} 个候选路径（--maven-home、MAVEN_HOME/M2_HOME/bin 与 PATH 中的 mvn）${suffix}`,
     );
   } else if (typeof maven.version !== 'string') {
     report.blockers.push(
@@ -879,7 +1102,7 @@ function checkToolchain(toolchain, requirements, report) {
     );
   } else if (compareVersions(maven.version, mavenMin) < 0) {
     report.blockers.push(
-      `Maven 版本不达标：${maven.version}（要求 ${mavenMin}+，探测方式 ${maven.mode}，路径 ${maven.path}）`,
+      `Maven 版本不达标：${maven.version}（要求 ${mavenMin}+，探测方式 ${maven.mode}，来源 ${maven.source ?? 'none'}，路径 ${maven.path}）`,
     );
   }
 
@@ -887,6 +1110,7 @@ function checkToolchain(toolchain, requirements, report) {
     requirements: { jdkMinMajor: jdkMin, mavenMinVersion: mavenMin },
     jdk: {
       path: jdk.path ?? null,
+      source: jdk.source ?? null,
       version: jdk.version ?? null,
       major: typeof jdk.major === 'number' ? jdk.major : null,
       mode: jdk.mode ?? 'none',
@@ -895,6 +1119,7 @@ function checkToolchain(toolchain, requirements, report) {
     },
     maven: {
       path: maven.path ?? null,
+      source: maven.source ?? null,
       version: maven.version ?? null,
       mode: maven.mode ?? 'none',
       checked: checkedMaven,
@@ -903,7 +1128,143 @@ function checkToolchain(toolchain, requirements, report) {
   };
 }
 
-/** 清单里的工具链前置状态必须与本机实测一致（双向校验，防止只写声明不写证据）。 */
+/**
+ * 清单必须声明「可复现探测配方」，并记录本机实测的主版本；两者都与本次探测交叉核验：
+ *   - 配方字段（显式参数名、环境变量名、解析优先级、本地压缩包只读约束）缺失即判清单非法；
+ *   - 探测到「达标」的工具时，清单记录的主版本不得高于本机实测（防止把没测过的高版本写进清单）。
+ */
+function checkToolchainProbe(toolchain, effective, report) {
+  const probe = isPlainObject(toolchain) ? toolchain.probe : null;
+  if (!isPlainObject(probe)) {
+    report.violations.push(
+      'gate-manifest.json: toolchain.probe 必须是对象（可复现探测配方与实测记录不得省略）',
+    );
+    return;
+  }
+  const expect = (condition, message) => {
+    if (!condition) report.violations.push(message);
+  };
+
+  const flags = probe.explicitFlags;
+  expect(
+    isPlainObject(flags) &&
+      flags.jdk === PROBE_EXPLICIT_FLAGS.jdk &&
+      flags.maven === PROBE_EXPLICIT_FLAGS.maven,
+    `gate-manifest.json: toolchain.probe.explicitFlags 必须声明 { jdk: "${PROBE_EXPLICIT_FLAGS.jdk}", maven: "${PROBE_EXPLICIT_FLAGS.maven}" }`,
+  );
+  const envVars = probe.envVars;
+  const envVarsValid =
+    isPlainObject(envVars) &&
+    ['jdk', 'maven'].every(
+      (key) =>
+        Array.isArray(envVars[key]) &&
+        envVars[key].length > 0 &&
+        envVars[key].every(
+          (item) => typeof item === 'string' && /^[A-Z][A-Z0-9_]*$/.test(item.trim()),
+        ),
+    );
+  expect(
+    envVarsValid,
+    'gate-manifest.json: toolchain.probe.envVars.jdk / .maven 必须是非空的环境变量名数组',
+  );
+  expect(
+    sameList(probe.resolutionOrder ?? [], PROBE_RESOLUTION_ORDER),
+    `gate-manifest.json: toolchain.probe.resolutionOrder 必须为 ${PROBE_RESOLUTION_ORDER.join(' → ')}`,
+  );
+
+  const archive = probe.mavenArchive;
+  if (!isPlainObject(archive)) {
+    report.violations.push('gate-manifest.json: toolchain.probe.mavenArchive 必须是对象');
+  } else {
+    expect(
+      typeof archive.file === 'string' &&
+        archive.file.trim() !== '' &&
+        !FABRICATED_REFERENCE.test(archive.file.trim()),
+      'gate-manifest.json: toolchain.probe.mavenArchive.file 必须是非占位的压缩包文件名',
+    );
+    expect(
+      typeof archive.sha256 === 'string' &&
+        /^[0-9a-f]{64}$/.test(archive.sha256) &&
+        !/^([0-9a-f])\1{63}$/.test(archive.sha256),
+      'gate-manifest.json: toolchain.probe.mavenArchive.sha256 必须是真实（非全同字符占位）的 64 位小写十六进制摘要',
+    );
+    expect(
+      archive.inRepository === false,
+      'gate-manifest.json: toolchain.probe.mavenArchive.inRepository 必须为 false（压缩包只留本地，禁止入库）',
+    );
+    expect(
+      archive.archivedReadOnly === true,
+      'gate-manifest.json: toolchain.probe.mavenArchive.archivedReadOnly 必须为 true（压缩包只读，解压只在仓库外）',
+    );
+    expect(
+      typeof archive.extractScope === 'string' && archive.extractScope.trim() !== '',
+      'gate-manifest.json: toolchain.probe.mavenArchive.extractScope 必须说明解压范围（仓库外临时目录）',
+    );
+  }
+
+  const recorded = probe.recorded;
+  if (!isPlainObject(recorded)) {
+    report.violations.push(
+      'gate-manifest.json: toolchain.probe.recorded 必须是对象（记录本机实测的主版本）',
+    );
+  } else {
+    expect(
+      typeof recorded.measuredAt === 'string' && ISO_DATE.test(recorded.measuredAt),
+      'gate-manifest.json: toolchain.probe.recorded.measuredAt 必须是 YYYY-MM-DD',
+    );
+    expect(
+      Number.isInteger(recorded.jdkMajor) && recorded.jdkMajor >= DOCUMENTED_BASELINE.jdkMinMajor,
+      `gate-manifest.json: toolchain.probe.recorded.jdkMajor 必须是不低于 ${DOCUMENTED_BASELINE.jdkMinMajor} 的整数`,
+    );
+    expect(
+      Number.isInteger(recorded.mavenMajor) && recorded.mavenMajor >= 3,
+      'gate-manifest.json: toolchain.probe.recorded.mavenMajor 必须是不少于 3 的整数',
+    );
+    const probedJdkMajor = typeof effective?.jdk?.major === 'number' ? effective.jdk.major : null;
+    const probedMavenMajor =
+      typeof effective?.maven?.major === 'number' ? effective.maven.major : null;
+    if (
+      jdkReady(effective?.jdk, DOCUMENTED_BASELINE.jdkMinMajor) &&
+      Number.isInteger(recorded.jdkMajor) &&
+      probedJdkMajor !== null &&
+      probedJdkMajor < recorded.jdkMajor
+    ) {
+      report.violations.push(
+        `清单实测记录高于本机可复现水平：记录 JDK ${recorded.jdkMajor}，本机探测 ${probedJdkMajor}（${buildProbeSubject(effective?.jdk)}）；请用清单记录的工具链复现，或按实测修正 recorded`,
+      );
+    }
+    if (
+      mavenReady(effective?.maven, DOCUMENTED_BASELINE.mavenMinVersion) &&
+      Number.isInteger(recorded.mavenMajor) &&
+      probedMavenMajor !== null &&
+      probedMavenMajor < recorded.mavenMajor
+    ) {
+      report.violations.push(
+        `清单实测记录高于本机可复现水平：记录 Maven ${recorded.mavenMajor}，本机探测 ${probedMavenMajor}（${buildProbeSubject(effective?.maven)}）；请用清单记录的工具链复现，或按实测修正 recorded`,
+      );
+    }
+  }
+
+  report.summary.toolchainProbe = {
+    explicitFlags: PROBE_EXPLICIT_FLAGS,
+    envVars: PROBE_ENV_VARS,
+    resolutionOrder: PROBE_RESOLUTION_ORDER,
+    recorded: isPlainObject(recorded)
+      ? {
+          measuredAt: recorded.measuredAt ?? null,
+          jdkMajor: Number.isInteger(recorded.jdkMajor) ? recorded.jdkMajor : null,
+          mavenMajor: Number.isInteger(recorded.mavenMajor) ? recorded.mavenMajor : null,
+        }
+      : null,
+  };
+}
+
+/**
+ * 清单里的工具链前置状态必须与本次实测一致，但两个方向的性质不同：
+ *   - 「本机已达标却仍写 pending」＝拿得出反证的清单滞后，判**违规**（退出码 1）；
+ *   - 「本机测不到/不达标却写 satisfied」＝本机无法复现该声明，没有任何伪造的反证，按
+ *     fail-closed 记为**未准入**（退出码 2）——仍然不放行，只是不冤枉清单。
+ */
 function checkToolchainConsistency(manifest, toolchain, report) {
   const prerequisites = Array.isArray(manifest?.admissionPrerequisites)
     ? manifest.admissionPrerequisites
@@ -922,12 +1283,14 @@ function checkToolchainConsistency(manifest, toolchain, report) {
       label: 'JDK',
       ready: jdkReady(toolchain.jdk, jdkMin),
       detail: toolchain.jdk?.version ?? '未找到',
+      subject: buildProbeSubject(toolchain.jdk),
     },
     {
       id: 'toolchain-maven',
       label: 'Maven',
       ready: mavenReady(toolchain.maven, mavenMin),
       detail: toolchain.maven?.version ?? '未找到',
+      subject: buildProbeSubject(toolchain.maven),
     },
   ];
   for (const pair of pairs) {
@@ -940,12 +1303,16 @@ function checkToolchainConsistency(manifest, toolchain, report) {
       );
     }
     if (!pair.ready && satisfied) {
-      report.violations.push(
-        `清单状态漂移：前置 ${pair.id} 标记 satisfied，但本机 ${pair.label} 探测未达标（${pair.detail}）`,
+      report.blockers.push(
+        `清单声明的工具链状态未能在本机复现：前置 ${pair.id} 标记 satisfied，但本次探测未达标（${pair.subject}）。按 fail-closed 视为未准入；请按 toolchain/README.md §5 的显式配方复现，或修正清单证据`,
       );
     }
   }
-  report.summary.toolchainConsistency = pairs.map((pair) => ({ id: pair.id, ready: pair.ready }));
+  report.summary.toolchainConsistency = pairs.map((pair) => ({
+    id: pair.id,
+    ready: pair.ready,
+    subject: pair.subject,
+  }));
 }
 
 /* ------------------------------------------------------------------ *
@@ -966,7 +1333,9 @@ function evaluate(input) {
     report.summary.boundary = { scanned: paths.length, forbiddenHits: 0, skipped: '清单不可用' };
   }
   checkSourcePolicy(Array.isArray(input.sources) ? input.sources : [], boundary, report);
-  checkToolchain(input.toolchain, isPlainObject(manifest) ? manifest.toolchain : null, report);
+  const manifestToolchain = isPlainObject(manifest) ? manifest.toolchain : null;
+  checkToolchain(input.toolchain, manifestToolchain, report);
+  checkToolchainProbe(manifestToolchain, input.toolchain, report);
   checkToolchainConsistency(manifest, input.toolchain, report);
   report.exitCode =
     report.violations.length > 0
@@ -982,9 +1351,19 @@ function evaluate(input) {
  * ------------------------------------------------------------------ */
 
 function describeTool(record, requirement) {
-  const verdict = record.ready ? '达标' : '未达标';
-  const found = record.path ? record.path : '未找到';
-  return `${record.version ?? '未找到版本'}（要求 ${requirement}）→ ${verdict} [探测方式 ${record.mode}；${found}]`;
+  const verdict = record?.ready ? '达标' : '未达标';
+  const found = record?.path ? record.path : '未找到';
+  const source = record?.source ? `；来源 ${record.source}` : '';
+  return `${record?.version ?? '未找到版本'}（要求 ${requirement}）→ ${verdict} [探测方式 ${record?.mode ?? 'none'}${source}；${found}]`;
+}
+
+/** 供报告与清单漂移信息复用：把一次探测的来源/版本/路径写全。 */
+function buildProbeSubject(record) {
+  if (!record || !record.path) {
+    const suffix = record?.note ? `；${record.note}` : '';
+    return `未探测到可用工具${suffix}`;
+  }
+  return `${record.version ?? '版本未知'}，来源 ${record.source ?? 'none'}，探测方式 ${record.mode ?? 'none'}，路径 ${record.path}`;
 }
 
 function formatCounts(counts) {
@@ -1014,6 +1393,17 @@ function renderText(report, context) {
     `- 源码自审: ${context.sourceFiles} 个公开文件（导入白名单 + 网络模块 + 内部文档引用）`,
   );
   const toolchain = report.summary.toolchain;
+  const probeSummary = report.summary.toolchainProbe;
+  if (probeSummary) {
+    lines.push(
+      `- 探测配方: ${probeSummary.resolutionOrder.join(' → ')}；显式参数 ${probeSummary.explicitFlags.jdk} / ${probeSummary.explicitFlags.maven}；环境变量 ${probeSummary.envVars.jdk.join('/')} / ${probeSummary.envVars.maven.join('/')}`,
+    );
+    if (probeSummary.recorded) {
+      lines.push(
+        `- 清单实测记录: ${probeSummary.recorded.measuredAt}（JDK 主版本 ${probeSummary.recorded.jdkMajor}、Maven 主版本 ${probeSummary.recorded.mavenMajor}）`,
+      );
+    }
+  }
   if (toolchain) {
     lines.push(
       `- 工具链 JDK: ${describeTool(toolchain.jdk, `>= ${toolchain.requirements.jdkMinMajor}`)}`,
@@ -1032,6 +1422,10 @@ function renderText(report, context) {
   if (prerequisites) {
     lines.push(`- 准入前置: ${prerequisites.satisfied}/${prerequisites.total} 已满足`);
   }
+  const steps = report.summary.admissionSteps;
+  if (steps) {
+    lines.push(`- 候选准入步骤: ${steps.total} 步（覆盖前置 ${steps.covered} 项）`);
+  }
   const artifacts = report.summary.complianceArtifacts;
   if (artifacts) {
     lines.push(`- 合规产物: ${artifacts.total} 项（${formatCounts(artifacts.byStatus)}）`);
@@ -1048,24 +1442,65 @@ function printUsage() {
     [
       'RuoYi 工具链与准入合规门禁',
       '用法: node check-gate.mjs [--json] [--report] [--self-test] [--help]',
-      '  --json       以 JSON 输出判定结果（机器可读）',
-      '  --report     信息性运行：始终以退出码 0 结束',
-      '  --self-test  用合成输入验证判定规则（不读磁盘、不执行探测）',
+      '      [--java-home <绝对路径>] [--maven-home <绝对路径>]',
+      '  --json                   以 JSON 输出判定结果（机器可读）',
+      '  --report                 信息性运行：始终以退出码 0 结束',
+      '  --self-test              用合成输入验证判定规则（不读磁盘、不执行探测）',
+      '  --java-home <绝对路径>   显式指定 JDK home（优先于 JAVA_HOME 与 PATH，缺 bin/java 即用法错误）',
+      '  --maven-home <绝对路径>  显式指定 Maven home（优先于 MAVEN_HOME/M2_HOME 与 PATH）',
       '退出码: 0 通过 / 1 违规 / 2 未准入 / 64 用法错误',
     ].join('\n'),
   );
 }
 
 function parseArgs(argv) {
-  const flags = { json: false, report: false, selfTest: false, help: false, error: null };
-  for (const arg of argv) {
+  const flags = {
+    json: false,
+    report: false,
+    selfTest: false,
+    help: false,
+    error: null,
+    javaHome: null,
+    mavenHome: null,
+  };
+  const valueFlags = { '--java-home': 'javaHome', '--maven-home': 'mavenHome' };
+  const fail = (message) => ({ ...flags, error: message });
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
     if (arg === '--json') flags.json = true;
     else if (arg === '--report') flags.report = true;
     else if (arg === '--self-test') flags.selfTest = true;
     else if (arg === '--help' || arg === '-h') flags.help = true;
-    else flags.error = `未知参数：${arg}`;
+    else {
+      const separator = arg.indexOf('=');
+      const name = separator === -1 ? arg : arg.slice(0, separator);
+      const key = valueFlags[name];
+      if (!key) return fail(`未知参数：${arg}`);
+      if (flags[key] !== null) return fail(`${name} 只能指定一次`);
+      const inline = separator === -1 ? null : arg.slice(separator + 1);
+      const value = inline === null ? argv[index + 1] : inline;
+      if (typeof value !== 'string' || value.trim() === '') {
+        return fail(`${name} 缺少路径值`);
+      }
+      if (inline === null) index += 1;
+      flags[key] = value.trim();
+    }
   }
   return flags;
+}
+
+/**
+ * 解析参数并校验显式探测路径。`deps` 仅用于自检注入合成文件系统（默认读真实磁盘）。
+ * 返回 { exitCode, error, flags, javaHome, mavenHome }。
+ */
+function preflight(argv, deps) {
+  const flags = parseArgs(argv);
+  if (flags.error) return { exitCode: EXIT.USAGE, error: flags.error, flags };
+  if (flags.help || flags.selfTest)
+    return { exitCode: null, flags, javaHome: null, mavenHome: null };
+  const homes = validateExplicitHomes(flags, deps);
+  if (homes.error) return { exitCode: EXIT.USAGE, error: homes.error, flags };
+  return { exitCode: null, flags, javaHome: homes.javaHome, mavenHome: homes.mavenHome };
 }
 
 function loadManifest() {
@@ -1104,16 +1539,35 @@ const FIXTURE_BOUNDARY = {
 };
 
 const FIXTURE_COMMIT = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4';
+const FIXTURE_ARCHIVE_SHA = '5af3b743dd8b876b5c45da33b676251e5f1687712644abb4ee519ca56e1d89ce';
+const FIXTURE_PROBE_ROOT = resolve(MODULE_DIR, '__probe-fixture__');
+const FIXTURE_JDK_HOME = join(FIXTURE_PROBE_ROOT, 'jdk-17');
+const FIXTURE_MAVEN_HOME = join(FIXTURE_PROBE_ROOT, 'apache-maven-3.9.16');
+
+const FIXTURE_TOOLCHAIN_PROBE = {
+  explicitFlags: { ...PROBE_EXPLICIT_FLAGS },
+  envVars: { jdk: [...PROBE_ENV_VARS.jdk], maven: [...PROBE_ENV_VARS.maven] },
+  resolutionOrder: [...PROBE_RESOLUTION_ORDER],
+  mavenArchive: {
+    file: 'apache-maven-3.9.16-bin.zip',
+    sha256: FIXTURE_ARCHIVE_SHA,
+    inRepository: false,
+    archivedReadOnly: true,
+    extractScope: '仅解压到仓库外的系统临时目录，压缩包保持只读',
+  },
+  recorded: { measuredAt: '2026-01-01', jdkMajor: 17, mavenMajor: 3 },
+};
 
 function fixtureJdk({ version = '17.0.9', major = 17, found = true, mode = 'temp-fd' } = {}) {
   return {
     name: 'JDK',
-    path: found ? 'C:/jdk-17/bin/java.exe' : null,
+    path: found ? join(FIXTURE_JDK_HOME, 'bin', 'java.exe') : null,
+    source: found ? 'explicit-flag' : null,
     version: found ? version : null,
     major: found ? major : null,
     mode: found ? mode : 'none',
     found,
-    checked: ['C:/jdk-17/bin/java.exe'],
+    checked: [join(FIXTURE_JDK_HOME, 'bin', 'java.exe')],
     note: null,
   };
 }
@@ -1121,14 +1575,23 @@ function fixtureJdk({ version = '17.0.9', major = 17, found = true, mode = 'temp
 function fixtureMaven({ version = '3.9.6', found = true, mode = 'temp-fd' } = {}) {
   return {
     name: 'Maven',
-    path: found ? 'C:/maven/bin/mvn.cmd' : null,
+    path: found ? join(FIXTURE_MAVEN_HOME, 'bin', 'mvn.cmd') : null,
+    source: found ? 'explicit-flag' : null,
     version: found ? version : null,
     major: found ? 3 : null,
     mode: found ? mode : 'none',
     found,
-    checked: ['C:/maven/bin/mvn.cmd'],
+    checked: [join(FIXTURE_MAVEN_HOME, 'bin', 'mvn.cmd')],
     note: null,
   };
+}
+
+function fixtureAdmissionSteps() {
+  return REQUIRED_PREREQUISITE_IDS.map((id) => ({
+    id: `step-${id}`,
+    title: `fixture:${id}`,
+    requires: [id],
+  }));
 }
 
 function fixtureManifest(options = {}) {
@@ -1153,11 +1616,16 @@ function fixtureManifest(options = {}) {
     manifestVersion: '0.1.0',
     stage: options.stage ?? 'pre-poc-gate',
     boundary: { ...FIXTURE_BOUNDARY, ...(options.boundary ?? {}) },
-    toolchain: { jdk: { minMajor: 17 }, maven: { minVersion: '3.9.0' } },
+    toolchain: {
+      jdk: { minMajor: 17 },
+      maven: { minVersion: '3.9.0' },
+      probe: structuredClone(FIXTURE_TOOLCHAIN_PROBE),
+    },
     candidate: {
       target: { project: 'RuoYi-Vue', line: 'spring-boot-3', minJdkMajor: 17 },
       pinned: { tag, commit, resolved },
       unresolvedReasons: REQUIRED_PREREQUISITE_IDS.filter((id) => !satisfiedSet.has(id)),
+      admissionSteps: fixtureAdmissionSteps(),
     },
     admissionPrerequisites: prerequisites,
     complianceArtifacts: options.artifacts ?? [
@@ -1166,7 +1634,25 @@ function fixtureManifest(options = {}) {
   };
   if (options.manifestVersion) manifest.manifestVersion = options.manifestVersion;
   if (options.toolchain) manifest.toolchain = options.toolchain;
+  if (options.dropProbe) delete manifest.toolchain.probe;
+  if (options.probePatch) {
+    manifest.toolchain.probe = { ...manifest.toolchain.probe, ...options.probePatch };
+  }
+  if (options.archivePatch) {
+    manifest.toolchain.probe = {
+      ...manifest.toolchain.probe,
+      mavenArchive: { ...manifest.toolchain.probe.mavenArchive, ...options.archivePatch },
+    };
+  }
+  if (options.recordedPatch) {
+    manifest.toolchain.probe = {
+      ...manifest.toolchain.probe,
+      recorded: { ...manifest.toolchain.probe.recorded, ...options.recordedPatch },
+    };
+  }
   if (options.candidate) manifest.candidate = { ...manifest.candidate, ...options.candidate };
+  if (options.admissionSteps === null) delete manifest.candidate.admissionSteps;
+  else if (options.admissionSteps) manifest.candidate.admissionSteps = options.admissionSteps;
   return manifest;
 }
 
@@ -1211,7 +1697,30 @@ function runSelfTestScenario(scenario) {
   for (const needle of scenario.expect ?? []) {
     if (!messages.includes(needle)) failures.push(`期望信息包含「${needle}」`);
   }
-  return { name: scenario.name, failures, report };
+  return { name: scenario.name, failures, exitCode: report.exitCode };
+}
+
+/** 参数与显式探测路径的自检：注入合成文件系统，不读磁盘。 */
+function runPreflightScenario(scenario) {
+  const directories = scenario.directories ?? [];
+  const files = scenario.files ?? [];
+  const prepared = preflight(scenario.argv ?? [], {
+    directoryExists: (target) => directories.includes(target),
+    fileExists: (target) => files.includes(target),
+  });
+  const messages = prepared.error ?? '';
+  const exitCode = prepared.error ? prepared.exitCode : EXIT.PASS;
+  const failures = [];
+  if (exitCode !== scenario.expectCode) {
+    failures.push(`退出码期望 ${scenario.expectCode}，实际 ${exitCode}`);
+  }
+  for (const needle of scenario.expect ?? []) {
+    if (!messages.includes(needle)) failures.push(`期望信息包含「${needle}」`);
+  }
+  if (scenario.expectJavaHome !== undefined && prepared.javaHome !== scenario.expectJavaHome) {
+    failures.push(`期望解析出的 JDK home 为 ${scenario.expectJavaHome}，实际 ${prepared.javaHome}`);
+  }
+  return { name: scenario.name, failures, exitCode };
 }
 
 function selfTest() {
@@ -1448,23 +1957,204 @@ function selfTest() {
       sources: [fixtureSource('x.mjs', fixtureStaticImport('./helper.mjs'))],
       expectCode: 0,
     },
+    {
+      name: '清单标记 satisfied 但本机 JDK 未达标 → 未准入（不是违规）',
+      satisfied: allIds,
+      pinned: greenPinned,
+      probe: { jdk: fixtureJdk({ version: '1.8.0_501', major: 8 }), maven: fixtureMaven() },
+      expectCode: 2,
+      expect: ['未能在本机复现'],
+    },
+    {
+      name: '清单标记 satisfied 但本机找不到 Maven → 未准入（不是违规）',
+      satisfied: allIds,
+      pinned: greenPinned,
+      probe: { jdk: fixtureJdk(), maven: fixtureMaven({ found: false }) },
+      expectCode: 2,
+      expect: ['未能在本机复现'],
+    },
+    {
+      name: '清单实测记录主版本高于本机可复现水平',
+      ...green,
+      recordedPatch: { jdkMajor: 21 },
+      expectCode: 1,
+      expect: ['高于本机可复现水平'],
+    },
+    {
+      name: '清单缺少可复现探测配方（toolchain.probe）',
+      ...green,
+      dropProbe: true,
+      expectCode: 1,
+      expect: ['toolchain.probe 必须是对象'],
+    },
+    {
+      name: '探测配方解析优先级被改写',
+      ...green,
+      probePatch: { resolutionOrder: ['path', 'env', 'explicit-flag'] },
+      expectCode: 1,
+      expect: ['resolutionOrder'],
+    },
+    {
+      name: '本地 Maven 压缩包摘要写成占位值',
+      ...green,
+      archivePatch: { sha256: 'f'.repeat(64) },
+      expectCode: 1,
+      expect: ['sha256'],
+    },
+    {
+      name: '本地 Maven 压缩包被声明为可入库',
+      ...green,
+      archivePatch: { inRepository: true },
+      expectCode: 1,
+      expect: ['inRepository'],
+    },
+    {
+      name: '候选准入步骤缺失',
+      ...green,
+      admissionSteps: null,
+      expectCode: 1,
+      expect: ['admissionSteps'],
+    },
+    {
+      name: '候选准入步骤漏掉必需前置',
+      ...green,
+      admissionSteps: [{ id: 'step-one', title: 'fixture', requires: ['toolchain-jdk'] }],
+      expectCode: 1,
+      expect: ['漏掉'],
+    },
+    {
+      name: '候选准入步骤引用未登记前置',
+      ...green,
+      admissionSteps: [
+        ...fixtureAdmissionSteps(),
+        { id: 'step-extra', title: 'fixture', requires: ['not-registered'] },
+      ],
+      expectCode: 1,
+      expect: ['未登记的前置'],
+    },
+    {
+      name: '工具链达标但准入前置未满足 → 未准入（不是通过）',
+      satisfied: ['toolchain-jdk', 'toolchain-maven'],
+      pinned: { commit: null, tag: null, resolved: false },
+      expectCode: 2,
+      expect: ['准入前置未满足'],
+    },
+    {
+      name: '前置齐备但合规产物仍 pending → 未准入（不是通过）',
+      ...green,
+      artifacts: [
+        { id: 'license', path: 'services/ruoyi-api/compliance/LICENSE', status: 'pending' },
+      ],
+      fileExists: () => false,
+      expectCode: 2,
+      expect: ['合规产物未就位'],
+    },
+  ];
+
+  const preflightScenarios = [
+    {
+      name: '显式 --java-home（合法）被接受',
+      argv: ['--java-home', FIXTURE_JDK_HOME],
+      directories: [FIXTURE_JDK_HOME],
+      files: [join(FIXTURE_JDK_HOME, 'bin', 'java.exe'), join(FIXTURE_JDK_HOME, 'bin', 'java')],
+      expectCode: 0,
+    },
+    {
+      name: '显式 --java-home=<路径> 内联写法被接受',
+      argv: [`--java-home=${FIXTURE_JDK_HOME}`],
+      directories: [FIXTURE_JDK_HOME],
+      files: [join(FIXTURE_JDK_HOME, 'bin', 'java.exe')],
+      expectCode: 0,
+    },
+    {
+      name: '显式 --maven-home（合法）被接受',
+      argv: ['--maven-home', FIXTURE_MAVEN_HOME],
+      directories: [FIXTURE_MAVEN_HOME],
+      files: [join(FIXTURE_MAVEN_HOME, 'bin', 'mvn.cmd')],
+      expectCode: 0,
+    },
+    {
+      name: '--java-home 缺少路径值',
+      argv: ['--java-home'],
+      expectCode: 64,
+      expect: ['缺少路径值'],
+    },
+    {
+      name: '--maven-home 使用相对路径',
+      argv: ['--maven-home', 'apache-maven-3.9.16'],
+      expectCode: 64,
+      expect: ['绝对路径'],
+    },
+    {
+      name: '--java-home 指向的目录不存在',
+      argv: ['--java-home', FIXTURE_JDK_HOME],
+      expectCode: 64,
+      expect: ['不存在或不可读'],
+    },
+    {
+      name: '--java-home 指向的目录不含 bin/java（fail-closed）',
+      argv: ['--java-home', FIXTURE_JDK_HOME],
+      directories: [FIXTURE_JDK_HOME],
+      expectCode: 64,
+      expect: ['不是有效的 JDK home'],
+    },
+    {
+      name: '--maven-home 指向的目录不含 bin/mvn',
+      argv: ['--maven-home', FIXTURE_MAVEN_HOME],
+      directories: [FIXTURE_MAVEN_HOME],
+      expectCode: 64,
+      expect: ['不是有效的 Maven home'],
+    },
+    {
+      name: '显式探测路径重复指定',
+      argv: ['--java-home', FIXTURE_JDK_HOME, '--java-home', FIXTURE_JDK_HOME],
+      directories: [FIXTURE_JDK_HOME],
+      files: [join(FIXTURE_JDK_HOME, 'bin', 'java.exe')],
+      expectCode: 64,
+      expect: ['只能指定一次'],
+    },
+    {
+      name: '未知参数仍然报用法错误',
+      argv: ['--java-homes', FIXTURE_JDK_HOME],
+      expectCode: 64,
+      expect: ['未知参数'],
+    },
   ];
 
   console.log('RuoYi 工具链门禁自检（合成输入；不读磁盘、不执行探测器）');
   let failed = 0;
+  const total = scenarios.length + preflightScenarios.length;
   for (const scenario of scenarios) {
     const result = runSelfTestScenario(scenario);
     if (result.failures.length === 0) {
-      console.log(`  ok ${scenario.name}（退出码 ${result.report.exitCode}）`);
+      console.log(`  ok ${scenario.name}（退出码 ${result.exitCode}）`);
       continue;
     }
     failed += 1;
     console.error(`  x ${scenario.name}：${result.failures.join('；')}`);
-    for (const message of [...result.report.violations, ...result.report.blockers].slice(0, 4)) {
+    const report = evaluate({
+      manifest: scenario.manifest === undefined ? fixtureManifest(scenario) : scenario.manifest,
+      manifestError: scenario.manifestError ?? null,
+      paths: scenario.paths ?? [],
+      sources: scenario.sources ?? [],
+      toolchain: scenario.probe ?? { jdk: fixtureJdk(), maven: fixtureMaven() },
+      scanRoot: 'services/ruoyi-api',
+      manifestContext: { fileExists: scenario.fileExists ?? (() => true) },
+    });
+    for (const message of [...report.violations, ...report.blockers].slice(0, 4)) {
       console.error(`      - ${message}`);
     }
   }
-  console.log(`\n自检: ${scenarios.length - failed}/${scenarios.length} 通过`);
+  for (const scenario of preflightScenarios) {
+    const result = runPreflightScenario(scenario);
+    if (result.failures.length === 0) {
+      console.log(`  ok ${scenario.name}（退出码 ${result.exitCode}）`);
+      continue;
+    }
+    failed += 1;
+    console.error(`  x ${scenario.name}：${result.failures.join('；')}`);
+  }
+  console.log(`\n自检: ${total - failed}/${total} 通过`);
   return failed === 0 ? EXIT.PASS : EXIT.SELF_TEST_FAILED;
 }
 
@@ -1473,12 +2163,13 @@ function selfTest() {
  * ------------------------------------------------------------------ */
 
 function main(argv) {
-  const flags = parseArgs(argv);
-  if (flags.error) {
-    console.error(flags.error);
+  const prepared = preflight(argv);
+  if (prepared.error) {
+    console.error(prepared.error);
     printUsage();
     return EXIT.USAGE;
   }
+  const flags = prepared.flags;
   if (flags.help) {
     printUsage();
     return EXIT.PASS;
@@ -1492,7 +2183,13 @@ function main(argv) {
     relPosix(GATE_ROOT, absolutePath),
   );
   const sources = readSourceEntries(GATE_ROOT);
-  const toolchain = { jdk: probeTool(JDK_PROBE), maven: probeTool(MAVEN_PROBE) };
+  const probeOptions = { javaHome: prepared.javaHome, mavenHome: prepared.mavenHome };
+  const jdkRecord = probeTool(JDK_PROBE, probeOptions);
+  const mavenOptions = {
+    ...probeOptions,
+    jdkHomeForMaven: mavenProbeJdkHome(probeOptions, jdkRecord),
+  };
+  const toolchain = { jdk: jdkRecord, maven: probeTool(MAVEN_PROBE, mavenOptions) };
   const context = {
     gateRoot: GATE_ROOT,
     manifestFile: MANIFEST_FILE,
@@ -1502,6 +2199,11 @@ function main(argv) {
     truncated: scan.truncated,
     sourceFiles: sources.length,
     mode: flags.report ? 'report' : 'gate',
+    probe: {
+      javaHome: prepared.javaHome,
+      mavenHome: prepared.mavenHome,
+      mavenJdkHome: mavenOptions.jdkHomeForMaven,
+    },
   };
   const report = evaluate({
     manifest,

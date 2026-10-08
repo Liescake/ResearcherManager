@@ -1,6 +1,6 @@
 {
   "contract": "ruoyi-toolchain-gate",
-  "manifestVersion": "0.1.0",
+  "manifestVersion": "0.2.0",
   "stage": "pre-poc-gate",
   "boundary": {
     "rule": "在准入前置与工具链门禁全部满足前，services/ruoyi-api 内不得出现 Maven 工程、Java/Kotlin 源码、构建产物或 RuoYi 源码副本。",
@@ -43,7 +43,21 @@
   },
   "toolchain": {
     "jdk": { "minMajor": 17, "requirement": "JDK 17+" },
-    "maven": { "minVersion": "3.9.0", "requirement": "Maven 3.9+" }
+    "maven": { "minVersion": "3.9.0", "requirement": "Maven 3.9+" },
+    "probe": {
+      "explicitFlags": { "jdk": "--java-home", "maven": "--maven-home" },
+      "envVars": { "jdk": ["JAVA_HOME"], "maven": ["MAVEN_HOME", "M2_HOME"] },
+      "resolutionOrder": ["explicit-flag", "env", "path"],
+      "mavenArchive": {
+        "file": "apache-maven-3.9.16-bin.zip",
+        "sha256": "5af3b743dd8b876b5c45da33b676251e5f1687712644abb4ee519ca56e1d89ce",
+        "inRepository": false,
+        "archivedReadOnly": true,
+        "extractScope": "只解压到仓库外的系统临时目录（%TEMP%\\rm-toolchain-probe）后使用；压缩包本身保持只读，禁止修改、移动或提交入库",
+        "note": "压缩包只在本机使用，不属于仓库产物；sha256 为 2026-10-08 实测值（解压前后一致）。本清单不代替字节级复算，复现命令见 toolchain/README.md §5.1。"
+      },
+      "recorded": { "measuredAt": "2026-10-08", "jdkMajor": 17, "mavenMajor": 3 }
+    }
   },
   "candidate": {
     "target": {
@@ -54,8 +68,6 @@
     },
     "pinned": { "tag": null, "commit": null, "resolved": false },
     "unresolvedReasons": [
-      "toolchain-jdk",
-      "toolchain-maven",
       "candidate-commit",
       "license-notice",
       "dependency-licenses",
@@ -64,6 +76,53 @@
       "postgresql-compatibility",
       "security-review",
       "final-review"
+    ],
+    "admissionSteps": [
+      {
+        "id": "toolchain-reproduce",
+        "title": "用显式路径复现 JDK 17+ 与 Maven 3.9+ 探测（仅在工作区外临时目录解压本地 Maven 压缩包）",
+        "requires": ["toolchain-jdk", "toolchain-maven"]
+      },
+      {
+        "id": "pin-candidate",
+        "title": "固定实际 Spring Boot 3 候选 commit（40 位 SHA）并同时固定 tag，核对其 POM 声明的 JDK 与 Spring Boot 版本",
+        "requires": ["candidate-commit"]
+      },
+      {
+        "id": "license-and-notice",
+        "title": "保留候选原始 LICENSE/NOTICE 原文与哈希证据（不做改写）",
+        "requires": ["license-notice"]
+      },
+      {
+        "id": "dependency-inventory",
+        "title": "在隔离目录生成依赖树、传递依赖许可证清单与 SBOM（记录工具、版本与生成时间）",
+        "requires": ["dependency-licenses", "sbom"]
+      },
+      {
+        "id": "vulnerability-scan",
+        "title": "完成依赖漏洞扫描并逐项记录处置结论（记录扫描工具与规则版本）",
+        "requires": ["vulnerability-scan"]
+      },
+      {
+        "id": "postgresql-validation",
+        "title": "在隔离 PostgreSQL 实例验证 DDL、分页、时间、事务、索引与迁移回滚",
+        "requires": ["postgresql-compatibility"]
+      },
+      {
+        "id": "independent-reviews",
+        "title": "完成架构/安全独立审查与终审并保留放行结论（不由实施方自证）",
+        "requires": ["security-review", "final-review"]
+      },
+      {
+        "id": "gate-promotion",
+        "title": "全部前置 satisfied 且合规产物就位后，才把本清单 stage 提升为 admitted（此前不得出现 pom.xml 与 Java 源码）",
+        "requires": []
+      },
+      {
+        "id": "provenance-promotion",
+        "title": "五项来源/合规证据全部 verified（文件存在、摘要与内容标记匹配）并与本清单交叉核验后，才把 provenance-manifest.json 的 stage 提升为 poc-ready",
+        "requires": []
+      }
     ],
     "rules": {
       "commitFormat": "^[0-9a-f]{40}$",
@@ -75,13 +134,15 @@
   "admissionPrerequisites": [
     {
       "id": "toolchain-jdk",
-      "status": "pending",
-      "requirement": "本机 JDK 17+ 可用（版本探测达要求）"
+      "status": "satisfied",
+      "requirement": "本机 JDK 17+ 可用（版本探测达要求）",
+      "evidence": "2026-10-08 本机实测 JDK 17.0.12（home C:\\Program Files\\Java\\jdk-17，探测来源 explicit-flag）。复现：node services/ruoyi-api/toolchain/check-gate.mjs --java-home \"C:\\Program Files\\Java\\jdk-17\"。PATH 上的 java 仍为 1.8.0_501，不带显式参数时本机探测不达标。"
     },
     {
       "id": "toolchain-maven",
-      "status": "pending",
-      "requirement": "本机 Maven 3.9+ 可用（版本探测达要求）"
+      "status": "satisfied",
+      "requirement": "本机 Maven 3.9+ 可用（版本探测达要求）",
+      "evidence": "2026-10-08 本机实测 Maven 3.9.16：由仓库根 apache-maven-3.9.16-bin.zip 只读解压到仓库外临时目录后探测（探测来源 explicit-flag，JAVA_HOME 由 --java-home 注入 17.0.12），压缩包解压前后 SHA-256 一致（见 toolchain.probe.mavenArchive.sha256）。系统未安装 Maven，不带显式参数时探测不到。"
     },
     {
       "id": "candidate-commit",
@@ -159,6 +220,7 @@
   "nonGoals": [
     "本清单不保存 RuoYi 源码、候选 POM 副本、依赖锁定文件或任何构建产物。",
     "本清单不声明可构建、可运行或生产就绪；它只描述准入前置与禁止项。",
-    "本清单不替代公开契约校验（services/ruoyi-api/contracts/validate.mjs）与人工安全评审。"
+    "本清单不替代公开契约校验（services/ruoyi-api/contracts/validate.mjs）与人工安全评审。",
+    "本清单不把本机 Maven 压缩包当作可分发产物：压缩包只留本机、保持只读，解压只在仓库外临时目录进行。"
   ]
 }
