@@ -1,0 +1,41 @@
+# Docker 构建上下文排除项（公开、可提交）。
+# 目的：镜像里只放构建与运行真正需要的东西，本地文档与机密一律不进上下文。
+
+# 版本控制与 CI
+.git
+.github
+
+# 依赖与构建产物（镜像内重新安装/构建）
+node_modules
+**/node_modules
+.pnpm-store
+.pnpm-cache
+**/dist
+**/build
+**/coverage
+**/*.tsbuildinfo
+
+# 内部文档与本地工作材料（不随仓库分发）
+docs
+需求.txt
+要求.txt
+AI开发计划表.md
+计划表待确认问题清单.md
+_local-git-backup-before-purge.bundle
+
+# 环境变量与证书：只允许**示例模板**进入上下文（真实 .env* 一律排除）
+.env
+.env.*
+!.env.example
+!.env.docker.example
+certs
+*.pem
+*.key
+
+# 本机工具链压缩包与临时文件
+apache-maven-*-bin.zip
+*.log
+*.tmp
+*.bak
+_acl-recovery
+_probe
