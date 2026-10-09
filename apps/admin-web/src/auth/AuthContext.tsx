@@ -7,8 +7,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { ApiClientError, createApiClient, resolveApiBaseUrl } from '../api/client';
-import type { ApiClient } from '../api/client';
+import { createApiClient, resolveApiBaseUrl } from '../api/client';
 import { ENDPOINTS } from '../api/endpoints';
 import { toUiError, type UiError } from '../api/errors';
 import { createDemoGateway, createLiveGateway, type AdminGateway } from '../api/gateway';
@@ -25,6 +24,18 @@ import {
 } from '../api/session';
 import { HOME_PATH, LOGIN_PATH } from '../router/routes';
 import { buildHash, navigate } from '../router/hash-router';
+import {
+  LOGGED_OUT_NOTICE,
+  SESSION_EXPIRED_NOTICE,
+  expireSession,
+  verifyTicket,
+} from './session-flow';
+
+/**
+ * 会话层提示里与 401 相关的两条由无 React 依赖的 `session-flow` 提供，
+ * 在这里转出以保持既有引用路径不变。
+ */
+export { LOGGED_OUT_NOTICE, SESSION_EXPIRED_NOTICE };
 
 /**
  * 会话与取数上下文。
@@ -57,63 +68,11 @@ export interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
-export const SESSION_EXPIRED_NOTICE = '登录状态已失效，请重新登录。';
-export const LOGGED_OUT_NOTICE = '已退出登录。';
 export const DEMO_ENTERED_NOTICE =
   '已进入受控演示模式：所有数据来自前端夹具，写操作被拒绝，不会产生任何真实持久化结果。';
 
 /** 票据形状不合法时的本地拒绝（不发请求，也不写入会话） */
 export const INVALID_TICKET_NOTICE = '会话票据格式不符：应为 8–128 位字母、数字或 . _ : - 字符。';
-
-interface VerificationOutcome {
-  ok: boolean;
-  warning?: string;
-  error?: UiError;
-}
-
-/**
- * 用真实请求确认票据：探测 `GET /me/profile`。
- *
- * 为什么选它：共享权限目录里**每个默认角色都含 `profile:self:read`**，因此它是最中性的
- * 「服务端是否认这张票据」探针。判定口径：
- * - 401 → 票据无效或已过期（失败）；
- * - 200 / 404（尚未提交画像）/ 403（票据有效但角色缺该权限）→ 服务端**认这张票据**；
- *   403 附提示，因为后续管理端页面可能仍然因权限不足而显示 403 面板；
- * - 网络错误/超时 → 无法确认，按失败处理（fail-closed，不写入会话）。
- */
-async function verifyTicket(client: ApiClient, ticket: string): Promise<VerificationOutcome> {
-  const probe = createApiClient({
-    baseUrl: client.baseUrl,
-    tokenProvider: () => ticket,
-    // 刻意不接 onUnauthorized：登录失败不应该触发「会话过期」的全局处理
-  });
-
-  try {
-    await probe.getJson(ENDPOINTS.profileRead.path);
-    return { ok: true };
-  } catch (caught) {
-    if (caught instanceof ApiClientError) {
-      if (caught.status === 401) {
-        return {
-          ok: false,
-          error: toUiError(caught, `${ENDPOINTS.profileRead.method} ${ENDPOINTS.profileRead.path}`),
-        };
-      }
-      if (caught.status === 404 || caught.status === 403) {
-        return {
-          ok: true,
-          ...(caught.status === 403
-            ? { warning: '会话有效，但当前角色缺少 profile:self:read，部分管理端功能可能不可用。' }
-            : {}),
-        };
-      }
-    }
-    return {
-      ok: false,
-      error: toUiError(caught, `${ENDPOINTS.profileRead.method} ${ENDPOINTS.profileRead.path}`),
-    };
-  }
-}
 
 export interface AuthProviderProps {
   children: ReactNode;
@@ -147,9 +106,9 @@ export function AuthProvider({ children, storage, baseUrl }: AuthProviderProps):
             : null,
         onUnauthorized: () => {
           // 会话语义上的失效：清空 + 提示；跳转由路由守卫完成（401 不在这里做命令式跳转）
-          writeSession(storageRef.current, ANONYMOUS);
-          setSession(ANONYMOUS);
-          setNotice(SESSION_EXPIRED_NOTICE);
+          const expiry = expireSession(storageRef.current);
+          setSession(expiry.state);
+          setNotice(expiry.notice);
         },
       }),
     [resolvedBaseUrl, session],
@@ -177,7 +136,7 @@ export function AuthProvider({ children, storage, baseUrl }: AuthProviderProps):
           },
         };
       }
-      const outcome = await verifyTicket(client, trimmed);
+      const outcome = await verifyTicket({ baseUrl: client.baseUrl, ticket: trimmed });
       if (!outcome.ok) {
         return {
           ok: false,
