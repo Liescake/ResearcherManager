@@ -11,6 +11,7 @@ import { ApiResponseInterceptor } from '../../common/api-response.interceptor';
 import { APP_ENV, ConfigModule } from '../../config/config.module';
 import type { AppEnv } from '../../config/env';
 import { loadEnv } from '../../config/env';
+import { describeDependencyReadinessTier } from '../../db/persistence/dependency-readiness';
 import { HealthModule } from '../health/health.module';
 import {
   checkHealthDataAgainstContract,
@@ -23,14 +24,17 @@ import {
   RUNTIME_INFO_FIELDS,
   RuntimeInfoService,
   checkRuntimeInfoFields,
+  toRuntimeInfo,
 } from './runtime-info.service';
 
 /**
  * 真实控制器测试：启动**真实 Nest 应用**（保留全局响应信封与统一异常映射），
  * 通过真实 HTTP 断言 `GET /api/v1/runtime-info`：
- * 1. 字段闭集（恰好 6 个白名单字段，多一个少一个都不行）；
- * 2. 开关矩阵（NODE_ENV / API_PORT / API_PREFIX / DATABASE_URL / AI_PROVIDER / AI_MATCHING_ENABLED）；
- * 3. 敏感值不泄露（连接串、会话密钥、AI key、AI base URL、微信密钥、原始 env 字段名）；
+ * 1. 字段闭集（恰好 7 个白名单字段，多一个少一个都不行）；
+ * 2. 开关矩阵（NODE_ENV / API_PORT / API_PREFIX / DATABASE_URL / 依赖就绪门禁档位 /
+ *    AI_PROVIDER / AI_MATCHING_ENABLED）；
+ * 3. 敏感值不泄露（连接串、会话密钥、AI key、AI base URL、微信密钥、原始 env 字段名、
+ *    依赖就绪证据/后端标识）；
  * 4. 注入 runtime-info 后健康路由行为不变。
  */
 
@@ -106,6 +110,7 @@ const toggleMatrix: ReadonlyArray<{ name: string; env: AppEnv; expected: Runtime
       apiPort: 3000,
       apiPrefix: '/api/v1',
       databaseConfigured: false,
+      dependencyGate: 'not-required',
       aiProvider: 'mock',
       aiMatchingEnabled: false,
     },
@@ -118,6 +123,7 @@ const toggleMatrix: ReadonlyArray<{ name: string; env: AppEnv; expected: Runtime
       apiPort: 3000,
       apiPrefix: '/api/v1',
       databaseConfigured: false,
+      dependencyGate: 'not-required',
       aiProvider: 'mock',
       aiMatchingEnabled: true,
     },
@@ -130,6 +136,7 @@ const toggleMatrix: ReadonlyArray<{ name: string; env: AppEnv; expected: Runtime
       apiPort: 3000,
       apiPrefix: '/api/v1',
       databaseConfigured: true,
+      dependencyGate: 'required',
       aiProvider: 'disabled',
       aiMatchingEnabled: true,
     },
@@ -142,6 +149,7 @@ const toggleMatrix: ReadonlyArray<{ name: string; env: AppEnv; expected: Runtime
       apiPort: 3000,
       apiPrefix: '/api/v1',
       databaseConfigured: true,
+      dependencyGate: 'required',
       aiProvider: 'http-json',
       aiMatchingEnabled: false,
     },
@@ -154,6 +162,7 @@ const toggleMatrix: ReadonlyArray<{ name: string; env: AppEnv; expected: Runtime
       apiPort: 8080,
       apiPrefix: '/api/v2',
       databaseConfigured: true,
+      dependencyGate: 'required',
       aiProvider: 'http-json',
       aiMatchingEnabled: true,
     },
@@ -281,6 +290,7 @@ describe('GET /api/v1/runtime-info 字段闭集与开关矩阵（真实 Nest 应
       'apiPort',
       'apiPrefix',
       'databaseConfigured',
+      'dependencyGate',
       'aiProvider',
       'aiMatchingEnabled',
     ]);
@@ -293,9 +303,31 @@ describe('GET /api/v1/runtime-info 字段闭集与开关矩阵（真实 Nest 应
       apiPort: 8080,
       apiPrefix: '/api/v2',
       databaseConfigured: true,
+      dependencyGate: 'required',
       aiProvider: 'http-json',
       aiMatchingEnabled: true,
     });
+  });
+
+  it('依赖就绪门禁档位：与启动门禁同一函数，且只回枚举不回证据/后端标识', () => {
+    // 档位口径必须与启动门禁完全一致（生产或已配置数据库 ⇒ required），否则运维会看到
+    // 一个「看起来没要求」的进程而实际已被门禁约束。
+    const matrix: ReadonlyArray<{ env: AppEnv; tier: 'required' | 'not-required' }> = [
+      { env: defaultEnv, tier: 'not-required' },
+      { env: matchingOnEnv, tier: 'not-required' },
+      { env: aiDisabledEnv, tier: 'required' },
+      { env: httpJsonWithoutMatchingEnv, tier: 'required' },
+      { env: fullEnv, tier: 'required' },
+    ];
+    for (const { env, tier } of matrix) {
+      expect(toRuntimeInfo(env).dependencyGate).toBe(tier);
+      expect(toRuntimeInfo(env).dependencyGate).toBe(
+        describeDependencyReadinessTier(env.NODE_ENV, Boolean(env.DATABASE_URL)),
+      );
+    }
+    // required 档位也不携带任何证据引用 / 后端标识 / 时间戳
+    const serialized = JSON.stringify(toRuntimeInfo(fullEnv));
+    expect(serialized).not.toMatch(/evidence|readiness|verifiedAt|checkedAt|postgres|in-memory/iu);
   });
 });
 
@@ -311,12 +343,13 @@ describe('敏感配置绝不进入 /runtime-info 响应', () => {
     for (const name of FORBIDDEN_FIELD_NAMES) {
       expect(text).not.toContain(name);
     }
-    // AI 侧只回供应商枚举与开关，不回 base URL / key / model
+    // AI 侧只回供应商枚举与开关，不回 base URL / key / model；依赖就绪只回档位枚举
     expect(body.data).toEqual({
       nodeEnv: 'production',
       apiPort: 8080,
       apiPrefix: '/api/v2',
       databaseConfigured: true,
+      dependencyGate: 'required',
       aiProvider: 'http-json',
       aiMatchingEnabled: true,
     });

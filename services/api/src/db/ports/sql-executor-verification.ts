@@ -252,8 +252,13 @@ export function inspectSqlExecutorSurface(instance: unknown): SqlExecutorSurface
 // 声明完整性：深度冻结、自持原型、只允许数据属性
 // ---------------------------------------------------------------------------
 
-/** 深度冻结（对象、数组与嵌套值）：封存声明必须在任何环境都不可改写 */
-function freezeDeep(value: unknown, seen = new Set<unknown>()): void {
+/**
+ * 深度冻结（对象、数组与嵌套值）：封存声明必须在任何环境都不可改写。
+ *
+ * 导出给**同类封存契约**复用（当前是 `db/persistence/dependency-readiness.ts` 的生产依赖就绪契约）：
+ * 「封存」的语义只有一份定义，避免两份契约各自实现出可被绕过的差异。
+ */
+export function freezeDeep(value: unknown, seen = new Set<unknown>()): void {
   if (typeof value !== 'object' || value === null || seen.has(value)) {
     return;
   }
@@ -341,11 +346,13 @@ export interface SqlExecutorVerificationRegistry {
 const ISO_TIMESTAMP_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u;
 
-function isNonBlankString(value: unknown): value is string {
+/** 非空字符串（去空白）判定：封存契约共用的形状基元 */
+export function isNonBlankString(value: unknown): value is string {
   return typeof value === 'string' && value.trim() !== '';
 }
 
-function isIsoTimestamp(value: unknown): value is string {
+/** 带时区的 ISO 时间戳判定：封存契约共用的时间基元 */
+export function isIsoTimestamp(value: unknown): value is string {
   return (
     typeof value === 'string' &&
     ISO_TIMESTAMP_PATTERN.test(value) &&

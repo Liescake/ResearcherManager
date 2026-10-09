@@ -1,9 +1,26 @@
-import { Inject, Injectable, Logger, Module, type OnApplicationBootstrap } from '@nestjs/common';
+import {
+  Inject,
+  Injectable,
+  Logger,
+  Module,
+  Optional,
+  type OnApplicationBootstrap,
+} from '@nestjs/common';
 import { ModuleRef } from '@nestjs/core';
 import { APP_ENV } from '../config/config.module';
 import type { AppEnv } from '../config/env';
 import { resolveDatabaseConfig, type DatabaseConfigResolution } from './config/database-config';
 import { bindingTokenName, PERSISTENCE_BINDINGS } from './persistence-bindings';
+import {
+  DEFAULT_DEPENDENCY_READINESS_REGISTRY,
+  DependencyReadinessError,
+  describeDependencyReadinessTier,
+  evaluateDependencyReadiness,
+  type DependencyReadinessCandidate,
+  type DependencyReadinessRegistry,
+  type DependencyReadinessReport,
+  type DependencyRole,
+} from './persistence/dependency-readiness';
 import {
   assertPersistenceBoundary,
   type PersistenceBoundaryReport,
@@ -42,6 +59,14 @@ import {
  * `SQL_EXECUTOR_VERIFICATION_FAILED`，两类都在 `onApplicationBootstrap` 阶段抛错终止启动，
  * 且发生在任何 `connect` 之前。未配置数据库时该要求不生效（无数据库默认启动保持放行）。
  *
+ * **生产依赖就绪门禁（本次新增）**：业务与会话依赖不再接受「能力自述」。只要门禁生效
+ * （`NODE_ENV=production`，或已配置 `DATABASE_URL`），`DependencyReadinessService` 就按
+ * **认证 → 业务** 分阶段判定每个已登记端口：内存替身判 `DEPENDENCY_NOT_PERSISTENT`，
+ * 未验证后端判 `DEPENDENCY_NOT_VERIFIED`，自称生产可用但没有封存声明/验证证据的一律判
+ * `DEPENDENCY_NOT_SEALED` / `DEPENDENCY_EVIDENCE_*`（见 `persistence/dependency-readiness.ts`）。
+ * 认证阶段不通过时业务阶段整体不评估，业务端口不会被读取。开发/测试且无数据库时门禁不生效，
+ * 端口不会被触碰 —— 无数据库默认启动保持现状。
+ *
  * 业务 repository 的 DI 绑定**不在本模块改动**：换绑到 Postgres 实现属于后续切片，
  * 且必须先有经评估的驱动依赖与集成测试证据。
  */
@@ -53,29 +78,200 @@ export const DATABASE_CONFIG = Symbol('DATABASE_CONFIG');
 export const UNAVAILABLE_DRIVER_REASON =
   '尚未选定并验证 PostgreSQL 驱动（Prisma / TypeORM 选型未完成）：运行时不得切换到未验证数据库';
 
+// ---------------------------------------------------------------------------
+// 容器读取基元（能力边界与依赖就绪门禁共用同一实现，避免两份读取口径漂移）
+// ---------------------------------------------------------------------------
+
 /**
- * 启动期持久化边界检查。
+ * 读取端口绑定的实例本体；未在该装配中提供该令牌时返回 `undefined`。
+ * 只做容器查找，**不调用**实例的任何方法（不建连接、不查库）。
+ */
+function readBoundInstance(moduleRef: ModuleRef, token: symbol): unknown {
+  try {
+    return moduleRef.get<unknown, unknown>(token, { strict: false });
+  } catch {
+    // 未绑定：不在这里抛错，交由守卫按对应规则统一判定
+    return undefined;
+  }
+}
+
+/** 读取端口实现的能力声明（**原始值**，形状未校验）；数组与本原语视为未声明 */
+function readBoundCapabilities(moduleRef: ModuleRef, token: symbol): unknown {
+  const instance = readBoundInstance(moduleRef, token);
+  if (Array.isArray(instance) || typeof instance !== 'object' || instance === null) {
+    return undefined;
+  }
+  return (instance as { capabilities?: unknown }).capabilities;
+}
+
+// ---------------------------------------------------------------------------
+// 生产依赖就绪门禁（认证 → 业务）
+// ---------------------------------------------------------------------------
+
+/**
+ * 门禁接线选项：生产一律使用默认值（空登记表 + 当前时刻）。
+ * 只为测试与未来的多后端场景留出入口，避免把「换一份登记表」变成改全局状态。
+ */
+export interface DependencyReadinessOptions {
+  /** 封存身份集合；省略时使用 `DEFAULT_DEPENDENCY_READINESS_REGISTRY`（空集） */
+  readonly registry?: DependencyReadinessRegistry;
+  /** 判定时刻；省略时取当前时间（测试应显式注入，保证判定可复现） */
+  readonly now?: string;
+}
+
+/**
+ * DI 令牌：依赖就绪门禁的接线选项（**可选**）。
  *
- * 为什么放在启动钩子而不是只放在 main.ts：任何以 `AppModule` 组装并 `listen()`/`init()`
- * 的入口（测试、未来的 worker、CLI）都必须经过同一道门，避免出现「绕过 main.ts 就能带内存存储上线」。
+ * 生产装配不提供该令牌 ⇒ 两个服务都用默认值（空登记表 + 当前时刻）。测试与未来的多后端场景
+ * 可以提供它，从而在**不改全局状态**的前提下换一份登记表。刻意做成可选令牌而不是普通构造参数：
+ * 接口/类型别名会被 `emitDecoratorMetadata` 记成 `Object`，Nest 会把它当成第 4 个必填依赖，
+ * 让整个应用装配失败（这正是本切片实测到的失败模式）。
+ */
+export const DEPENDENCY_READINESS_OPTIONS = Symbol('DEPENDENCY_READINESS_OPTIONS');
+
+/** 能力边界服务的接线选项（把依赖就绪门禁的选项一起透传，保证两者读到同一份事实） */
+export type PersistenceBoundaryOptions = DependencyReadinessOptions;
+
+/** 阶段状态的可读文案（只用于日志，不含任何证据/取值） */
+function describeStageState(state: string): string {
+  switch (state) {
+    case 'not-required':
+      return '未要求';
+    case 'not-checked':
+      return '未评估（认证阶段未通过）';
+    case 'verified':
+      return '通过';
+    default:
+      return '拒绝';
+  }
+}
+
+/**
+ * 生产依赖就绪门禁：按「认证 → 业务」分阶段判定已登记持久化端口，违规即抛
+ * `DependencyReadinessError`（fail-closed）。
+ *
+ * 为什么独立成类而不是塞进 `PersistenceBoundaryService` 的循环：**判定顺序是契约的一部分**。
+ * 认证阶段（会话存储）必须先通过，业务阶段才被读取与判定；否则「业务依赖看着就绪」会把
+ * 「认证不可信」稀释掉。两个阶段各自惰性读取容器，因此该性质在容器层可观测
+ * （`FakeModuleRef` 记录到的令牌里不会出现业务端口）。
+ *
+ * 判定口径（与 `persistence/dependency-readiness.ts` 完全一致，本类只负责接线）：
+ * - 门禁档位 = `NODE_ENV=production` 或已配置 `DATABASE_URL`；否则不生效、不读取任何端口；
+ * - 内存替身（含 `InMemorySessionStore`）判 `DEPENDENCY_NOT_PERSISTENT`；
+ * - `persistent=true` 但 `productionReady=false` 判 `DEPENDENCY_NOT_VERIFIED`；
+ * - 自称「持久 + 生产可用」的绑定必须持登记表签发的**封存声明**与已登记、新鲜、一致的**验证证据**。
  */
 @Injectable()
-export class PersistenceBoundaryService implements OnApplicationBootstrap {
-  private readonly logger = new Logger(PersistenceBoundaryService.name);
+export class DependencyReadinessService {
+  private readonly logger = new Logger(DependencyReadinessService.name);
 
   constructor(
     private readonly moduleRef: ModuleRef,
     @Inject(DATABASE_CONFIG) private readonly database: DatabaseConfigResolution,
     @Inject(APP_ENV) private readonly env: AppEnv,
+    @Optional()
+    @Inject(DEPENDENCY_READINESS_OPTIONS)
+    private readonly options: DependencyReadinessOptions = {},
   ) {}
 
+  /** 执行门禁；通过时返回可写日志的脱敏摘要，不通过时抛 `DependencyReadinessError` */
+  verify(): DependencyReadinessReport {
+    const tier = describeDependencyReadinessTier(
+      this.env.NODE_ENV,
+      this.database.status === 'configured',
+    );
+    const report = evaluateDependencyReadiness({
+      required: tier === 'required',
+      // 惰性读取：未生效时零读取；认证阶段未通过时业务端口不会被读到
+      authentication: () => this.readCandidates('authentication'),
+      business: () => this.readCandidates('business'),
+      registry: this.options.registry ?? DEFAULT_DEPENDENCY_READINESS_REGISTRY,
+      now: this.options.now ?? new Date().toISOString(),
+    });
+
+    if (!report.ok) {
+      throw new DependencyReadinessError(report.violations);
+    }
+
+    this.logger.log(this.describeForLog(report));
+    return report;
+  }
+
+  /** 启动日志摘要：只有档位、阶段状态、端口数量与违规码，**不含**后端名/证据引用/取值 */
+  describeForLog(report: DependencyReadinessReport): string {
+    const codes = [...new Set(report.violations.map((item) => item.code))];
+    return [
+      `生产依赖就绪门禁：档位=${report.tier}`,
+      `认证阶段=${describeStageState(report.authentication)}`,
+      `业务阶段=${describeStageState(report.business)}`,
+      `已检查端口=${report.checkedTokens.length}`,
+      `违规=${codes.length === 0 ? '无' : codes.join(',')}`,
+    ].join('；');
+  }
+
+  /** 按角色收集候选：角色来自登记表（`persistence-bindings.ts`），不由调用方指定 */
+  private readCandidates(role: DependencyRole): readonly DependencyReadinessCandidate[] {
+    return PERSISTENCE_BINDINGS.filter((descriptor) => descriptor.role === role).map(
+      (descriptor) => ({
+        token: bindingTokenName(descriptor.token),
+        role,
+        capabilities: readBoundCapabilities(this.moduleRef, descriptor.token),
+      }),
+    );
+  }
+}
+
+/**
+ * 启动期持久化边界检查。
+ *
+ * 为什么放在启动钩子而不是只放在 main.ts：任何以 `AppModule` 组装并 `listen()`/`init()`
+ * 的入口（测试、未来的 worker、CLI）都必须经过同一道门，避免出现「绕过 main.ts 就能带内存存储上线」。
+ *
+ * 引导钩子里的**固定顺序**：依赖就绪门禁（认证 → 业务）→ 本类的能力边界与 SQL 执行器契约。
+ * 前者回答「这个依赖是否经过封存与证据验证」，后者回答「能力声明是否齐全、是否配置了数据库、
+ * 执行器是否 attest」；任一不通过都终止启动，且都发生在任何 `connect` 之前。
+ */
+@Injectable()
+export class PersistenceBoundaryService implements OnApplicationBootstrap {
+  private readonly logger = new Logger(PersistenceBoundaryService.name);
+
+  /** 与能力边界共用同一 ModuleRef / 配置：两者读到的「实际绑定」不可能漂移 */
+  private readonly readiness: DependencyReadinessService;
+
+  private lastReadiness: DependencyReadinessReport | undefined;
+
+  constructor(
+    private readonly moduleRef: ModuleRef,
+    @Inject(DATABASE_CONFIG) private readonly database: DatabaseConfigResolution,
+    @Inject(APP_ENV) private readonly env: AppEnv,
+    @Optional()
+    @Inject(DEPENDENCY_READINESS_OPTIONS)
+    options: PersistenceBoundaryOptions = {},
+  ) {
+    this.readiness = new DependencyReadinessService(moduleRef, database, env, options);
+  }
+
   onApplicationBootstrap(): void {
+    // 顺序固定，不依赖 Nest 对多个引导钩子的调用顺序
+    this.lastReadiness = this.readiness.verify();
     this.verify();
+  }
+
+  /**
+   * 最近一次依赖就绪判定结果（脱敏摘要；未执行引导钩子时为 `undefined`）。
+   * 供运维信息与测试读取：只含档位、阶段状态、端口名与违规码，不含证据引用与取值。
+   */
+  readinessReport(): DependencyReadinessReport | undefined {
+    return this.lastReadiness;
   }
 
   /**
    * 收集已登记端口的能力声明并判定边界；违规时抛 `PersistenceBoundaryError`。
    * 未解析到实现（或实现未声明能力）判 `MISSING_CAPABILITIES`，任何环境都算代码缺陷。
+   *
+   * 注意：本方法只判**能力边界**（自述是否齐全、生产环境是否禁止内存/未验证后端、数据库是否
+   * 配置、SQL 执行器是否 attest）。更强的「封存 + 证据」准入由 `DependencyReadinessService`
+   * 承担，并只在引导钩子里先于本方法执行；直接调用本方法不会重复判定依赖就绪。
    */
   verify(): PersistenceBoundaryReport {
     const bindings: PersistenceBinding[] = PERSISTENCE_BINDINGS.map((descriptor) => {
@@ -83,7 +279,9 @@ export class PersistenceBoundaryService implements OnApplicationBootstrap {
       return {
         token,
         label: `${token}（${descriptor.module}：${descriptor.responsibility}）`,
-        capabilities: this.readCapabilities(descriptor.token),
+        // 原始能力声明：形状未校验，交由能力边界按 MISSING_CAPABILITIES 等规则统一判定
+        capabilities: readBoundCapabilities(this.moduleRef, descriptor.token) as
+          PersistenceCapabilities | undefined,
       };
     });
 
@@ -122,21 +320,15 @@ export class PersistenceBoundaryService implements OnApplicationBootstrap {
    */
   private collectExecutorVerifications(): readonly PersistenceExecutorVerificationInput[] {
     const token = bindingTokenName(SQL_CONNECTION_FACTORY);
-    const input = collectSqlExecutorVerificationInput(this.readInstance(SQL_CONNECTION_FACTORY), {
-      registry: DEFAULT_SQL_EXECUTOR_VERIFICATION_REGISTRY,
-      nodeEnv: this.env.NODE_ENV,
-      label: token,
-    });
+    const input = collectSqlExecutorVerificationInput(
+      readBoundInstance(this.moduleRef, SQL_CONNECTION_FACTORY),
+      {
+        registry: DEFAULT_SQL_EXECUTOR_VERIFICATION_REGISTRY,
+        nodeEnv: this.env.NODE_ENV,
+        label: token,
+      },
+    );
     return input === undefined ? [] : [{ token, input }];
-  }
-
-  /** 读取端口绑定的实例本体（未绑定时返回 undefined，交由对应守卫判定） */
-  private readInstance(token: symbol): unknown {
-    try {
-      return this.moduleRef.get<unknown, unknown>(token, { strict: false });
-    } catch {
-      return undefined;
-    }
   }
 
   /** 可写日志的配置摘要：只含状态与开关，不含主机、用户名、口令或连接串 */
@@ -150,23 +342,6 @@ export class PersistenceBoundaryService implements OnApplicationBootstrap {
       poolMax: this.database.config.poolMax,
       applicationName: this.database.config.applicationName,
     };
-  }
-
-  /** 读取端口实现的能力声明；未绑定或未声明能力时返回 undefined（由守卫判违规） */
-  private readCapabilities(token: symbol): PersistenceCapabilities | undefined {
-    try {
-      const instance = this.moduleRef.get<unknown, { capabilities?: PersistenceCapabilities }>(
-        token,
-        { strict: false },
-      );
-      if (Array.isArray(instance)) {
-        return undefined;
-      }
-      return instance?.capabilities;
-    } catch {
-      // 未在该装配中提供该令牌：不在这里抛错，交由守卫按 MISSING_CAPABILITIES 统一判定
-      return undefined;
-    }
   }
 }
 

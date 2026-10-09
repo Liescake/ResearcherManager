@@ -30,12 +30,24 @@ import { SQL_CONNECTION_FACTORY } from './ports/sql-executor.port';
  * 登记项只描述「哪个端口需要被检查」，不硬编码能力值：能力从容器里实际绑定的实现读取
  * （见 `PersistenceBoundaryService`），因此换绑实现后判定自动跟随，无需改登记表。
  */
+/**
+ * 端口角色：决定该端口在生产门禁里的归属与判定顺序。
+ * - `authentication`：认证链路的根（会话存储），必须最先就绪（见
+ *   `persistence/dependency-readiness.ts` 的「认证先行」阶段判定）；
+ * - `business`：业务持久化依赖（画像、小组、成果、审计、导出……）；
+ * - `infrastructure`：执行器形态的连接端口，其生产准入由 SQL 执行器契约承担
+ *   （`ports/sql-executor-verification.ts`），因此不进入依赖就绪契约的角色阶段。
+ */
+export type PersistenceBindingRole = 'authentication' | 'business' | 'infrastructure';
+
 export interface PersistenceBindingDescriptor {
   readonly token: symbol;
   /** 端口所在模块（便于定位违规来源） */
   readonly module: string;
   /** 一句话说明该端口承载的持久化职责 */
   readonly responsibility: string;
+  /** 端口角色：决定生产门禁按「认证 → 业务」分阶段判定时的归属 */
+  readonly role: PersistenceBindingRole;
 }
 
 /** 需要按「持久 + 生产可用」判定能力的端口（业务数据与会话存储） */
@@ -44,86 +56,103 @@ export const PERSISTENCE_BINDINGS: readonly PersistenceBindingDescriptor[] = [
     token: SESSION_STORE,
     module: 'auth',
     responsibility: '会话存储：跨进程/重启保留会话主体',
+    role: 'authentication',
   },
   {
     token: PROFILE_REPOSITORY,
     module: 'profiles',
     responsibility: '学生画像存储',
+    role: 'business',
   },
   {
     token: GROUP_REPOSITORY,
     module: 'groups',
     responsibility: '科研小组存储',
+    role: 'business',
   },
   {
     token: APPLICATION_REPOSITORY,
     module: 'memberships',
     responsibility: '入组申请存储',
+    role: 'business',
   },
   {
     token: ACHIEVEMENT_REPOSITORY,
     module: 'achievements',
     responsibility: '成果记录存储',
+    role: 'business',
   },
   {
     token: EDUCATION_RECORD_REPOSITORY,
     module: 'education',
     responsibility: '升学记录存储',
+    role: 'business',
   },
   {
     token: MATCHING_REPOSITORY,
     module: 'matching',
     responsibility: '匹配记录存储',
+    role: 'business',
   },
   {
     token: NOTIFICATION_REPOSITORY,
     module: 'notifications',
     responsibility: '站内通知存储',
+    role: 'business',
   },
   {
     token: AUDIT_REPOSITORY,
     module: 'audit',
     responsibility: '审计事件存储（只追加）',
+    role: 'business',
   },
   {
     token: EXPORT_REPOSITORY,
     module: 'exports',
     responsibility: '导出任务存储',
+    role: 'business',
   },
   {
     token: EXPORT_ARTIFACT_STORE,
     module: 'exports',
     responsibility: '导出产物存储（文件体）',
+    role: 'business',
   },
   {
     token: COMPLIANCE_REPOSITORY,
     module: 'compliance',
     responsibility: '合规/隐私同意记录存储',
+    role: 'business',
   },
   {
     token: EDUCATION_STATISTICS_REPOSITORY,
     module: 'statistics',
     responsibility: '升学记录计数来源',
+    role: 'business',
   },
   {
     token: APPLICATION_STATISTICS_REPOSITORY,
     module: 'statistics',
     responsibility: '入组申请计数来源',
+    role: 'business',
   },
   {
     token: ACHIEVEMENT_STATISTICS_REPOSITORY,
     module: 'statistics',
     responsibility: '成果计数来源',
+    role: 'business',
   },
   {
     token: MATCHING_STATISTICS_REPOSITORY,
     module: 'statistics',
     responsibility: '匹配计数来源',
+    role: 'business',
   },
   {
     token: SQL_CONNECTION_FACTORY,
     module: 'db',
     responsibility: 'SQL 连接工厂：默认绑定 fail-closed 的未验证驱动工厂',
+    role: 'infrastructure',
   },
 ];
 
