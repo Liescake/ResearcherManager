@@ -2,7 +2,7 @@ import 'reflect-metadata';
 import { randomUUID } from 'node:crypto';
 import { request } from 'node:http';
 import { Logger, Module } from '@nestjs/common';
-import type { INestApplication } from '@nestjs/common';
+import type { FactoryProvider, INestApplication } from '@nestjs/common';
 import { APP_FILTER, APP_INTERCEPTOR, NestFactory } from '@nestjs/core';
 import {
   DataScope,
@@ -17,10 +17,12 @@ import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { AppModule } from '../../app.module';
 import { ApiExceptionFilter } from '../../common/api-exception.filter';
 import { ApiResponseInterceptor } from '../../common/api-response.interceptor';
-import { ConfigModule } from '../../config/config.module';
+import { APP_ENV, ConfigModule } from '../../config/config.module';
 import { loadEnv } from '../../config/env';
+import { SQL_CONNECTION_FACTORY } from '../../db/ports/sql-executor.port';
 import { AuthModule } from '../auth/auth.module';
 import { InMemorySessionStore } from '../auth/session-store.in-memory';
+import { SESSION_STORE } from '../auth/session-subject.port';
 import { AccessControlModule } from '../access-control/access-control.module';
 import { RUOYI_AUTHZ_ADAPTER } from '../ruoyi-adapter/ruoyi-adapter.port';
 import type { RuoYiAuthzAdapter } from '../ruoyi-adapter/ruoyi-adapter.port';
@@ -130,7 +132,7 @@ async function startGroupsApp(): Promise<TestApp> {
   await app.listen(0, '127.0.0.1');
   startedApps.push(app);
 
-  const store = app.get(InMemorySessionStore);
+  const store = app.get<InMemorySessionStore>(SESSION_STORE);
   store.seed({
     sessionId: SESSION_STUDENT_1,
     subject: { userId: 'u-student-1', roles: [Role.Student] },
@@ -183,7 +185,7 @@ async function startGroupsApp(): Promise<TestApp> {
     app,
     baseUrl: `${await app.getUrl()}/api/v1`,
     store,
-    repository: app.get(InMemoryGroupRepository),
+    repository: app.get<InMemoryGroupRepository>(GROUP_REPOSITORY),
   };
 }
 
@@ -263,8 +265,15 @@ function itemsOf(body: ApiEnvelope<unknown>): Array<Record<string, unknown>> {
 }
 
 /** 从真实仓储读出全部记录（只用于断言落库结果，不参与生产路径） */
-function storedGroups(repository: InMemoryGroupRepository): readonly ResearchGroup[] {
-  return repository.listVisibleGroups({ includeAllOpenGroups: true, visibleGroupIds: [] });
+const ALL_RECORDS_WINDOW = { offset: 0, limit: 100 } as const;
+
+async function storedGroups(
+  repository: InMemoryGroupRepository,
+): Promise<readonly ResearchGroup[]> {
+  return repository.listVisibleGroups(
+    { includeAllOpenGroups: true, visibleGroupIds: [] },
+    ALL_RECORDS_WINDOW,
+  );
 }
 
 afterAll(async () => {
@@ -278,14 +287,14 @@ afterEach(() => {
 describe('小组：成功路径（真实 HTTP + 统一响应信封）', () => {
   it('学生浏览：集合级可见，只返回开放小组；暂停/关闭的小组与其字段不出现在任何响应文本里', async () => {
     const { baseUrl, repository } = await startGroupsApp();
-    const opened = repository.create(
+    const opened = await repository.create(
       fixtureGroup({ name: '开放小组甲', description: '开放小组甲说明' }),
     );
-    const opened2 = repository.create(fixtureGroup({ name: '开放小组乙' }));
-    const paused = repository.create(
+    const opened2 = await repository.create(fixtureGroup({ name: '开放小组乙' }));
+    const paused = await repository.create(
       fixtureGroup({ name: '暂停小组', status: GroupStatus.Paused }),
     );
-    const closed = repository.create(
+    const closed = await repository.create(
       fixtureGroup({ name: '关闭小组', status: GroupStatus.Closed }),
     );
 
@@ -296,6 +305,13 @@ describe('小组：成功路径（真实 HTTP + 统一响应信封）', () => {
     expect(res.status).toBe(200);
     expect(res.body.error).toBeNull();
     expect(res.body.meta.requestId).toBe('test-request-groups-list');
+    // 分页元数据写在 meta（docs/P2-API契约基线.md「分页元数据」），且 total 只统计可见小组
+    expect(res.body.meta).toMatchObject({
+      page: 1,
+      pageSize: 20,
+      total: 2,
+      totalPages: 1,
+    });
 
     const items = itemsOf(res.body);
     expect(items.map((item) => item.id)).toEqual([opened.id, opened2.id]);
@@ -317,8 +333,10 @@ describe('小组：成功路径（真实 HTTP + 统一响应信封）', () => {
 
   it('负责人浏览：只看到服务端解析的 groupIds 里的开放小组（逐条资源级判定）', async () => {
     const { baseUrl, repository } = await startGroupsApp();
-    const own = repository.create(fixtureGroup({ id: LEADER_OWN_GROUP_ID, name: '本人负责小组' }));
-    const other = repository.create(fixtureGroup({ name: '他人小组' }));
+    const own = await repository.create(
+      fixtureGroup({ id: LEADER_OWN_GROUP_ID, name: '本人负责小组' }),
+    );
+    const other = await repository.create(fixtureGroup({ name: '他人小组' }));
 
     const res = await call(baseUrl, 'GET', '/groups', { headers: bearer(SESSION_LEADER) });
 
@@ -331,8 +349,10 @@ describe('小组：成功路径（真实 HTTP + 统一响应信封）', () => {
 
   it('管理员浏览：只看到服务端分配（assignedResourceIds）的小组；系统管理员为集合级可见', async () => {
     const { baseUrl, repository } = await startGroupsApp();
-    const assigned = repository.create(fixtureGroup({ id: LEADER_OWN_GROUP_ID, name: '受派小组' }));
-    const notAssigned = repository.create(fixtureGroup({ name: '未受派小组' }));
+    const assigned = await repository.create(
+      fixtureGroup({ id: LEADER_OWN_GROUP_ID, name: '受派小组' }),
+    );
+    const notAssigned = await repository.create(fixtureGroup({ name: '未受派小组' }));
 
     const assignedRes = await call(baseUrl, 'GET', '/groups', {
       headers: bearer(SESSION_ADMIN_ASSIGNED),
@@ -385,7 +405,7 @@ describe('小组：成功路径（真实 HTTP + 统一响应信封）', () => {
     // 负责人标识（会话主体）不出现在响应里
     expect(res.text).not.toContain(SUPER_ADMIN_UUID);
 
-    const stored = storedGroups(repository);
+    const stored = await storedGroups(repository);
     expect(stored).toHaveLength(1);
     // 负责人取会话主体（服务端解析值），不是任何客户端字段
     expect(stored[0]?.leaderUserId).toBe(SUPER_ADMIN_UUID);
@@ -493,7 +513,7 @@ describe('小组：输入拒绝（400 VALIDATION_FAILED，不落库）', () => {
     expect(res.body.error?.requestId).toBeTruthy();
     // 字段级错误（路径 + 消息）；不落库
     expect(issuesOf(res.body).length).toBeGreaterThan(0);
-    expect(storedGroups(repository)).toHaveLength(0);
+    expect(await storedGroups(repository)).toHaveLength(0);
   });
 
   it('非对象请求体（JSON 标量）→ 400 且不落库（拒绝发生在请求体解析层，无字段级 issues）', async () => {
@@ -514,7 +534,7 @@ describe('小组：输入拒绝（400 VALIDATION_FAILED，不落库）', () => {
     expect(res.body.error?.details).toBeUndefined();
     expect(res.body.error?.message).toBe('提交内容不合法，请检查后重试');
     expect(res.text).not.toContain('not-an-object');
-    expect(storedGroups(repository)).toHaveLength(0);
+    expect(await storedGroups(repository)).toHaveLength(0);
   });
 
   it('客户端提交 leaderUserId/status/groupId/groupIds/userId/roles/scope/id/时间戳 一律拒绝，且没有任何小组被写入', async () => {
@@ -574,7 +594,7 @@ describe('小组：输入拒绝（400 VALIDATION_FAILED，不落库）', () => {
     for (const key of unexpectedKeys) {
       expect(messages.some((message) => message.includes(key))).toBe(true);
     }
-    expect(storedGroups(repository)).toHaveLength(0);
+    expect(await storedGroups(repository)).toHaveLength(0);
     // 伪造的归属没有被采纳为「写入目标」
     expect(res.text).not.toContain(victimId);
   });
@@ -594,7 +614,7 @@ describe('小组：输入拒绝（400 VALIDATION_FAILED，不落库）', () => {
         .map((issue) => issue.message)
         .join('|'),
     ).toContain('leaderUserId');
-    expect(storedGroups(repository)).toHaveLength(0);
+    expect(await storedGroups(repository)).toHaveLength(0);
   });
 });
 
@@ -628,7 +648,7 @@ describe('小组：认证边界 401（fail-closed）', () => {
 
     expect(res.status).toBe(401);
     expect(res.body.error?.code).toBe('UNAUTHENTICATED');
-    expect(storedGroups(repository)).toHaveLength(0);
+    expect(await storedGroups(repository)).toHaveLength(0);
   });
 });
 
@@ -646,12 +666,12 @@ describe('小组：越权 403（AuthorizationGuard + 服务端判定入参）', 
       expect(res.body.error?.code).toBe('FORBIDDEN');
       expect(res.body.error?.message).toBe('无权执行该操作');
     }
-    expect(storedGroups(repository)).toHaveLength(0);
+    expect(await storedGroups(repository)).toHaveLength(0);
   });
 
   it('负责人没有任何服务端解析的 groupIds、管理员没有 assignedResourceIds → 403（不退化成空列表）', async () => {
     const { baseUrl, repository } = await startGroupsApp();
-    repository.create(fixtureGroup({ name: '可见小组' }));
+    await repository.create(fixtureGroup({ name: '可见小组' }));
 
     for (const sessionId of [SESSION_LEADER_NO_GROUP, SESSION_ADMIN_NO_ASSIGNMENT]) {
       const res = await call(baseUrl, 'GET', '/groups', { headers: bearer(sessionId) });
@@ -700,7 +720,7 @@ describe('小组：越权 403（AuthorizationGuard + 服务端判定入参）', 
     const { app, baseUrl, repository } = await startGroupsApp();
     const adapter = app.get<RuoYiAuthzAdapter>(RUOYI_AUTHZ_ADAPTER);
     const checkAuthorization = vi.spyOn(adapter, 'checkAuthorization');
-    repository.create(fixtureGroup());
+    await repository.create(fixtureGroup());
 
     const res = await call(baseUrl, 'GET', '/groups', {
       headers: {
@@ -763,10 +783,14 @@ describe('小组：越权 403（AuthorizationGuard + 服务端判定入参）', 
 });
 
 describe('小组：客户端声明伪造无效（请求体 / 查询串 / 自定义头）', () => {
-  it('查询串里的 groupId/scope/userId/roles 不被读取也不被信任', async () => {
+  it('查询串里的 groupId/scope/userId/roles 一律 400，不产生任何取数（不是静默忽略）', async () => {
     const { baseUrl, repository } = await startGroupsApp();
-    const own = repository.create(fixtureGroup({ id: LEADER_OWN_GROUP_ID, name: '本人负责小组' }));
-    const other = repository.create(fixtureGroup({ name: '他人小组' }));
+    const own = await repository.create(
+      fixtureGroup({ id: LEADER_OWN_GROUP_ID, name: '本人负责小组' }),
+    );
+    const other = await repository.create(fixtureGroup({ name: '他人小组' }));
+    const listSpy = vi.spyOn(repository, 'listVisibleGroups');
+    const countSpy = vi.spyOn(repository, 'countVisibleGroups');
 
     const res = await call(
       baseUrl,
@@ -775,12 +799,68 @@ describe('小组：客户端声明伪造无效（请求体 / 查询串 / 自定�
       { headers: bearer(SESSION_LEADER) },
     );
 
-    // 控制器不声明任何查询参数：伪造声明既不能扩大可见集合，也不能改变判定
-    expect(res.status).toBe(200);
-    expect(itemsOf(res.body).map((item) => item.id)).toEqual([own.id]);
+    // 查询串闭集：服务端独占键必须显式拒绝，且每个键都有可区分的拒绝原因
+    expect(res.status).toBe(400);
+    expect(res.body.data).toBeNull();
+    expect(res.body.error?.code).toBe('VALIDATION_FAILED');
+    const messages = issuesOf(res.body).map((issue) => issue.message);
+    for (const key of ['groupId', 'groupIds', 'scope', 'userId', 'roles']) {
+      expect(messages.some((message) => message.includes(key))).toBe(true);
+    }
+    // 拒绝发生在取数之前：仓储一次都没有被调用，也没有任何可见集合被泄露
+    expect(listSpy).not.toHaveBeenCalled();
+    expect(countSpy).not.toHaveBeenCalled();
+    expect(res.text).not.toContain('本人负责小组');
     expect(res.text).not.toContain('他人小组');
     expect(res.text).not.toContain('u-victim-1');
     expect(res.text).not.toContain('g-forged');
+    expect(own.id).toBe(LEADER_OWN_GROUP_ID);
+  });
+
+  it('创建接口不接受查询参数：POST 带 userId/roles/scope/groupId 等任何查询键一律 400，且不落库', async () => {
+    const { baseUrl, repository } = await startGroupsApp();
+    const createSpy = vi.spyOn(repository, 'create');
+
+    for (const query of [
+      'userId=u-victim-1',
+      'roles=super_admin',
+      'scope=GLOBAL',
+      `groupId=${randomUUID()}`,
+      `leaderUserId=${SUPER_ADMIN_UUID}`,
+      'page=1',
+      'x=1',
+    ]) {
+      const res = await call(baseUrl, 'POST', `/groups?${query}`, {
+        headers: bearer(SESSION_SUPER_ADMIN),
+        body: validCreateBody,
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.error?.code).toBe('VALIDATION_FAILED');
+      expect(res.text).not.toContain('u-victim-1');
+    }
+    expect(createSpy).not.toHaveBeenCalled();
+    expect(await storedGroups(repository)).toHaveLength(0);
+
+    // 对照组：同一请求体不带查询串即成功（拒绝来自查询键，而不是请求体本身）
+    const accepted = await call(baseUrl, 'POST', '/groups', {
+      headers: bearer(SESSION_SUPER_ADMIN),
+      body: validCreateBody,
+    });
+    expect(accepted.status).toBe(201);
+    expect(await storedGroups(repository)).toHaveLength(1);
+  });
+
+  it('授权先于查询串校验（写路径）：无权主体带伪造查询串仍得 403，而不是 400', async () => {
+    const { baseUrl, repository } = await startGroupsApp();
+
+    const res = await call(baseUrl, 'POST', '/groups?userId=u-victim-1&scope=GLOBAL', {
+      headers: bearer(SESSION_STUDENT_1),
+      body: validCreateBody,
+    });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error?.code).toBe('FORBIDDEN');
+    expect(await storedGroups(repository)).toHaveLength(0);
   });
 
   it('创建请求体里的归属/角色/范围声明不进入判定也不落库（伪造的归属不是写入目标）', async () => {
@@ -797,15 +877,15 @@ describe('小组：客户端声明伪造无效（请求体 / 查询串 / 自定�
     });
 
     expect(res.status).toBe(400);
-    const stored = storedGroups(repository);
+    const stored = await storedGroups(repository);
     expect(stored).toHaveLength(0);
     expect(res.text).not.toContain('u-victim-1');
   });
 
   it('自定义头里的角色/范围声明不能把学生提升为集合级可见之外的任何东西', async () => {
     const { baseUrl, repository } = await startGroupsApp();
-    const opened = repository.create(fixtureGroup({ name: '开放小组' }));
-    repository.create(fixtureGroup({ name: '暂时关闭', status: GroupStatus.Closed }));
+    const opened = await repository.create(fixtureGroup({ name: '开放小组' }));
+    await repository.create(fixtureGroup({ name: '暂时关闭', status: GroupStatus.Closed }));
 
     const plain = await call(baseUrl, 'GET', '/groups', { headers: bearer(SESSION_STUDENT_1) });
     const forged = await call(baseUrl, 'GET', '/groups', {
@@ -830,10 +910,10 @@ describe('小组：存储异常与不变量破坏 fail-closed（500，不泄露�
   it('存储记录状态为未登记枚举 → 500，且不把未知值/字段取值泄露给调用方', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startGroupsApp();
-    const corrupted = repository.create(
+    const corrupted = await repository.create(
       fixtureGroup({ status: 'unknown_status' as GroupStatus, name: '受损小组名称' }),
     );
-    vi.spyOn(repository, 'listVisibleGroups').mockReturnValue([corrupted]);
+    vi.spyOn(repository, 'listVisibleGroups').mockResolvedValue([corrupted]);
 
     const res = await call(baseUrl, 'GET', '/groups', { headers: bearer(SESSION_STUDENT_1) });
 
@@ -848,7 +928,7 @@ describe('小组：存储异常与不变量破坏 fail-closed（500，不泄露�
   it('存储记录时间戳非法 → 500；仓储返回非开放小组 → 500', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startGroupsApp();
-    vi.spyOn(repository, 'listVisibleGroups').mockReturnValue([
+    vi.spyOn(repository, 'listVisibleGroups').mockResolvedValue([
       fixtureGroup({ createdAt: '2026-01-01 00:00:00' }),
     ]);
 
@@ -858,10 +938,10 @@ describe('小组：存储异常与不变量破坏 fail-closed（500，不泄露�
 
     vi.restoreAllMocks();
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
-    const paused = repository.create(
+    const paused = await repository.create(
       fixtureGroup({ status: GroupStatus.Paused, name: '暂停小组' }),
     );
-    vi.spyOn(repository, 'listVisibleGroups').mockReturnValue([paused]);
+    vi.spyOn(repository, 'listVisibleGroups').mockResolvedValue([paused]);
 
     const pausedRes = await call(baseUrl, 'GET', '/groups', {
       headers: bearer(SESSION_STUDENT_1),
@@ -874,8 +954,8 @@ describe('小组：存储异常与不变量破坏 fail-closed（500，不泄露�
   it('仓储返回授权集合之外的小组（越权取数）→ 500，绝不当作正常输出', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startGroupsApp();
-    const outOfScope = repository.create(fixtureGroup({ name: '越权小组' }));
-    vi.spyOn(repository, 'listVisibleGroups').mockReturnValue([outOfScope]);
+    const outOfScope = await repository.create(fixtureGroup({ name: '越权小组' }));
+    vi.spyOn(repository, 'listVisibleGroups').mockResolvedValue([outOfScope]);
 
     const res = await call(baseUrl, 'GET', '/groups', { headers: bearer(SESSION_LEADER) });
 
@@ -899,13 +979,13 @@ describe('小组：存储异常与不变量破坏 fail-closed（500，不泄露�
     expect(res.body.data).toBeNull();
     expect(res.body.error?.code).toBe('INTERNAL_ERROR');
     expect(res.text).not.toContain('u-super-legacy');
-    expect(storedGroups(repository)).toHaveLength(0);
+    expect(await storedGroups(repository)).toHaveLength(0);
   });
 
   it('创建：仓储改写了负责人 → 500，不把他人小组当作创建结果返回', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startGroupsApp();
-    vi.spyOn(repository, 'create').mockImplementation((record) => ({
+    vi.spyOn(repository, 'create').mockImplementation(async (record) => ({
       ...record,
       leaderUserId: randomUUID(),
       name: '他人小组',
@@ -921,6 +1001,101 @@ describe('小组：存储异常与不变量破坏 fail-closed（500，不泄露�
     expect(res.body.error?.code).toBe('INTERNAL_ERROR');
     expect(res.text).not.toContain('他人小组');
     expect(res.text).not.toContain(SUPER_ADMIN_UUID);
+  });
+});
+
+describe('小组：分页浏览（meta 分页元数据 + 服务端限制 page size）', () => {
+  it('显式分页：page/pageSize 决定当前页，total/totalPages 覆盖全部可见小组', async () => {
+    const { baseUrl, repository } = await startGroupsApp();
+    const first = await repository.create(fixtureGroup({ name: '小组一' }));
+    const second = await repository.create(fixtureGroup({ name: '小组二' }));
+    await repository.create(fixtureGroup({ name: '已关闭', status: GroupStatus.Closed }));
+
+    const page1 = await call(baseUrl, 'GET', '/groups?page=1&pageSize=1', {
+      headers: bearer(SESSION_STUDENT_1),
+    });
+    expect(page1.status).toBe(200);
+    expect(itemsOf(page1.body).map((item) => item.id)).toEqual([first.id]);
+    expect(page1.body.meta).toMatchObject({ page: 1, pageSize: 1, total: 2, totalPages: 2 });
+
+    const page2 = await call(baseUrl, 'GET', '/groups?page=2&pageSize=1', {
+      headers: bearer(SESSION_STUDENT_1),
+    });
+    expect(page2.status).toBe(200);
+    expect(itemsOf(page2.body).map((item) => item.id)).toEqual([second.id]);
+    expect(page2.body.meta).toMatchObject({ page: 2, pageSize: 1, total: 2, totalPages: 2 });
+  });
+
+  it('超出末页返回空页但元数据保持真实（不悄悄回退到第一页）', async () => {
+    const { baseUrl, repository } = await startGroupsApp();
+    await repository.create(fixtureGroup({ name: '唯一小组' }));
+
+    const res = await call(baseUrl, 'GET', '/groups?page=5&pageSize=20', {
+      headers: bearer(SESSION_STUDENT_1),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data).toEqual([]);
+    expect(res.body.meta).toMatchObject({ page: 5, pageSize: 20, total: 1, totalPages: 1 });
+    expect(res.text).not.toContain('唯一小组');
+  });
+
+  it('服务端限制 page size：默认 20、上限 100，越界/非法值一律 400 且不取数', async () => {
+    const { baseUrl, repository } = await startGroupsApp();
+    const listSpy = vi.spyOn(repository, 'listVisibleGroups');
+
+    const boundary = await call(baseUrl, 'GET', '/groups?page=1&pageSize=100', {
+      headers: bearer(SESSION_STUDENT_1),
+    });
+    expect(boundary.status).toBe(200);
+    expect(boundary.body.meta).toMatchObject({ pageSize: 100 });
+
+    for (const query of [
+      'pageSize=101',
+      'pageSize=0',
+      'page=0',
+      'page=-1',
+      'page=abc',
+      'page=1.5',
+      'page=1&page=2',
+    ]) {
+      const res = await call(baseUrl, 'GET', `/groups?${query}`, {
+        headers: bearer(SESSION_STUDENT_1),
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.error?.code).toBe('VALIDATION_FAILED');
+      expect(issuesOf(res.body).length).toBeGreaterThan(0);
+    }
+    // 边界值合法请求取了数，非法请求一个都没有进入仓储
+    expect(listSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('未声明的查询键（排序/关键词等）→ 400，且给出「只支持 page/pageSize」的可区分原因', async () => {
+    const { baseUrl, repository } = await startGroupsApp();
+    await repository.create(fixtureGroup({ name: '小组' }));
+    const listSpy = vi.spyOn(repository, 'listVisibleGroups');
+
+    for (const query of ['sortBy=name', 'sortOrder=asc', 'keyword=机', 'status=open']) {
+      const res = await call(baseUrl, 'GET', `/groups?${query}`, {
+        headers: bearer(SESSION_STUDENT_1),
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.error?.code).toBe('VALIDATION_FAILED');
+    }
+    expect(listSpy).not.toHaveBeenCalled();
+  });
+
+  it('分页参数不参与授权判定：无权主体带合法分页参数仍是 403（先授权后校验）', async () => {
+    const { baseUrl, repository } = await startGroupsApp();
+    await repository.create(fixtureGroup({ name: '小组' }));
+
+    const res = await call(baseUrl, 'GET', '/groups?page=1&pageSize=10', {
+      headers: bearer(SESSION_ADMIN_NO_ASSIGNMENT),
+    });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error?.code).toBe('FORBIDDEN');
+    expect(res.text).not.toContain('小组');
   });
 });
 
@@ -951,24 +1126,36 @@ describe('小组：统一响应信封', () => {
 });
 
 describe('小组：切片装配、契约复用与既有路由回归', () => {
-  it('GroupsModule 只注册本切片的路由与服务，并把仓储端口显式绑到内存基线', () => {
+  it('GroupsModule 只注册本切片的路由/服务，并把仓储令牌绑到「按是否配置数据库分流」的工厂', async () => {
     const providers = (Reflect.getMetadata('providers', GroupsModule) ?? []) as unknown[];
     const controllers = (Reflect.getMetadata('controllers', GroupsModule) ?? []) as unknown[];
     const moduleImports = (Reflect.getMetadata('imports', GroupsModule) ?? []) as unknown[];
 
     expect(controllers).toEqual([GroupsController]);
     expect(providers).toContain(GroupsService);
-    expect(providers).toContain(InMemoryGroupRepository);
-    expect(providers).toContainEqual({
+    // 内存基线**不再是独立 provider**：它是实现，不是绑定（否则会有两份状态）
+    expect(providers).not.toContain(InMemoryGroupRepository);
+    expect(providers).not.toContainEqual({
       provide: GROUP_REPOSITORY,
       useExisting: InMemoryGroupRepository,
     });
+    // 换绑只发生在这一个 provider 的工厂里
+    const binding = providers.find(
+      (provider): provider is FactoryProvider =>
+        typeof provider === 'object' &&
+        provider !== null &&
+        (provider as { provide?: unknown }).provide === GROUP_REPOSITORY,
+    );
+    expect(binding).toBeDefined();
+    expect(typeof binding?.useFactory).toBe('function');
+    // 可选注入执行器工厂：测试装配无需数据库模块
+    expect(binding?.inject).toEqual([APP_ENV, { token: SQL_CONNECTION_FACTORY, optional: true }]);
     // 依赖方向：认证（auth）与授权（access-control）各自只经端口/服务暴露
     expect(moduleImports).toContain(AuthModule);
     expect(moduleImports).toContain(AccessControlModule);
   });
 
-  it('契约复用回归：创建字段闭集 = 共享 schema 去掉两个服务端独占字段后的键集', () => {
+  it('契约复用回归：创建字段闭集 = 共享 schema 去掉两个服务端独占字段后的键集', async () => {
     expect([...GROUP_CREATE_INPUT_FIELDS].sort()).toEqual(
       Object.keys(groupCreateInputSchema.shape).sort(),
     );
@@ -983,7 +1170,7 @@ describe('小组：切片装配、契约复用与既有路由回归', () => {
     expect(sharedKeys).toContain('status');
   });
 
-  it('契约复用回归：同一请求体经派生 schema 与共享 schema 解析，剩余字段规则完全一致', () => {
+  it('契约复用回归：同一请求体经派生 schema 与共享 schema 解析，剩余字段规则完全一致', async () => {
     const viaCreate = groupCreateInputSchema.parse(validCreateBody);
     const viaShared = researchGroupInputSchema.parse({
       ...validCreateBody,
@@ -1004,7 +1191,7 @@ describe('小组：切片装配、契约复用与既有路由回归', () => {
     });
   });
 
-  it('内存基线如实声明非持久化，并在生产环境拒绝构造（不用内存冒充生产存储）', () => {
+  it('内存基线如实声明非持久化，并在生产环境拒绝构造（不用内存冒充生产存储）', async () => {
     const developmentEnv = loadEnv({});
     const productionEnv = loadEnv({ NODE_ENV: 'production' });
 
@@ -1045,6 +1232,7 @@ describe('小组：切片装配、契约复用与既有路由回归', () => {
       'apiPort',
       'apiPrefix',
       'databaseConfigured',
+      'dependencyGate',
       'nodeEnv',
     ]);
 

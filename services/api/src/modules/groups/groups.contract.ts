@@ -9,7 +9,7 @@ import {
   researchGroupInputSchema,
   uuidSchema,
 } from '@rm/shared';
-import type { AuthorizationRequest, AuthorizationSubject } from '@rm/shared';
+import type { AuthorizationRequest, AuthorizationSubject, Pagination } from '@rm/shared';
 import type { ResearchGroup } from './groups.port';
 
 /**
@@ -34,6 +34,10 @@ import type { ResearchGroup } from './groups.port';
  * `AuthorizationGuard`（其下是 `RUOYI_AUTHZ_ADAPTER` 端口）判定。
  * 这里不复制授权规则：候选范围取自共享的 `DEFAULT_ROLE_DATA_SCOPE`（与谓词同一张表），
  * 而能否通过完全由端口背后的 canonical 谓词决定。
+ *
+ * 查询串闭集：列表接口只接受共享 `paginationSchema` 的 `page`/`pageSize`；其余键一律 400——
+ * 服务端独占字段（`userId`/`roles`/`scope`/`groupId`…）是必须可观测的越权声明尝试，
+ * 尚未实现的排序/过滤键是契约漂移。分页参数只是**取数窗口**，从不参与授权判定。
  */
 
 /**
@@ -48,8 +52,24 @@ export const GROUP_CREATE_INPUT_FIELDS = [
 ] as const;
 
 /**
+ * 列表接口声明的查询字段闭集：只接受共享 `paginationSchema` 的两个键
+ * （排序/关键词/过滤属于后续切片，出现即 400，而不是静默忽略）。
+ * 分页参数只是**取数窗口**：它不参与授权判定，也不会扩大可见集合。
+ */
+export const GROUP_LIST_QUERY_FIELDS = ['page', 'pageSize'] as const;
+
+/**
+ * 创建接口声明的查询字段闭集：**空**。写接口不接受任何查询参数（分页/过滤只属于列表接口），
+ * 出现任何查询键一律 400（见 `assertNoGroupWriteQueryFields`）。
+ */
+export const GROUP_WRITE_QUERY_FIELDS = [] as const;
+
+/**
  * 服务端独占字段（**禁止客户端提交**）：即使它们不在创建 schema 内，也必须给出可区分的
  * 拒绝原因，避免「以为是业务字段但被静默剥离」。这些字段只能来自服务端会话、状态机或存储。
+ *
+ * 同一份清单同时用于**请求体**与**查询串**的字段闭集：`?groupId=`/`?scope=`/`?userId=`/`?roles=`
+ * 这类客户端声明既不是过滤器也不是范围，出现在任一输入通道都必须被显式拒绝（400）。
  */
 export const FORBIDDEN_GROUP_FIELDS = [
   'id',
@@ -315,4 +335,66 @@ export function buildGroupReadCandidates(
 /** 供测试与调用方复用：读取记录负责人（不可读时返回空串，交由调用方按服务端缺陷处理） */
 export function readGroupLeaderId(record: ResearchGroup): string {
   return typeof record.leaderUserId === 'string' ? record.leaderUserId : '';
+}
+
+/**
+ * 查询串字段闭集门禁（列表接口）：查询串出现 `page`/`pageSize` 之外的键即抛 `ZodError`
+ * （由统一异常过滤器映射为 400 `VALIDATION_FAILED` + `details.issues`）。
+ *
+ * 两类键给出可区分的拒绝原因：
+ * 1. `FORBIDDEN_GROUP_FIELDS`（服务端独占：`userId`/`roles`/`scope`/`groupId`/`status`…）——
+ *    这是必须可观测的越权声明尝试，而不是「无效过滤器」；
+ * 2. 其余未声明键（如 `sortBy`/`keyword`）——本切片尚未实现排序/过滤，出现即契约漂移。
+ *
+ * 非对象查询串（理论上不出现）不在这里拒绝，交给共享 `paginationSchema` 判非法。
+ */
+export function assertDeclaredGroupListQueryFields(query: unknown): void {
+  assertDeclaredGroupQueryFields(query, GROUP_LIST_QUERY_FIELDS, '本切片只支持 page/pageSize');
+}
+
+/**
+ * 查询串字段闭集门禁（创建接口）：写接口**不声明任何查询参数**，因此任何查询键都 400。
+ *
+ * 与列表接口共用同一份「服务端独占字段」清单：`POST /groups?userId=…&scope=…&groupId=…`
+ * 这类声明不是「被忽略的额外参数」，而是必须在写路径上被显式拒绝的伪造尝试
+ * （静默忽略会让「客户端声明永不生效」这条不变量只靠实现细节维持，无法被观测/回归）。
+ */
+export function assertNoGroupWriteQueryFields(query: unknown): void {
+  assertDeclaredGroupQueryFields(query, GROUP_WRITE_QUERY_FIELDS, '创建接口不接受查询参数');
+}
+
+/** 查询串闭集的共用实现：两个端点只差「声明了哪些键」与提示文案 */
+function assertDeclaredGroupQueryFields(
+  query: unknown,
+  declared: readonly string[],
+  hint: string,
+): void {
+  if (typeof query !== 'object' || query === null || Array.isArray(query)) return;
+
+  const forbidden: readonly string[] = FORBIDDEN_GROUP_FIELDS;
+  const unexpected = Object.keys(query).filter((key) => !declared.includes(key));
+  if (unexpected.length === 0) return;
+
+  throw new z.ZodError(
+    unexpected.map((key) => ({
+      code: 'unrecognized_keys' as const,
+      keys: [key],
+      path: [key] as (string | number)[],
+      message: forbidden.includes(key)
+        ? `查询串禁止声明服务端字段 ${key}`
+        : `查询串包含未声明字段 ${key}（${hint}）`,
+    })),
+  );
+}
+
+/**
+ * 列表服务的返回结构：`items` 是当前页的对外视图，`total` 是**服务端判定可见**的小组总数
+ * （不受当前页影响），`pagination` 是规范化后的分页参数（由共享 `paginationSchema` 校验：
+ * `page >= 1`、`pageSize <= MAX_PAGE_SIZE`）。控制器据此用共享 `okPaginated` 构建信封，
+ * 把分页元数据写进 `meta`（docs/P2-API契约基线.md「分页元数据」）。
+ */
+export interface GroupListPage {
+  readonly items: GroupView[];
+  readonly total: number;
+  readonly pagination: Pagination;
 }

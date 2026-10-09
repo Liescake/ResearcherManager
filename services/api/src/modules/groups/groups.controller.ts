@@ -1,4 +1,6 @@
-import { Body, Controller, Get, Headers, Inject, Post } from '@nestjs/common';
+import { Body, Controller, Get, Headers, Inject, Post, Query } from '@nestjs/common';
+import { okPaginated } from '@rm/shared';
+import type { ApiEnvelope } from '@rm/shared';
 import { requireSubject } from '../auth/require-subject';
 import { SESSION_SUBJECT_RESOLVER } from '../auth/session-subject.port';
 import type { SessionSubjectResolver } from '../auth/session-subject.port';
@@ -6,8 +8,8 @@ import type { GroupView } from './groups.contract';
 import { GroupsService } from './groups.service';
 
 /**
- * 小组（浏览与创建）：
- * - `GET  /api/v1/groups`  浏览对服务端主体可见的开放小组
+ * 小组（分页浏览与创建）：
+ * - `GET  /api/v1/groups`  分页浏览对服务端主体可见的开放小组
  * - `POST /api/v1/groups`  创建小组
  *
  * 路径与权限点对齐 docs/P2-API契约基线.md §「小组与申请」（`/groups`）；
@@ -18,12 +20,16 @@ import { GroupsService } from './groups.service';
  *    → 无有效会话即 401；主体只来自服务端会话存储，控制器不解析任何角色字段。
  * 2. 资源级判定在 service 内经由 `AuthorizationGuard`（`RUOYI_AUTHZ_ADAPTER` 端口）完成，
  *    且**先于任何仓储访问**，拒绝即 403；控制器不自行判断权限，也不拼接判定入参。
- * 3. 本控制器**不声明任何查询参数**：`?groupId=`/`?scope=`/`?userId=`/`?roles=`
- *    这类客户端声明既不被读取也不被信任，可见范围只由服务端主体决定
- *    （自定义头 `x-user-id`/`x-roles`/`x-scope`/`x-group-id` 同理，永不进入判定）。
+ * 3. 列表只声明 `page`/`pageSize` 两个查询参数（其上下界由共享 `paginationSchema` 校验）；
+ *    查询串出现 `?groupId=`/`?scope=`/`?userId=`/`?roles=` 这类客户端声明时由 service 的
+ *    查询串闭集**显式 400**（不是静默忽略，也不是过滤器）；创建接口**不声明任何查询参数**，
+ *    出现任何查询键同样 400；自定义头
+ *    `x-user-id`/`x-roles`/`x-scope`/`x-group-id` 同理，永不进入判定。
  *
- * 响应统一由 `ApiResponseInterceptor` 包成 `{ data, meta, error }`，
- * 异常统一由 `ApiExceptionFilter` 映射为稳定错误码（401/400/403/500）。
+ * 响应：默认由 `ApiResponseInterceptor` 包成 `{ data, meta, error }`；列表额外返回共享
+ * `okPaginated(...)` 构建的信封，由拦截器补齐 `requestId`/`generatedAt` 后把
+ * `page`/`pageSize`/`total`/`totalPages` 写入 `meta`（docs/P2-API契约基线.md「分页元数据」）。
+ * 异常统一由 `ApiExceptionFilter` 映射为稳定错误码（401/403/400/500）。
  */
 @Controller('groups')
 export class GroupsController {
@@ -33,15 +39,23 @@ export class GroupsController {
   ) {}
 
   @Get()
-  listGroups(@Headers('authorization') authorization: string | undefined): GroupView[] {
-    return this.groups.listGroups(requireSubject(this.sessions, authorization));
+  async listGroups(
+    @Headers('authorization') authorization: string | undefined,
+    @Query() query: unknown,
+  ): Promise<ApiEnvelope<GroupView[]>> {
+    const page = await this.groups.listGroups(
+      await requireSubject(this.sessions, authorization),
+      query,
+    );
+    return okPaginated(page.items, page.total, page.pagination);
   }
 
   @Post()
-  createGroup(
+  async createGroup(
     @Headers('authorization') authorization: string | undefined,
     @Body() body: unknown,
-  ): GroupView {
-    return this.groups.createGroup(requireSubject(this.sessions, authorization), body);
+    @Query() query: unknown,
+  ): Promise<GroupView> {
+    return this.groups.createGroup(await requireSubject(this.sessions, authorization), body, query);
   }
 }

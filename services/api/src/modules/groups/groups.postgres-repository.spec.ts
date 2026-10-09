@@ -12,6 +12,7 @@ import type { AsyncGroupRepository, ResearchGroup } from './groups.port';
 import { GROUP_REPOSITORY_BACKEND_POSTGRES } from './groups.port';
 import {
   POSTGRES_GROUP_COLUMNS,
+  POSTGRES_GROUP_INTERNAL_COLUMNS,
   POSTGRES_GROUP_REPOSITORY_CAPABILITIES,
   POSTGRES_GROUP_REPOSITORY_VERIFICATION_STEPS,
   POSTGRES_GROUP_TABLE,
@@ -838,17 +839,27 @@ describe('PostgreSQL 小组仓储：计数与列表同源且严格解析', () =>
   });
 });
 
-describe('PostgreSQL 小组仓储：未装配、无驱动依赖、与 schema 草案对齐', () => {
-  it('GroupsModule 仍只绑定内存基线（本 adapter 未被装配）', () => {
+describe('PostgreSQL 小组仓储：已装配、无驱动依赖、与迁移对齐', () => {
+  it('GroupsModule 经工厂绑定本 adapter（引用工厂导出，但不直接引用 adapter 类）', () => {
     const moduleFile = resolve(process.cwd(), 'src', 'modules', 'groups', 'groups.module.ts');
     const content = readFileSync(moduleFile, 'utf8');
 
-    expect(content).not.toContain('PostgresGroupRepository');
-    expect(content).not.toContain('groups.postgres-repository');
+    // 绑定点必须同时出现「DI 令牌」与「adapter 侧工厂导出名」——登记表按名字比对这两者
+    expect(content).toContain('GROUP_REPOSITORY');
+    expect(content).toContain('createLazyPostgresGroupRepository');
+    // 内存基线是**实现**，不是绑定：它不再作为独立 provider 存在（否则会有两份状态）
+    expect(content).not.toContain('useExisting: InMemoryGroupRepository');
     expect(content).toContain('InMemoryGroupRepository');
-    expect(content).toContain(
-      '{ provide: GROUP_REPOSITORY, useExisting: InMemoryGroupRepository }',
-    );
+    // 装配只发生在工厂里：模块不得直接 new / 引用 adapter 类
+    expect(content).not.toContain('new PostgresGroupRepository');
+    expect(content).not.toContain('PostgresGroupRepository,');
+  });
+
+  it('adapter 不含 Nest 装配痕迹（依赖注入元数据只允许出现在 Module 与实现类之外）', () => {
+    const source = readFileSync(ADAPTER_PATH, 'utf8');
+    expect(source).not.toContain('@nestjs/common');
+    expect(source).not.toMatch(/@Injectable\s*\(/u);
+    expect(source).not.toMatch(/@Inject\s*\(/u);
   });
 
   it('持久化登记与数据库模块都不引用本 adapter（端口登记表仍按令牌判定）', () => {
@@ -905,7 +916,7 @@ describe('PostgreSQL 小组仓储：未装配、无驱动依赖、与 schema 草
     );
   });
 
-  it('工作区依赖里没有 pg / ORM 包', () => {
+  it('工作区依赖里没有未授权的 pg 族 / ORM 包（官方 pg 驱动已授权，仅限驱动层）', () => {
     for (const relative of [join('services', 'api', 'package.json'), 'package.json']) {
       const manifest = JSON.parse(readFileSync(join(REPO_ROOT, relative), 'utf8')) as {
         dependencies?: Record<string, string>;
@@ -917,7 +928,7 @@ describe('PostgreSQL 小组仓储：未装配、无驱动依赖、与 schema 草
       ];
       for (const name of names) {
         expect(
-          /^(?:pg|pg-pool|pg-promise|postgres|prisma|@prisma\/client|typeorm|kysely|drizzle-orm|sequelize|@mikro-orm\/core)$/u.test(
+          /^(?:pg-pool|pg-native|pg-promise|postgres|slonik|prisma|@prisma\/client|typeorm|kysely|drizzle-orm|drizzle-kit|sequelize|@mikro-orm\/core)$/u.test(
             name,
           ),
         ).toBe(false);
@@ -925,16 +936,18 @@ describe('PostgreSQL 小组仓储：未装配、无驱动依赖、与 schema 草
     }
   });
 
-  it('表名、列清单与状态枚举都与 db/schema-drafts 草案一致，且草案仍未转迁移', () => {
+  it('表名、列清单与状态枚举都与 db/schema-drafts 草案一致，且草案已按最小版本转为迁移', () => {
     const draftDir = join(REPO_ROOT, 'db', 'schema-drafts');
     const draftName = '0001_research_groups.draft.sql';
     const content = readFileSync(join(draftDir, draftName), 'utf8');
 
     const descriptor = describeSchemaDraftFile(draftName, content);
     expect(descriptor.targetTable).toBe(POSTGRES_GROUP_TABLE);
+    // 草案文件本身仍是「草案」状态（转迁移的产物是 db/migrations 下的新文件，
+    // 草案保留为设计来源，其头部不被改写）
     expect(descriptor.applied).toBe(false);
 
-    for (const column of [...POSTGRES_GROUP_COLUMNS, 'deleted_at']) {
+    for (const column of [...POSTGRES_GROUP_COLUMNS, ...POSTGRES_GROUP_INTERNAL_COLUMNS]) {
       expect(content).toContain(column);
     }
     expect(content).toContain(`CREATE TABLE IF NOT EXISTS ${POSTGRES_GROUP_TABLE}`);
@@ -946,8 +959,25 @@ describe('PostgreSQL 小组仓储：未装配、无驱动依赖、与 schema 草
       .sort();
     expect(draftStatuses).toEqual([...GROUP_STATUS_VALUES].sort());
 
-    // 草案不得提前变成迁移（迁移一旦合并即不可修改）
+    // 草案已转为**最小版本**迁移：迁移文件存在、建的是同一张表、列清单逐列一致
+    // （输出列 + 内部列；多列与少列都失败），且状态闭集与共享枚举一致
+    const migrationName = '0011_research_groups.sql';
     const migrationFiles = readdirSync(join(REPO_ROOT, 'db', 'migrations'));
-    expect(migrationFiles.some((file) => file.includes('research_groups'))).toBe(false);
+    expect(migrationFiles).toContain(migrationName);
+
+    const migration = readFileSync(join(REPO_ROOT, 'db', 'migrations', migrationName), 'utf8');
+    expect(migration).toContain(`CREATE TABLE IF NOT EXISTS ${POSTGRES_GROUP_TABLE}`);
+    for (const column of [...POSTGRES_GROUP_COLUMNS, ...POSTGRES_GROUP_INTERNAL_COLUMNS]) {
+      expect(migration).toContain(column);
+    }
+    const migrationStatusCheck = /status IN \(([^)]*)\)/iu.exec(migration);
+    const migrationStatuses = [...(migrationStatusCheck?.[1] ?? '').matchAll(/'([a-z_]+)'/gu)]
+      .map((match) => match[1])
+      .sort();
+    expect(migrationStatuses).toEqual([...GROUP_STATUS_VALUES].sort());
+    // 一份迁移只做一件事：这里只建这一张表
+    expect([...migration.matchAll(/CREATE TABLE IF NOT EXISTS (\w+)/gu)].map((m) => m[1])).toEqual([
+      POSTGRES_GROUP_TABLE,
+    ]);
   });
 });

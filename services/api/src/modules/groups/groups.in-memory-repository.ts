@@ -3,6 +3,7 @@ import { isGroupApplicable } from '@rm/shared';
 import { APP_ENV } from '../../config/config.module';
 import type { AppEnv } from '../../config/env';
 import type {
+  GroupListWindow,
   GroupRepository,
   GroupRepositoryCapabilities,
   GroupVisibilityQuery,
@@ -19,7 +20,8 @@ import type {
  *   换绑到数据库实现（见 `groups.port.ts` 的替换说明），
  *   而不是让「重启即丢数据」的内存结构悄悄承担生产存储职责；
  * - 不做授权判定、不生成归属信息：`leaderUserId`/`status` 由 service 从服务端主体与
- *   服务端常量写入；本类只执行「开放状态 + 授权范围」这两个**数据过滤**。
+ *   服务端常量写入；本类只执行「开放状态 + 授权范围」这两个**数据过滤**，
+ *   外加对已判定可见集合的**分页窗口切片**（`offset`/`limit`）。
  */
 @Injectable()
 export class InMemoryGroupRepository implements GroupRepository {
@@ -39,7 +41,12 @@ export class InMemoryGroupRepository implements GroupRepository {
     }
   }
 
-  create(group: ResearchGroup): ResearchGroup {
+  /**
+   * 异步只是**契约形状**（与 PostgreSQL 实现共用一条端口）：本实现没有任何 I/O，
+   * 因此在同一次事件循环里同步完成。早于 `await` 抛出的主键冲突仍然会被拒绝，
+   * 因而 `GroupRepository.create` 的失败语义在两种后端上一致。
+   */
+  async create(group: ResearchGroup): Promise<ResearchGroup> {
     if (this.groups.has(group.id)) {
       // 主键冲突属于服务端缺陷（ID 由服务端生成），不得静默覆盖
       throw new Error(`小组 ID 冲突: ${group.id}`);
@@ -48,13 +55,30 @@ export class InMemoryGroupRepository implements GroupRepository {
     return cloneGroup(group);
   }
 
-  listVisibleGroups(query: GroupVisibilityQuery): readonly ResearchGroup[] {
+  async listVisibleGroups(
+    query: GroupVisibilityQuery,
+    window: GroupListWindow,
+  ): Promise<readonly ResearchGroup[]> {
+    return this.visible(query)
+      .slice(window.offset, window.offset + window.limit)
+      .map(cloneGroup);
+  }
+
+  async countVisibleGroups(query: GroupVisibilityQuery): Promise<number> {
+    return this.visible(query).length;
+  }
+
+  /**
+   * 可见性过滤的**唯一实现**：列表与计数共用，避免「总数与当前页来自两套语义」
+   * 导致分页元数据与实际数据不一致。返回内部引用（调用方要么立刻切片、要么只读长度），
+   * 对外暴露前一律经 `cloneGroup` 复制。
+   */
+  private visible(query: GroupVisibilityQuery): ResearchGroup[] {
     return (
       [...this.groups.values()]
         // 本端点只展示开放小组；暂停/关闭的小组不可见（复用共享 isGroupApplicable）
         .filter((group) => isGroupApplicable(group.status))
         .filter((group) => query.includeAllOpenGroups || query.visibleGroupIds.includes(group.id))
-        .map(cloneGroup)
     );
   }
 }

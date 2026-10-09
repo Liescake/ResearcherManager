@@ -11,31 +11,39 @@ import type { SqlExecutor } from '../../db/ports/sql-executor.port';
 import { parseStoredGroup, storedGroupSchema } from './groups.contract';
 import {
   GROUP_REPOSITORY_BACKEND_POSTGRES,
-  type AsyncGroupRepository,
   type GroupListWindow,
+  type GroupRepository,
   type GroupRepositoryCapabilities,
   type GroupVisibilityQuery,
   type ResearchGroup,
 } from './groups.port';
 
 /**
- * 小组的 **PostgreSQL 仓储 adapter（首个可验证实现，未接入运行时）**。
+ * 小组的 **PostgreSQL 仓储 adapter（已接入运行时）**。
+ *
+ * ## 装配位置（唯一换绑点）
+ * `groups.module.ts` 的 `createGroupRepository(env, sqlConnectionFactory)` 按「是否解析出
+ * `DATABASE_URL`」分流：未配置时内存基线；配置时经 `createLazyPostgresGroupRepository`
+ * 绑定本文件的实现（**延迟建连**）。本文件自身不含任何 Nest 装配痕迹（无 `@Injectable` /
+ * `@Inject`），装配只发生在 Module 的工厂里 —— 这也正是
+ * `db/persistence/postgres-adapter-registry.ts` 的「已绑定切片」规则要求的形状。
  *
  * ## 交付边界（本切片刻意不做的事）
- * - **不绑定**到 `GroupsModule`：模块仍然只绑定内存基线 `InMemoryGroupRepository`，
- *   运行时行为与本切片之前逐字节一致（有回归断言，见同名 spec）；
  * - **不引入** `pg` / Prisma / TypeORM 等驱动或 ORM 依赖：本文件只依赖驱动无关的
- *   `SqlExecutor` 端口（`db/ports/sql-executor.port.ts`），真实执行器由消费方在「启用数据库」
- *   那一步显式提供；
+ *   `SqlExecutor` 端口（`db/ports/sql-executor.port.ts`），驱动只允许出现在 `db/postgres/`
+ *   驱动层；
  * - **不声称生产可用**：能力声明固定为 `backend = postgres`、`persistent = true`、
- *   `productionReady = false`。在引入经评估的驱动并完成对真实 PostgreSQL 的集成验证之前，
- *   生产启动会被 `PersistenceBoundaryService` 拒绝（`productionReady !== true` 即违规）。
+ *   `productionReady = false`。因此在 `NODE_ENV=production` 且已配置数据库时，启动期
+ *   `PersistenceBoundaryService` 会以 `BACKEND_NOT_PRODUCTION_READY_IN_PRODUCTION` 拒绝启动，
+ *   依赖就绪门禁也会给出 `GROUP_REPOSITORY[DEPENDENCY_NOT_VERIFIED]`（fail-closed）。
  *
- * ## 为什么先有异步契约
- * 现有 `GroupRepository`（`groups.port.ts`）是同步接口；把运行时端口改成 Promise 是跨模块
- * 契约变更（service / controller / 既有 spec 必须一起改），必须与真实驱动引入在同一片切片完成。
- * 因此本文件实现 `AsyncGroupRepository`（Promise 版，语义与内存基线完全一致），
- * 让「SQL 与映射是否正确」可以在**没有驱动、也没有数据库**的情况下被离线验证。
+ * ## 存储 ID 域（本切片的已登记前置）
+ * 端口契约已改为异步（见 `groups.port.ts`），因此本实现可以直接替换内存基线。但
+ * `research_groups.id` 是 `uuid`，而会话主体的 `groupIds` / `assignedResourceIds` 目前只保证
+ * 是「安全 ID」（例如 `g-1`）而非 UUID。故数据库路径对**资源级可见**的主体是 fail-closed 的：
+ * 非 UUID 的可见 ID 在进入 SQL 之前就被拒绝（`INVALID_QUERY`），绝不退化成
+ * 「放弃类型约束的 uuid[] 比较」。把会话主体资源标识收敛为 UUID 属于后续切片，也是
+ * `productionReady` 仍为 false 的原因之一。
  *
  * ## 安全边界（本文件的四条硬约束）
  * 1. **参数化 SQL**：所有客户端可控的值一律走 `$1…$n` 占位符绑定；进入 SQL 文本的只有
@@ -77,6 +85,16 @@ export const POSTGRES_GROUP_COLUMNS = [
   'updated_at',
 ] as const;
 
+/**
+ * **内部列**：存储层存在、但既不进 `SELECT` / `RETURNING`，也不进领域对象。
+ *
+ * `deleted_at` 是软删除标记，只被可见性谓词使用（`deleted_at IS NULL`）。把它登记在这里
+ * 而不是塞进 `POSTGRES_GROUP_COLUMNS`，是为了让「迁移的列清单 = 输出列 + 内部列」成为一条
+ * 可机器判定的等式（见 `groups-integration.spec.ts` 的双向核对）：既不允许迁移偷偷多列，
+ * 也不允许内部列悄悄流进领域对象。
+ */
+export const POSTGRES_GROUP_INTERNAL_COLUMNS = ['deleted_at'] as const;
+
 /** 仓储能力：持久但**未验证**，因此生产环境仍会被持久化边界守卫拦下 */
 export const POSTGRES_GROUP_REPOSITORY_CAPABILITIES: GroupRepositoryCapabilities = Object.freeze({
   backend: GROUP_REPOSITORY_BACKEND_POSTGRES,
@@ -86,11 +104,16 @@ export const POSTGRES_GROUP_REPOSITORY_CAPABILITIES: GroupRepositoryCapabilities
 
 /**
  * 转成生产可用前必须完成的验证清单（每一项都需要证据，不能只写声明）：
- * 1. 驱动依赖经评估后引入（`docs/P2-开源复用评估.md` 的 Prisma / TypeORM 比较结论）；
- * 2. 对真实 PostgreSQL 的集成测试：建表迁移、唯一名索引、软删除过滤、可见性过滤与分页窗口；
- * 3. `db/schema-drafts/` 草案按 `db/migrations/README.md` 转为迁移并执行验证；
- * 4. `GroupRepository` 端口改为异步，并同步修改 service / controller 与其测试；
- * 5. 完成 1–4 后，才允许把 `productionReady` 改为 true，并同步删除能力自检
+ * 1. 驱动依赖经评估后引入（`docs/P2-开源复用评估.md` 的 Prisma / TypeORM 比较结论）——已由
+ *    `db/postgres/` 驱动层 + 官方 `pg` 依赖完成；
+ * 2. 对真实 PostgreSQL 的集成测试：建表迁移、唯一名索引、软删除过滤、可见性过滤与分页窗口
+ *    （见 `db/postgres/__tests__/groups-integration.spec.ts`）；
+ * 3. `db/schema-drafts/` 草案按 `db/migrations/README.md` 转为迁移并执行验证——已落地为
+ *    `db/migrations/0011_research_groups.sql`；
+ * 4. `GroupRepository` 端口改为异步，并同步修改 service / controller 与其测试——已完成；
+ * 5. **仍缺**：会话主体的 `groupIds` / `assignedResourceIds` 收敛为 UUID（否则资源级可见的
+ *    主体在数据库路径上 fail-closed）；
+ * 6. 完成 1–5 后，才允许把 `productionReady` 改为 true，并同步删除能力自检
  *    （`assertPostgresGroupRepositoryCapabilities` 会拒绝「未验证就声称生产可用」）。
  */
 export const POSTGRES_GROUP_REPOSITORY_VERIFICATION_STEPS = [
@@ -405,7 +428,7 @@ function assertUsableExecutor(executor: unknown): SqlExecutor {
 }
 
 /** 可见性查询的 fail-closed 校验：形状、类型、UUID；返回值是**副本**，且已去重 */
-function assertVisibilityQuery(query: unknown): GroupVisibilityQuery {
+export function assertPostgresGroupVisibilityQuery(query: unknown): GroupVisibilityQuery {
   if (typeof query !== 'object' || query === null) {
     throw new PostgresGroupRepositoryError('INVALID_QUERY', '可见性查询必须是对象', ['query']);
   }
@@ -446,7 +469,7 @@ function assertVisibilityQuery(query: unknown): GroupVisibilityQuery {
 }
 
 /** 窗口的 fail-closed 校验：只校验类型与整数性，不校验业务上下界（由共享 paginationSchema 负责） */
-function assertWindow(window: unknown): GroupListWindow {
+export function assertPostgresGroupListWindow(window: unknown): GroupListWindow {
   if (typeof window !== 'object' || window === null) {
     throw new PostgresGroupRepositoryError('INVALID_WINDOW', '取数窗口必须是对象', ['window']);
   }
@@ -540,9 +563,10 @@ function parseCount(value: unknown): number {
  *
  * 构造与每次调用都会重新校验执行器（`assertUsableExecutor`）与自身能力声明，
  * 因此「执行器被换掉 / 被降级」或「能力声明被改写」都会 fail-closed，而不是静默继续。
- * 本类**不是** Nest provider，也未在任何模块中注册。
+ * 本类**不是** Nest provider：装配只发生在 `groups.module.ts` 的工厂里
+ * （`createLazyPostgresGroupRepository` 持有它，并在每次调用时按需构造）。
  */
-export class PostgresGroupRepository implements AsyncGroupRepository {
+export class PostgresGroupRepository implements GroupRepository {
   readonly capabilities: GroupRepositoryCapabilities = POSTGRES_GROUP_REPOSITORY_CAPABILITIES;
 
   private readonly executor: SqlExecutor;
@@ -627,8 +651,8 @@ export class PostgresGroupRepository implements AsyncGroupRepository {
     window: GroupListWindow,
   ): Promise<readonly ResearchGroup[]> {
     const executor = this.usableExecutor();
-    const visibility = assertVisibilityQuery(query);
-    const { offset, limit } = assertWindow(window);
+    const visibility = assertPostgresGroupVisibilityQuery(query);
+    const { offset, limit } = assertPostgresGroupListWindow(window);
 
     const result = await executor.query(LIST_SQL, [
       visibility.includeAllOpenGroups,
@@ -683,7 +707,7 @@ export class PostgresGroupRepository implements AsyncGroupRepository {
    */
   async countVisibleGroups(query: GroupVisibilityQuery): Promise<number> {
     const executor = this.usableExecutor();
-    const visibility = assertVisibilityQuery(query);
+    const visibility = assertPostgresGroupVisibilityQuery(query);
 
     const result = await executor.query(COUNT_SQL, [
       visibility.includeAllOpenGroups,
@@ -701,4 +725,105 @@ export class PostgresGroupRepository implements AsyncGroupRepository {
     const row = rows[0] as { total?: unknown } | undefined;
     return parseCount(row?.total);
   }
+}
+
+/** DI 工厂：把驱动无关的 `SqlExecutor` 装成小组仓储端口实现（本切片的换绑点之一） */
+export function createPostgresGroupRepository(executor: SqlExecutor): GroupRepository {
+  return new PostgresGroupRepository(executor);
+}
+
+/**
+ * 把「负责人必须落在存储 ID 域内」变成可**先于建连**执行的断言（供分流点、service 与测试复用）。
+ *
+ * 写路径的负责人是服务端会话主体（`subject.userId`），`research_groups.leader_user_id` 是 `uuid`。
+ * 非 UUID（例如会话基线的 `u-student-1`）或空 UUID 都不是可用负责人：延迟建连的实现必须在
+ * 解析执行器**之前**判定它，否则一个不合法的会话主体会先触发一次数据库连接、再在 adapter 里被拒绝——
+ * 那既浪费连接，也让「主体域判定发生在任何连接之前」这条性质无法被测试固定。
+ * 错误信息只含字段路径，不含主体取值。
+ */
+export function assertPostgresGroupLeaderSubject(leaderUserId: unknown): string {
+  const parsed = uuidSchema.safeParse(leaderUserId);
+  if (!parsed.success) {
+    throw new PostgresGroupRepositoryError(
+      'INVALID_RECORD',
+      '负责人必须由服务端会话主体写入且必须是合法 UUID：非存储 ID 域的主体拒绝进入数据库路径',
+      ['leaderUserId'],
+    );
+  }
+  if (parsed.data === NIL_UUID) {
+    throw new PostgresGroupRepositoryError(
+      'INVALID_RECORD',
+      '负责人是空 UUID（不是可用主体）：拒绝进入数据库路径',
+      ['leaderUserId'],
+    );
+  }
+  return parsed.data;
+}
+
+/** 待写记录的主体域：`leaderUserId` 必须先于建连通过 `assertPostgresGroupLeaderSubject` */
+function leaderSubjectOf(record: unknown): string {
+  if (typeof record !== 'object' || record === null) {
+    throw new PostgresGroupRepositoryError('INVALID_RECORD', '待写入的小组记录必须是对象', [
+      'record',
+    ]);
+  }
+  return assertPostgresGroupLeaderSubject((record as { leaderUserId?: unknown }).leaderUserId);
+}
+
+/**
+ * 延迟建连的 PostgreSQL 小组仓储：**模块装配阶段不碰数据库**。
+ *
+ * 为什么必须延迟：`SQL_CONNECTION_FACTORY.connect()` 在数据库已配置但执行器未通过 attest 契约时
+ * 会抛错。如果在这里急切建连，启动失败会表现为「模块工厂抛了数据库错」，而不是启动期持久化边界
+ * 给出的**结构化违规**（`SQL_EXECUTOR_VERIFICATION_REQUIRED` / `DECLARATION_NOT_SEALED` 等）；
+ * 依赖就绪门禁也必须能在**任何连接之前**给出 `GROUP_REPOSITORY[DEPENDENCY_NOT_VERIFIED]`。
+ * 延迟后，判定顺序保持为「配置 → 持久化边界 / 依赖就绪 → 首次真正读库」。
+ *
+ * 连接只在首次读写时建立并被复用；建立失败不缓存失败结果（下一次调用会重试）。
+ *
+ * **存储 ID 域先判、再建连**：可见范围与负责人必须落在 UUID 域内，因此
+ * `visibleGroupIds` 里的非 UUID 标识、以及非 UUID 的负责人，都会在解析执行器**之前**被拒绝，
+ * 不会触发任何数据库连接（`INVALID_QUERY` / `INVALID_RECORD`）。
+ */
+export function createLazyPostgresGroupRepository(
+  resolveExecutor: () => Promise<SqlExecutor>,
+  capabilities: GroupRepositoryCapabilities = POSTGRES_GROUP_REPOSITORY_CAPABILITIES,
+): GroupRepository {
+  assertPostgresGroupRepositoryCapabilities(capabilities);
+
+  let pending: Promise<SqlExecutor> | undefined;
+  const executor = (): Promise<SqlExecutor> => {
+    if (pending === undefined) {
+      pending = resolveExecutor().catch((error: unknown) => {
+        pending = undefined;
+        throw error;
+      });
+    }
+    return pending;
+  };
+
+  return {
+    capabilities,
+    async create(group: ResearchGroup): Promise<ResearchGroup> {
+      // 主体域先判、再建连：非法负责人的记录不应该触发任何数据库连接
+      leaderSubjectOf(group);
+      const resolved = await executor();
+      return new PostgresGroupRepository(resolved).create(group);
+    },
+    async listVisibleGroups(
+      query: GroupVisibilityQuery,
+      window: GroupListWindow,
+    ): Promise<readonly ResearchGroup[]> {
+      // 可见 ID 域与窗口形状先判、再建连（两者都是服务端判定产物，非法即服务端缺陷）
+      const visibility = assertPostgresGroupVisibilityQuery(query);
+      const listWindow = assertPostgresGroupListWindow(window);
+      const resolved = await executor();
+      return new PostgresGroupRepository(resolved).listVisibleGroups(visibility, listWindow);
+    },
+    async countVisibleGroups(query: GroupVisibilityQuery): Promise<number> {
+      const visibility = assertPostgresGroupVisibilityQuery(query);
+      const resolved = await executor();
+      return new PostgresGroupRepository(resolved).countVisibleGroups(visibility);
+    },
+  };
 }
