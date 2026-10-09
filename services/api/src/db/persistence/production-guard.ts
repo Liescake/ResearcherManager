@@ -1,3 +1,8 @@
+import {
+  evaluateSqlExecutorVerification,
+  type SqlExecutorVerificationCode,
+  type SqlExecutorVerificationInput,
+} from '../ports/sql-executor-verification';
 import type { PersistenceCapabilities } from '../ports/sql-executor.port';
 
 /**
@@ -12,7 +17,11 @@ import type { PersistenceCapabilities } from '../ports/sql-executor.port';
  * 2. `NODE_ENV=production` 时，任何 `persistent !== true` 或 `productionReady !== true`
  *    的绑定都判违规 —— 未验证的数据库 adapter 也包含在内（禁止把 provider 切到未验证数据库）；
  * 3. `NODE_ENV=production` 且未配置 `DATABASE_URL` 时判违规 —— 配置 fail-closed；
- * 4. 违规信息只包含端口名/后端名/规则，绝不包含连接串或口令。
+ * 4. 若装配提供了 SQL 执行器契约事实（`executorVerifications`），执行器还必须通过
+ *    `ports/sql-executor-verification.ts` 的准入契约：封存（不可伪造/不可变）的 Postgres 能力声明、
+ *    参数化查询能力、事务能力、已登记的验证来源与 schema/迁移就绪证据；内存替身、可变声明、
+ *    缺失/过期/冲突证据与非参数化执行器都判 `SQL_EXECUTOR_VERIFICATION_FAILED`；
+ * 5. 违规信息只包含端口名/后端名/规则，绝不包含连接串或口令。
  */
 
 export type PersistenceViolationRule =
@@ -20,7 +29,8 @@ export type PersistenceViolationRule =
   | 'BACKEND_NOT_DECLARED'
   | 'IN_MEMORY_BACKEND_IN_PRODUCTION'
   | 'BACKEND_NOT_PRODUCTION_READY_IN_PRODUCTION'
-  | 'DATABASE_NOT_CONFIGURED_IN_PRODUCTION';
+  | 'DATABASE_NOT_CONFIGURED_IN_PRODUCTION'
+  | 'SQL_EXECUTOR_VERIFICATION_FAILED';
 
 export interface PersistenceViolation {
   readonly rule: PersistenceViolationRule;
@@ -28,6 +38,8 @@ export interface PersistenceViolation {
   readonly token: string;
   /** 只包含后端名与布尔能力，不含任何机密 */
   readonly detail: string;
+  /** 仅当 `rule = SQL_EXECUTOR_VERIFICATION_FAILED`：执行器契约的原始违规码 */
+  readonly executorCode?: SqlExecutorVerificationCode;
 }
 
 /** 一个持久化绑定：端口名 + 实际绑定的实现能力声明 */
@@ -42,6 +54,18 @@ export interface PersistenceBoundaryInput {
   readonly nodeEnv: string;
   readonly databaseConfigured: boolean;
   readonly bindings: readonly PersistenceBinding[];
+  /**
+   * 可选的 SQL 执行器契约事实（每个执行器/连接工厂一条）。
+   * 装配没有执行器时省略；提供即参与判定，任一违规都让边界判定失败（fail-closed）。
+   */
+  readonly executorVerifications?: readonly PersistenceExecutorVerificationInput[];
+}
+
+/** 一个执行器的契约事实：违规要落到具体端口上，便于定位 */
+export interface PersistenceExecutorVerificationInput {
+  /** 违规端口名（DI 令牌的可读名，例如 `SQL_CONNECTION_FACTORY`） */
+  readonly token: string;
+  readonly input: SqlExecutorVerificationInput;
 }
 
 export interface PersistenceBoundaryReport {
@@ -119,6 +143,19 @@ export function evaluatePersistenceBoundary(
       token: 'DATABASE_CONFIG',
       detail: '生产环境未配置 DATABASE_URL：配置 fail-closed，拒绝以无数据库状态启动',
     });
+  }
+
+  // ---- SQL 执行器准入契约：只在装配提供了执行器事实时判定（没有执行器的装配不受影响） ----
+  for (const executor of input.executorVerifications ?? []) {
+    const report = evaluateSqlExecutorVerification(executor.input);
+    for (const item of report.violations) {
+      violations.push({
+        rule: 'SQL_EXECUTOR_VERIFICATION_FAILED',
+        token: executor.token,
+        detail: `SQL 执行器契约 ${item.code}：${item.detail}`,
+        executorCode: item.code,
+      });
+    }
   }
 
   return {
