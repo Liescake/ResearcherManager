@@ -17,7 +17,8 @@ import { describeEnv, type AppEnv } from './config/env';
  * 配置只有一个来源：**容器里的 `APP_ENV`**（`ConfigModule` 解析一次）。
  * 这一条很关键：应用自己 `loadEnv()` 出来的配置只能用于读取端口与日志，不能用来做判定，
  * 否则「应用实际使用的配置」与「判定用的配置」会漂移（判定通过、实际拿到别的值）。
- * 因此这里先 `init()`，再从容器取已校验配置。
+ * 因此这里从容器取已校验配置（`NestFactory.create()` 之后即可取用，见下方全局前缀的说明），
+ * 而不是自己再 `loadEnv()` 一次。
  *
  * @param options.setGlobalPrefix 是否设置全局前缀（默认 true）。为 `false` 时保持 Nest 默认，
  *   便于用注入配置的测试装配走 HTTP 用例。
@@ -36,16 +37,26 @@ export async function createApp(
     abortOnError: options.abortOnError ?? true,
   });
 
-  // NestFactory.create 已完成实例化（生产环境的 fail-closed 主要在这里触发：配置解析、
-  // 内存基线仓储拒绝构造）；init() 再触发 OnModuleInit / OnApplicationBootstrap，
-  // 持久化边界守卫也在这时执行（实测日志可见其通过记录）。
-  await app.init();
-
+  // 全局前缀必须在 init() **之前**设置。原因：init() 内部的 `registerRouter()` 会在**注册路由的
+  // 那一刻**读取 `ApplicationConfig` 里的前缀（@nestjs/core `nest-application.js` 的
+  // `registerRouter()`：`const prefix = this.config.getGlobalPrefix()`），之后再调用
+  // `setGlobalPrefix()` 只改配置、不重注册已注册的路由。此前的顺序（先 init 再设前缀）会让
+  // 构建产物以**不带前缀**的路径提供服务（实测：`/health` 200、`/api/v1/health` 404），
+  // 容器健康检查因此永远不可能通过。
+  //
+  // 这一改动不引入第二个配置来源：`NestFactory.create()` 已完成依赖实例化
+  // （`instanceLoader.createInstancesOfDependencies()`），因此这里 `app.get(APP_ENV)` 拿到的就是
+  // ConfigModule 解析并校验过的**同一份**容器配置；配置非法会在 create() 阶段直接失败
+  // （fail-closed 语义不变，仍在任何端口监听之前）。init() 仍负责 OnModuleInit /
+  // OnApplicationBootstrap 与持久化边界守卫。
   const env = app.get<AppEnv>(APP_ENV);
   if (options.setGlobalPrefix !== false) {
     // Nest 的 setGlobalPrefix 不接受前导斜杠
     app.setGlobalPrefix(env.API_PREFIX.replace(/^\/+/u, ''));
   }
+
+  await app.init();
+
   app.enableShutdownHooks();
   return app;
 }
@@ -56,9 +67,11 @@ export async function createApp(
  * 注入内存基线（含未验证 SQL 连接工厂）时，装配阶段直接失败：Nest 默认 `process.abort()`
  * 终止进程（子进程实测退出码 1），绝不带着坏配置继续跑。
  *
- * 门禁顺序（`startup-assembly.spec.ts` 守住）：配置解析 → 持久化能力声明 → SQL 执行器 attest
- * 契约，全部通过后才 `listen`。只要 `DATABASE_URL` 解析成功，无论 `NODE_ENV` 是什么，
- * 装配都必须提供经过 attest 且证据完整的 SQL 执行器，否则在**任何连接之前**终止启动。
+ * 门禁顺序（`startup-assembly.spec.ts` 守住）：配置解析 → 生产依赖就绪门禁（认证 → 业务，见
+ * `db/persistence/dependency-readiness.ts`）→ 持久化能力声明 → SQL 执行器 attest 契约，
+ * 全部通过后才 `listen`。只要 `DATABASE_URL` 解析成功，无论 `NODE_ENV` 是什么，
+ * 装配都必须提供经过 attest 且证据完整的 SQL 执行器，并持有封存声明与验证证据的持久化依赖，
+ * 否则在**任何连接之前**终止启动。
  */
 async function bootstrap(): Promise<void> {
   const logger = new Logger('Bootstrap');
