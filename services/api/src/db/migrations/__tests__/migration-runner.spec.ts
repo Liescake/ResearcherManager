@@ -64,10 +64,15 @@ class FakeDatabase implements MigrationDatabasePort {
     readonly appliedBy: string;
   }[] = [];
   failOnVersion: string | undefined;
+  /** 注入读取失败（模拟连接中断 / 权限不足这类「真正的读失败」） */
+  readFailure: Error | undefined;
   loadCount = 0;
 
   loadApplied(): Promise<readonly MigrationApplication[]> {
     this.loadCount += 1;
+    if (this.readFailure !== undefined) {
+      return Promise.reject(this.readFailure);
+    }
     return Promise.resolve(this.applied.map((item) => ({ ...item })));
   }
 
@@ -294,6 +299,59 @@ describe('runMigrations：执行与幂等', () => {
       }),
     ).rejects.toMatchObject({ code: 'RUN_GUARD_REJECTED' });
     expect(database.calls).toEqual([]);
+  });
+
+  it('读取已应用记录失败即 fail-closed（一个 SQL 都不执行），且错误文本已脱敏', async () => {
+    const directory = makeDirectory();
+    writeMigration(directory, '0001', 'create_a', 'CREATE TABLE IF NOT EXISTS a (id int);');
+    const database = new FakeDatabase();
+    database.readFailure = new Error(
+      'connect ECONNREFUSED postgresql://rm:sup3r-s3cret@db.example.com:5432/researcher_manager',
+    );
+
+    let captured: unknown;
+    try {
+      await runMigrations({
+        environment: 'development',
+        sourceDirectory: directory,
+        database,
+        appliedBy: 'test',
+      });
+    } catch (error) {
+      captured = error;
+    }
+
+    expect(captured).toBeInstanceOf(MigrationRunnerError);
+    const error = captured as MigrationRunnerError;
+    // 「读不出来」不等于「空库」：状态未知时不得放行迁移
+    expect(error.code).toBe('RUN_APPLIED_READ_FAILED');
+    expect(error.message).toContain('状态未知');
+    expect(database.calls).toEqual([]);
+    expect(JSON.stringify(error.issues)).not.toContain('sup3r-s3cret');
+    expect(error.issues[0]?.detail).toContain('***@');
+  });
+
+  it('全新数据库（loadApplied 返回空集合）时 0001 是第一个待执行版本', async () => {
+    const directory = makeDirectory();
+    writeMigration(
+      directory,
+      '0001',
+      'create_ledger',
+      'CREATE TABLE IF NOT EXISTS ledger (id int);',
+    );
+    writeMigration(directory, '0002', 'create_b', 'CREATE TABLE IF NOT EXISTS b (id int);');
+    const database = new FakeDatabase();
+
+    const report = await runMigrations({
+      environment: 'development',
+      sourceDirectory: directory,
+      database,
+      appliedBy: 'test',
+    });
+
+    expect(report.appliedBefore).toEqual([]);
+    expect(report.executionOrder).toEqual(['0001', '0002']);
+    expect(report.executed.map((item) => item.version)).toEqual(['0001', '0002']);
   });
 });
 

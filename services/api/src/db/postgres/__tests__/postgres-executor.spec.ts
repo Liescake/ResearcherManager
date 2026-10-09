@@ -209,6 +209,42 @@ describe('参数化：参数槽与传入参数必须严格配对', () => {
       code: 'EXECUTOR_RESULT_INVALID',
     });
   });
+
+  it('多语句简单查询（迁移文件形状）返回逐语句结果数组：归一化而不是判非法', async () => {
+    // `pg` 在无参数时走简单查询协议：一次下发多条语句会返回逐语句结果数组
+    // （真实形状：CREATE/COMMENT/CREATE，rows 为空数组、rowCount 为 null）
+    const multi = [
+      { rows: [], rowCount: null },
+      { rows: [], rowCount: null },
+      { rows: [{ id: 1 }], rowCount: 1 },
+    ] as unknown as PoolQueryResultLike;
+    const fake = createFakePool(() => multi);
+    const connection = createPostgresConnection({
+      profile: toPostgresPoolProfile(CONFIG),
+      capabilities: UNATTESTED_POSTGRES_CAPABILITIES,
+      poolFactory: () => fake.pool,
+    });
+
+    const result = await connection.query(
+      "CREATE TABLE IF NOT EXISTS t (id int); COMMENT ON TABLE t IS 't'; SELECT id FROM t",
+    );
+    expect(result.rows).toEqual([{ id: 1 }]);
+    expect(result.rowCount).toBe(1);
+    expect(fake.queries).toHaveLength(1);
+  });
+
+  it('结果数组里任一条缺少 rows 数组仍然拒绝（不因数组形状放宽）', async () => {
+    const broken = [{ rows: [] }, { rowCount: 1 }] as unknown as PoolQueryResultLike;
+    const fake = createFakePool(() => broken);
+    const connection = createPostgresConnection({
+      profile: toPostgresPoolProfile(CONFIG),
+      capabilities: UNATTESTED_POSTGRES_CAPABILITIES,
+      poolFactory: () => fake.pool,
+    });
+    await expect(connection.query('SELECT 1; SELECT 2')).rejects.toMatchObject({
+      code: 'EXECUTOR_RESULT_INVALID',
+    });
+  });
 });
 
 describe('事务：BEGIN / COMMIT / ROLLBACK 与逃逸、嵌套、销毁', () => {

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { resolveDatabaseConfig, type ResolvedDatabaseConfig } from '../../config/database-config';
 import { MIGRATION_DEPLOYMENT_SOURCE_DIRECTORY } from '../../migrations/migration-deployment-guard';
-import { runMigrations } from '../../migrations/migration-runner';
+import { loadMigrationStatus, runMigrations } from '../../migrations/migration-runner';
 import { resolveMigrationsDirectory } from '../../migrations/run-migrations';
 import { createPostgresMigrationDatabase } from '../postgres-migration-database';
 import {
@@ -40,15 +40,17 @@ import type { SqlConnection } from '../../ports/sql-executor.port';
  * 3. **错误脱敏**：真实驱动的 SQLSTATE 保留，连接串 / 口令 / 行取值不外发；
  * 4. **事务**：显式回滚不留数据、提交留数据；
  * 5. **迁移**：部署守卫 + 真实执行 `0001`–`0005` + 幂等重跑；**失败迁移整体回滚**（无半成品表、无记账行）；
- * 6. **owner 隔离**：统计聚合读只返回请求主体自己的计数（他人记录不参与、也不回流）。
+ * 6. **全新数据库 bootstrap**：记账表缺失时 `0001` 能先建表并记账，之后 status 稳定可重复；
+ * 7. **owner 隔离**：统计聚合读只返回请求主体自己的计数（他人记录不参与、也不回流）。
  *
  * 四张统计来源表**不再由测试临时建表**：它们由仓库真实迁移 `0002`–`0005` 建立，测试只在
  * 表上写入 / 清理自己的行（按 `user_id` 删除），因此「统计切片对真实 schema 取数」是被真的验证过的。
  *
  * ## 安全边界
  * - 目标库名必须包含 `test`，否则 fail-closed（避免误连生产库跑破坏性 DDL）；
- * - 只创建 / 删除本测试自带的表 `rm_it_*`；对迁移建出的业务表只按 `user_id` 增删本测试的行，
- *   不 DROP、不 TRUNCATE，也不触碰 `schema_migrations` 之外的既有数据；
+ * - 只创建 / 删除本测试自带的表 `rm_it_*`，以及**唯一一次** `DROP TABLE schema_migrations`（纯记账表，
+ *   无外键引用，紧接着由同一用例按守卫顺序幂等重建）；对迁移建出的业务表只按 `user_id` 增删本测试的行，
+ *   不 DROP、不 TRUNCATE，也不触碰业务表里的既有数据；
  * - 断言里绝不打印连接串。
  */
 /** 从连接串里取出数据库名；解析失败或无库名时返回 undefined（调用方按「不启用」处理） */
@@ -250,23 +252,29 @@ integrationDescribe('真实 PostgreSQL 集成（TEST_DATABASE_URL / 测试库 DA
     expect(rows.rows).toEqual([{ id: 2 }]);
   });
 
-  it('错误脱敏：保留 SQLSTATE，不外发连接串 / 口令 / 行取值', async () => {
+  it('错误脱敏：保留 SQLSTATE，不外发连接串 / 口令 / SQL 文本 / 行取值', async () => {
+    const sql = 'SELECT * FROM rm_it_definitely_missing_table';
     let captured: unknown;
     try {
-      await connection.query('SELECT * FROM rm_it_definitely_missing_table');
+      await connection.query(sql);
     } catch (error) {
       captured = error;
     }
     expect(captured).toBeInstanceOf(PostgresExecutorError);
     const executorError = captured as PostgresExecutorError;
+    // SQLSTATE 是**可外发**的诊断事实（脱敏契约要求保留它）
     expect(executorError.issues[0]?.code).toBe('42P01');
 
     const serialized = JSON.stringify(executorError, Object.getOwnPropertyNames(executorError));
-    expect(serialized).not.toContain(config.host);
-    for (const secret of [config.connectionString, 'rm_it_definitely_missing_table']) {
+    const password = new URL(config.connectionString).password;
+    // 不外发：连接串、口令、主机，以及 SQL 文本（`postgres-error.ts` 明确丢弃 `query` / `detail` / `where`）
+    for (const secret of [config.connectionString, password, config.host, sql]) {
       expect(serialized).not.toContain(secret);
     }
     expect(executorError.message).not.toContain(config.connectionString);
+    // 结构名（表名）按脱敏契约**可以**外发：`postgres-error.ts` 与 `postgres-error.spec.ts` 明确保留
+    // schema / table / column / constraint 以便定位，因此这里不断言表名不出现 —— 表名不是行取值。
+    expect(executorError.message).toContain('does not exist');
   });
 
   it('迁移：真实执行 0001–0005，且幂等重跑不再执行任何 SQL', async () => {
@@ -305,6 +313,64 @@ integrationDescribe('真实 PostgreSQL 集成（TEST_DATABASE_URL / 测试库 DA
     expect(again.guard.violations).toEqual([]);
     expect(again.executed).toEqual([]);
   }, 60_000);
+
+  it('全新数据库 bootstrap：记账表缺失时先安全执行 0001，再读取应用版本', async () => {
+    // 复现 WSL 真实测试发现的故障：空库里没有 schema_migrations，修复前 loadApplied() 直接抛
+    // EXECUTOR_QUERY_FAILED（relation "schema_migrations" does not exist），0001 永远没机会执行。
+    //
+    // 为什么可以安全地 DROP 这张表：它是迁移 0001 建立的**纯记账表**，没有任何外键引用它；
+    // 仓库全部迁移都用 IF NOT EXISTS（0001–0005），因此本用例随后按守卫顺序重放时
+    // 只是幂等重建，不动业务表里的任何数据，且结束时记账表已恢复。
+    await connection.query('DROP TABLE IF EXISTS schema_migrations');
+    const database = createPostgresMigrationDatabase(connection);
+
+    // 「记账表尚未建立」= 空集合（而不是读取失败）
+    await expect(database.loadApplied()).resolves.toEqual([]);
+
+    const first = await runMigrations({
+      environment: 'test',
+      sourceDirectory: resolveMigrationsDirectory(),
+      database,
+      appliedBy: 'integration-test',
+    });
+    const versions = ['0001', '0002', '0003', '0004', '0005'];
+    expect(first.guard.violations).toEqual([]);
+    expect(first.appliedBefore).toEqual([]);
+    expect(first.executionOrder).toEqual(versions);
+    expect(first.executed.map((item) => item.version)).toEqual(versions);
+    expect(first.appliedAfter).toEqual(versions);
+
+    // 0001 真的建立了记账表（不是测试自己建的）
+    const ledger = await connection.query<{ exists: boolean }>(
+      'SELECT to_regclass($1::text) IS NOT NULL AS exists',
+      ['public.schema_migrations'],
+    );
+    expect(ledger.rows[0]?.exists).toBe(true);
+
+    // 重复 status：两次结果一致，且报告已同步（只读，不写库）
+    const statusOptions = {
+      environment: 'test',
+      sourceDirectory: resolveMigrationsDirectory(),
+      database,
+      appliedBy: 'integration-test',
+    } as const;
+    const statusFirst = await loadMigrationStatus(statusOptions);
+    const statusSecond = await loadMigrationStatus(statusOptions);
+    expect(statusFirst.applied).toEqual(versions);
+    expect(statusFirst.pending).toEqual([]);
+    expect(statusFirst.upToDate).toBe(true);
+    expect(statusSecond.applied).toEqual(statusFirst.applied);
+    expect(statusSecond.pending).toEqual([]);
+
+    // 再跑一次仍然是幂等的（bootstrap 之后不再执行任何 SQL）
+    const again = await runMigrations({
+      environment: 'test',
+      sourceDirectory: resolveMigrationsDirectory(),
+      database,
+      appliedBy: 'integration-test',
+    });
+    expect(again.executed).toEqual([]);
+  }, 120_000);
 
   it('迁移失败整体回滚：半成品表与记账行都不留下', async () => {
     // 与已应用状态对齐：临时目录里放**与仓库逐字节相同**的全部迁移，再加一条必然失败的下一版本

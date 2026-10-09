@@ -103,7 +103,7 @@ export interface SelfStatisticsCapabilities {
  * - 一次调用返回四类计数，语义与四个来源端口之和一致（默认全零：空数据不是异常）；
  * - 只按**服务端主体**计数，不接受客户端提交的主体，也不做授权判定（调用方必须先授权）；
  * - 不返回记录、主键与任何字段取值：聚合输出在结构上不可能携带记录内容与 PII；
- * - SQL 实现必须走参数化（`$1::uuid`），且返回行要过严格行契约后才允许变成公开视图。
+ * - SQL 实现必须走参数化（`$n::uuid`，参数位从 `$1` 起连续且不重复），且返回行要过严格行契约后才允许变成公开视图。
  */
 export interface SelfStatisticsRepository {
   readonly capabilities: SelfStatisticsCapabilities;

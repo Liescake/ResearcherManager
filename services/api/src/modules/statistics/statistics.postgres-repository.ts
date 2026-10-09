@@ -35,7 +35,7 @@ import type { SelfStatisticsRepository } from './statistics.port';
  * ## 与内存基线的语义对应（逐条可核对）
  * | 内存基线（四个实例） | 本 adapter |
  * |---|---|
- * | 每个来源各自只按主体计数 | 一条 SELECT 的四个聚合子查询，谓词全是 `WHERE user_id = $1::uuid` |
+ * | 每个来源各自只按主体计数 | 一条 SELECT 的四个聚合子查询，谓词全是 `WHERE user_id = $n::uuid`（逐位绑定同一主体） |
  * | 默认全零：空数据不是异常 | 四个 `count` 恒有值：该主体无记录即 0，稳定返回四个 0 |
  * | 端口只返回计数、不返回记录 | 行契约只有归属列与四个计数列；结果只裁剪出四个计数字段 |
  * | `capabilities.source` 逐来源声明 | 聚合读模型只有一个 adapter，能力声明只保留后端与持久性 |
@@ -49,8 +49,12 @@ import type { SelfStatisticsRepository } from './statistics.port';
  *    四个 `count(1)::int` 子查询的别名就是行契约的四个聚合列；**不使用 `SELECT *`**，且语句里
  *    连 `*` 字符都不存在（聚合写成 `count(1)`），因此「存储层新增列自动流出」在结构上不可能；
  *    模块加载期即校验语句形状（参数位、聚合列数量、列名与来源表）。
- * 2. **单一 `$1::uuid` 参数化**：整条语句只有一个参数位（主体），值只走占位符绑定；SQL 文本里
- *    没有引号、分号、注释与通配符，不存在「值 → SQL 文本」的注入面；执行过的语句只有 `SELECT`。
+ * 2. **逐位 `$n::uuid` 参数化**：整条语句的参数位是**从 `$1` 起连续的独立序号**（归属投影占 `$1`，
+ *    四个聚合子查询各占一位，共 5 位），值只走占位符绑定且**同一个主体值逐位绑定**；
+ *    SQL 文本里没有引号、分号、注释与通配符，不存在「值 → SQL 文本」的注入面；执行过的语句只有 `SELECT`。
+ *    为什么不用复用的 `$1`：执行器契约（`db/postgres/sql-parameter-slots.ts`）要求参数位不重复，
+ *    复用会被判 `PARAMETER_SLOT_DUPLICATE` 并**拒绝下发**；逐位绑定与该契约一致，且「同一主体」
+ *    由 `postgresStatisticsParameters()` 用一个入参变量展开来保证（可用单测钉住逐位相同）。
  * 3. **严格非负安全整数行**：行契约 `.strict()`，计数复用 `statistics.contract.ts` 的
  *    `statisticsCountSchema`（整数、`>= 0`、`<= STATISTICS_COUNT_MAX`），因此负数、小数、NaN、
  *    Infinity 与字符串形计数（驱动默认把 `bigint` 返回成字符串）一律 fail-closed；SQL 侧用
@@ -240,7 +244,9 @@ function containsWord(sql: string, word: string): boolean {
   return new RegExp(`\\b${word}\\b`, 'u').test(sql);
 }
 
-/** SQL 里出现的占位符序号（去重升序），用于断言「占位符数量 === 参数数量」 */
+/**
+ * 语句里出现的占位符序号（去重升序），用于断言「占位符数量 === 参数数量」。
+ */
 export function statisticsPlaceholderIndexes(sql: string): number[] {
   return [...new Set([...sql.matchAll(/\$(\d+)/gu)].map((match) => Number(match[1])))].sort(
     (left, right) => left - right,
@@ -248,25 +254,50 @@ export function statisticsPlaceholderIndexes(sql: string): number[] {
 }
 
 /**
- * 固定显式四聚合列语句：由聚合列清单与单一参数位拼装。
+ * 参数位总数：归属投影 1 位 + 每个聚合子查询各 1 位（`$1`…`$5`）。
+ * 唯一事实来源是聚合列清单，因此新增来源表时参数位自动跟随。
+ */
+export const POSTGRES_STATISTICS_PARAMETER_COUNT = 1 + POSTGRES_STATISTICS_AGGREGATE_COLUMNS.length;
+
+/** 参数位序号（升序）：`$1` 为归属投影，随后每个聚合子查询各占一位 */
+export function postgresStatisticsPlaceholderSlots(): readonly number[] {
+  return Array.from({ length: POSTGRES_STATISTICS_PARAMETER_COUNT }, (_, index) => index + 1);
+}
+
+/**
+ * 固定显式四聚合列语句：由聚合列清单与**逐位参数位**拼装。
  *
  * - 归属列由 `$1::uuid` **直接投影**：它不来自任何表，唯一作用是让「返回了别的主体的行」
  *   成为可检测的差异（`OWNER_VIOLATION`）；
  * - 每个来源一个标量子查询，`count(1)::int`（不用 `count(*)`：语句里不存在 `*` 字符）；
- * - 全语句只有一个参数位，四个子查询与归属投影共用它。
+ * - 参数位从 `$1` 起连续且**每位只出现一次**：`$1` 是归属投影，`$2`…`$5` 依次是四个聚合子查询，
+ *   全部由同一个主体值逐位绑定（见 `postgresStatisticsParameters()`）。
  */
 function buildSelectSelfStatisticsSql(): string {
   const owner = assertSqlIdentifier(POSTGRES_STATISTICS_OWNER_COLUMN, 'owner_column');
-  const aggregates = POSTGRES_STATISTICS_AGGREGATE_COLUMNS.map((entry) => {
+  const slots = postgresStatisticsPlaceholderSlots();
+  const ownerSlot = slots[0] ?? 1;
+  const aggregates = POSTGRES_STATISTICS_AGGREGATE_COLUMNS.map((entry, index) => {
     const table = assertSqlIdentifier(entry.table, `${entry.field}.table`);
     const column = assertSqlIdentifier(entry.column, `${entry.field}.column`);
-    return `(SELECT count(1)::int FROM ${table} WHERE ${owner} = $1::uuid) AS ${column}`;
+    const slot = slots[index + 1] ?? index + 2;
+    return `(SELECT count(1)::int FROM ${table} WHERE ${owner} = $${slot}::uuid) AS ${column}`;
   });
-  return `SELECT $1::uuid AS ${owner}, ${aggregates.join(', ')}`;
+  return `SELECT $${ownerSlot}::uuid AS ${owner}, ${aggregates.join(', ')}`;
 }
 
 /** 唯一一条语句：固定显式四聚合列 SELECT */
 export const POSTGRES_STATISTICS_SELECT_SQL = buildSelectSelfStatisticsSql();
+
+/**
+ * 绑定参数：把**同一个**主体值按参数位逐位展开。
+ *
+ * 值只来自这一个入参变量，因此「归属投影与四个聚合子查询用的是同一主体」由构造保证，
+ * 不需要（也不能）靠复用占位符来表达 —— 执行器契约要求参数位不重复。
+ */
+export function postgresStatisticsParameters(ownerUserId: string): readonly string[] {
+  return Array.from({ length: POSTGRES_STATISTICS_PARAMETER_COUNT }, () => ownerUserId);
+}
 
 /**
  * 语句卫生（只读）：语句以 `SELECT` 开头，且文本里没有写操作 / DDL / 权限 / 过程调用与集合关键字，
@@ -308,27 +339,35 @@ export function assertPostgresStatisticsReadOnlySql(sql: string): void {
 }
 
 /**
- * 语句形状自检（模块加载期执行）：四个聚合列、单一参数位、来源表与归属谓词都必须与
- * 聚合列清单一致。这样「列清单改了但语句没改」「SQL 被改成多参数或通配投影」都会在
- * 导入期立刻失败，而不是等运行到某个主体才暴露。
+ * 语句形状自检（模块加载期执行）：四个聚合列、**逐位参数位**、来源表与归属谓词都必须与
+ * 聚合列清单一致。这样「列清单改了但语句没改」「SQL 被改成多参数、参数位不连续或复用同一位、
+ * 通配投影」都会在导入期立刻失败，而不是等运行到某个主体才暴露。
  */
 export function assertPostgresStatisticsSqlShape(
   sql: string = POSTGRES_STATISTICS_SELECT_SQL,
 ): void {
   const issues: string[] = [];
+  const expectedSlots = postgresStatisticsPlaceholderSlots();
   const placeholders = statisticsPlaceholderIndexes(sql);
-  if (placeholders.length !== 1 || placeholders[0] !== 1) {
+  if (placeholders.join(',') !== expectedSlots.join(',')) {
     issues.push('parameters');
   }
-  if (!sql.includes(`SELECT $1::uuid AS ${POSTGRES_STATISTICS_OWNER_COLUMN}`)) {
+  // 每位只允许出现一次：唯一序号数与出现次数都必须等于参数位总数（复用 `$1` 会被执行器拒绝下发）
+  const occurrences = [...sql.matchAll(/\$(\d+)/gu)].length;
+  if (occurrences !== expectedSlots.length) {
+    issues.push('parameter-usage');
+  }
+  const ownerSlot = expectedSlots[0] ?? 1;
+  if (!sql.includes(`SELECT $${ownerSlot}::uuid AS ${POSTGRES_STATISTICS_OWNER_COLUMN}`)) {
     issues.push('owner-projection');
   }
   const aggregateCount = [...sql.matchAll(/count\(1\)::int/gu)].length;
   if (aggregateCount !== POSTGRES_STATISTICS_AGGREGATE_COLUMNS.length) {
     issues.push('aggregate-count');
   }
-  for (const entry of POSTGRES_STATISTICS_AGGREGATE_COLUMNS) {
-    const expected = `(SELECT count(1)::int FROM ${entry.table} WHERE ${POSTGRES_STATISTICS_OWNER_COLUMN} = $1::uuid) AS ${entry.column}`;
+  for (const [index, entry] of POSTGRES_STATISTICS_AGGREGATE_COLUMNS.entries()) {
+    const slot = expectedSlots[index + 1] ?? index + 2;
+    const expected = `(SELECT count(1)::int FROM ${entry.table} WHERE ${POSTGRES_STATISTICS_OWNER_COLUMN} = $${slot}::uuid) AS ${entry.column}`;
     if (!sql.includes(expected)) {
       issues.push(`aggregate:${entry.field}`);
     }
@@ -336,7 +375,7 @@ export function assertPostgresStatisticsSqlShape(
   if (issues.length > 0) {
     throw new PostgresStatisticsRepositoryError(
       'SQL_VIOLATION',
-      '本人统计语句形状与聚合列清单不一致（固定显式四聚合列 + 单一 $1::uuid 参数位）',
+      '本人统计语句形状与聚合列清单不一致（固定显式四聚合列 + 逐位连续的 $1…$5 参数位）',
       issues,
     );
   }
@@ -621,7 +660,7 @@ function toSelfStatisticsView(row: PostgresStatisticsRow): SelfStatisticsView {
   return parsed.value;
 }
 
-/** 模块加载即校验：语句只读且形状固定（四聚合列 + 单一参数位） */
+/** 模块加载即校验：语句只读且形状固定（四聚合列 + 逐位连续的 `$1…$5` 参数位） */
 assertPostgresStatisticsReadOnlySql(POSTGRES_STATISTICS_SELECT_SQL);
 assertPostgresStatisticsSqlShape();
 assertPostgresStatisticsColumnsAligned();
@@ -668,7 +707,8 @@ export class PostgresStatisticsRepository implements SelfStatisticsRepository {
    * 按服务端主体聚合取数（四类计数一次读出）。
    *
    * - 主体必须落在存储 ID 域内，否则 `INVALID_SUBJECT`，且**不访问数据库**；
-   * - 归属下推进 SQL（四个子查询都是 `WHERE user_id = $1::uuid`），他人记录不参与计数；
+   * - 归属下推进 SQL（四个子查询都是 `WHERE user_id = $n::uuid`，`$2`…`$5` 逐位绑定同一主体），
+   *   他人记录不参与计数；
    * - 聚合语句恒返回一行：0 行与多行都判 `RESULT_SET_VIOLATION`（0 行绝不等于「四个 0」）；
    * - 返回行必须过严格行契约（未知列 / 缺列 / 非法计数 fail-closed）；
    * - 返回行的归属必须与请求主体逐字节一致，否则 `OWNER_VIOLATION`；
@@ -678,7 +718,11 @@ export class PostgresStatisticsRepository implements SelfStatisticsRepository {
     const executor = this.usableExecutor();
     const ownerId = requireSubject(ownerUserId);
 
-    const rows = await runQuery(executor, POSTGRES_STATISTICS_SELECT_SQL, [ownerId]);
+    const rows = await runQuery(
+      executor,
+      POSTGRES_STATISTICS_SELECT_SQL,
+      postgresStatisticsParameters(ownerId),
+    );
 
     if (rows.length !== 1) {
       throw new PostgresStatisticsRepositoryError(

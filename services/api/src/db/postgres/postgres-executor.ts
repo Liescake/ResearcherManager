@@ -44,6 +44,10 @@ import { assertQueryParameterSlots, SqlParameterSlotError } from './sql-paramete
  *    routine 与结构名（schema/table/column/constraint），丢弃 `detail` / `hint` / `where` / `query`，
  *    并擦除连接串凭据与口令片段；**不把原始错误挂成 `cause`**，避免下游日志把原文带回。
  *
+ * 结果归一化对**两种驱动形状**都成立：单条语句的单个结果，以及无参数多语句简单查询返回的
+ * **逐语句结果数组**（迁移文件正是后者：`CREATE TABLE ...; COMMENT ...; CREATE INDEX ...`）。
+ * 只认「单个结果」会把已经执行成功的多语句迁移判成非法结果并回滚事务。
+ *
  * ## attest 约束
  * `createPostgresSqlConnectionFactory` 不接受「自称生产可用」的对象字面量：
  * - 它只通过登记表 `attest()` 取得**封存声明**（不可伪造、深度冻结、WeakSet 身份校验）；
@@ -98,19 +102,47 @@ export function toPostgresPoolProfile(config: ResolvedDatabaseConfig): PostgresP
   };
 }
 
-function normalizeResult(result: {
+/** 驱动单条语句的结果形状（与 `pg` 的 QueryResult 对齐，但不依赖它） */
+interface DriverStatementResult {
   readonly rows?: unknown;
   readonly rowCount?: number | null;
-}): SqlQueryResult {
-  const rows = result.rows;
+}
+
+function normalizeSingleResult(result: unknown): SqlQueryResult {
+  const record: DriverStatementResult =
+    typeof result === 'object' && result !== null ? (result as DriverStatementResult) : {};
+  const rows = record.rows;
   if (!Array.isArray(rows)) {
     throw new PostgresExecutorError(
       'EXECUTOR_RESULT_INVALID',
       '驱动返回的结果缺少 rows 数组：拒绝把不可信结果交给调用方',
     );
   }
-  const rowCount = typeof result.rowCount === 'number' ? result.rowCount : rows.length;
+  const rowCount = typeof record.rowCount === 'number' ? record.rowCount : rows.length;
   return { rows, rowCount };
+}
+
+/**
+ * 归一化驱动结果。
+ *
+ * `pg` 在**没有参数**时走简单查询协议：一次下发多条语句会返回**逐语句的结果数组**
+ * （迁移文件正是这种形状：`CREATE TABLE ...; COMMENT ...; CREATE INDEX ...`）。
+ * 这不是非法结果，必须被正确归一化 —— 否则一条**已经真的执行成功**的迁移会被判成
+ * `EXECUTOR_RESULT_INVALID`，事务随之回滚，多语句迁移永远无法落地。
+ *
+ * 口径：行数据取**最后一条**语句的 `rows`（与单语句查询的语义一致），`rowCount` 取各语句之和；
+ * 数组里任一条结果缺少 `rows` 数组仍然按 `EXECUTOR_RESULT_INVALID` 拒绝。
+ */
+function normalizeResult(result: unknown): SqlQueryResult {
+  if (Array.isArray(result)) {
+    const results = result.map((item) => normalizeSingleResult(item));
+    const last = results[results.length - 1];
+    return {
+      rows: last?.rows ?? [],
+      rowCount: results.reduce((total, item) => total + item.rowCount, 0),
+    };
+  }
+  return normalizeSingleResult(result);
 }
 
 /** 驱动异常 → 脱敏后的执行器异常（绝不携带原始错误对象） */
@@ -177,7 +209,7 @@ export function createPostgresConnection(options: PostgresConnectionOptions): Sq
       throw error;
     }
 
-    let raw: { readonly rows?: unknown; readonly rowCount?: number | null };
+    let raw: unknown;
     try {
       raw = await client.query(sql, parameters === undefined ? undefined : [...parameters]);
     } catch (error) {

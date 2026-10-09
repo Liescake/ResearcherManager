@@ -27,6 +27,11 @@ import { redactPostgresErrorText } from '../postgres/postgres-error';
  * 4. 每条迁移在**单个事务**内执行，并把 `schema_migrations` 记录写进同一个事务 ——
  *    中途失败既不留下半成品 schema，也不留下「已应用」记录。
  *
+ * ## 全新数据库：先 bootstrap，再读应用版本
+ * 记账表 `schema_migrations` 由 `0001` 建立，所以空库里第 1 步读到的就是「空集合」而不是错误；
+ * 于是 `0001` 作为第一个待执行版本进入守卫的执行顺序，在守卫放行后由它自己的事务建表并记账，
+ * 之后才谈得上「读取应用版本」。运行入口不自行建表、不跳过守卫、也不把「读失败」当成空库。
+ *
  * ## 事务边界如何保证
  * 迁移文件按规范自带 `BEGIN;` / `COMMIT;`（守卫强制）。本模块把这两条**独立成行的**语句
  * 摘掉，改用执行器的 `transaction()` 提供事务，从而能把记账 INSERT 放进同一事务。
@@ -81,8 +86,22 @@ export class MigrationRunnerError extends Error {
   }
 }
 
-/** 数据库端口：只暴露运行迁移需要的两件事（读已应用记录、原子应用一条迁移） */
+/**
+ * 数据库端口：只暴露运行迁移需要的两件事（读已应用记录、原子应用一条迁移）。
+ *
+ * ## 「全新数据库」是正常状态，不是读取失败
+ * 记账表 `schema_migrations` 由迁移 `0001` 建立，所以**空的数据库里这张表本来就不存在**。
+ * `loadApplied()` 必须把这种情形如实表达为**空集合**（= 没有任何已应用迁移），
+ * 否则会出现死锁：读应用版本要有表 → 有表要执行 `0001` → 执行 `0001` 要先读版本。
+ *
+ * 除「记账表尚未建立」以外的任何读取失败（连接、权限、超时、行契约不合法）都必须抛出：
+ * 运行入口会把它收敛成 `RUN_APPLIED_READ_FAILED`（细节已脱敏）。
+ *
+ * **建表只允许走守卫**：实现不得在读取路径上顺手建表，`schema_migrations` 只能由守卫放行的
+ * `0001` 在自己的事务内建立 —— 否则「哪些 DDL 可以部署」就有了绕过守卫的第二个入口。
+ */
 export interface MigrationDatabasePort {
+  /** 已应用记录（版本升序）。**记账表尚未建立（全新数据库）时返回空集合**，不抛错。 */
   loadApplied(): Promise<readonly MigrationApplication[]>;
   /**
    * 在**单个事务**内执行 `statement` 并写入 `schema_migrations` 记录。
@@ -197,7 +216,9 @@ function guardViolationToIssue(violation: MigrationDeploymentViolation): Migrati
  */
 export async function runMigrations(options: RunMigrationsOptions): Promise<MigrationRunReport> {
   const candidates = collectMigrationDeploymentCandidates(options.sourceDirectory);
-  const appliedBefore = await options.database.loadApplied();
+  // 全新数据库在这里得到空集合（记账表尚未由 0001 建立），因此 `0001` 会作为第一个待执行版本
+  // 进入守卫的执行顺序；「读不出来」才 fail-closed（见 readApplied）。
+  const appliedBefore = await readApplied(options.database, 'before');
 
   const guard = evaluateMigrationDeploymentGuard({
     environment: options.environment,
@@ -267,15 +288,7 @@ export async function runMigrations(options: RunMigrationsOptions): Promise<Migr
     }
   }
 
-  let appliedAfter: readonly MigrationApplication[];
-  try {
-    appliedAfter = dryRun ? appliedBefore : await options.database.loadApplied();
-  } catch {
-    throw new MigrationRunnerError(
-      'RUN_APPLIED_READ_FAILED',
-      '迁移执行后无法重新读取 schema_migrations：拒绝在状态未知时报告成功',
-    );
-  }
+  const appliedAfter = dryRun ? appliedBefore : await readApplied(options.database, 'after');
 
   return {
     ok: true,
@@ -302,7 +315,7 @@ export async function loadMigrationStatus(
   options: Omit<RunMigrationsOptions, 'dryRun'>,
 ): Promise<MigrationStatusReport> {
   const candidates = collectMigrationDeploymentCandidates(options.sourceDirectory);
-  const applied = await options.database.loadApplied();
+  const applied = await readApplied(options.database, 'status');
   const guard = evaluateMigrationDeploymentGuard({
     environment: options.environment,
     sourceDirectory: MIGRATION_DEPLOYMENT_SOURCE_DIRECTORY,
@@ -318,9 +331,67 @@ export async function loadMigrationStatus(
   };
 }
 
-/** 失败摘要：驱动层的脱敏消息可以透传，其余只保留错误名（避免把栈/连接信息带回） */
+/**
+ * 失败摘要：驱动层的脱敏消息可以透传，其余只保留错误名（避免把栈/连接信息带回）。
+ *
+ * 若异常自身带有 `issues`（执行器契约里只放 SQLSTATE、后果名、参数槽序号这类**结构性**描述），
+ * 则把其中的 `code` 一并带上：SQLSTATE 是可外发的诊断事实（见 `postgres-error.ts`），
+ * 丢掉它会让「权限不足 / 表不存在 / 约束冲突」在上层无法区分。`issues` 不是数组就忽略，
+ * 绝不去回读驱动原文。
+ */
 function describeFailure(error: unknown): string {
   const message = error instanceof Error ? error.message : '';
   const name = error instanceof Error ? error.name : typeof error;
-  return `${name}: ${redactPostgresErrorText(message)}`;
+  const codes = readErrorIssueCodes(error);
+  const suffix = codes.length === 0 ? '' : ` [${codes.join(', ')}]`;
+  return `${name}: ${redactPostgresErrorText(message)}${suffix}`;
+}
+
+/** 读取已脱敏的结构性错误码（只取 `code`；形状不可信时返回空数组） */
+function readErrorIssueCodes(error: unknown): string[] {
+  if (typeof error !== 'object' || error === null) {
+    return [];
+  }
+  const issues = (error as { issues?: unknown }).issues;
+  if (!Array.isArray(issues)) {
+    return [];
+  }
+  return issues
+    .map((issue) =>
+      typeof issue === 'object' && issue !== null ? (issue as { code?: unknown }).code : undefined,
+    )
+    .filter((code): code is string => typeof code === 'string' && code !== '')
+    .map((code) => redactPostgresErrorText(code));
+}
+
+/** 读取失败发生在哪一步：只影响消息措辞，不改变 fail-closed 语义 */
+export type AppliedReadStage = 'before' | 'after' | 'status';
+
+/**
+ * 读取已应用记录：**读不出来就是状态未知**，一律 fail-closed。
+ *
+ * 「全新数据库」不在这里处理：那是端口层的正常返回值（空集合），不是异常。
+ * 这里只保证「真的读失败」不会退化成一个看起来正常的空快照 —— 那会让守卫在状态未知的
+ * 情况下放行迁移，是最危险的失败模式。细节先经 `postgres-error.ts` 脱敏再进入错误项，
+ * 因此连接串 / 口令 / 行取值不会随错误外发。
+ *
+ * @throws MigrationRunnerError `RUN_APPLIED_READ_FAILED`
+ */
+async function readApplied(
+  database: MigrationDatabasePort,
+  stage: AppliedReadStage,
+): Promise<readonly MigrationApplication[]> {
+  try {
+    return await database.loadApplied();
+  } catch (error) {
+    const message =
+      stage === 'before'
+        ? '无法读取 schema_migrations（迁移状态未知）：未执行任何 SQL'
+        : stage === 'after'
+          ? '迁移执行后无法重新读取 schema_migrations：拒绝在状态未知时报告成功'
+          : '无法读取 schema_migrations（迁移状态未知）：拒绝在状态未知时报告已同步';
+    throw new MigrationRunnerError('RUN_APPLIED_READ_FAILED', message, [
+      { code: 'applied-read', detail: `${stage}: ${describeFailure(error)}` },
+    ]);
+  }
 }

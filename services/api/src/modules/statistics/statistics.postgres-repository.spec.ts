@@ -6,6 +6,7 @@ import type {
   SqlExecutor,
   SqlQueryResult,
 } from '../../db/ports/sql-executor.port';
+import { assertQueryParameterSlots } from '../../db/postgres/sql-parameter-slots';
 import {
   SELF_STATISTICS_FIELDS,
   STATISTICS_COUNT_MAX,
@@ -29,6 +30,7 @@ import {
   assertPostgresStatisticsRowAligned,
   assertPostgresStatisticsSqlShape,
   findStatisticsViewExclusionLeaks,
+  postgresStatisticsParameters,
   statisticsPlaceholderIndexes,
 } from './statistics.postgres-repository';
 
@@ -41,7 +43,8 @@ import {
  *   不引 Nest 装饰器、不引驱动与 ORM；
  * - **固定显式四聚合列 SELECT**：四个 `count(1)::int` 子查询、来源表逐条固定、不使用通配投影，
  *   语句里没有字面量 / 分号 / 注释，执行过的语句只有 `SELECT`；
- * - **`$1::uuid` 参数化**：整条语句只有一个参数位，值只走绑定；注入载荷要么只进参数、要么在进入
+ * - **逐位 `$n::uuid` 参数化**：参数位从 `$1` 起连续、每位只出现一次（归属投影 `$1` + 四个子查询
+ *   `$2`…`$5`），值只走绑定且**逐位绑定同一主体**；注入载荷要么只进参数、要么在进入
  *   SQL 之前被拒绝（拒绝路径一个 SQL 都不执行）；
  * - **strict 非负安全整数行**：负数 / 小数 / NaN / Infinity / 字符串形计数 / 超上限 / 缺列 /
  *   未知列一律 fail-closed，且错误信息只含字段路径，不含字段取值；
@@ -342,18 +345,18 @@ describe('能力声明与交付边界', () => {
   });
 });
 
-describe('固定显式四聚合列 SELECT 与单一参数位', () => {
+describe('固定显式四聚合列 SELECT 与逐位参数位', () => {
   it('语句以 SELECT 开头，含恰好四个 count(1)::int 聚合列与固定来源表', () => {
     expect(POSTGRES_STATISTICS_SELECT_SQL.startsWith('SELECT ')).toBe(true);
     const aggregates = [...POSTGRES_STATISTICS_SELECT_SQL.matchAll(/count\(1\)::int/gu)];
     expect(aggregates).toHaveLength(POSTGRES_STATISTICS_AGGREGATE_COLUMNS.length);
     expect(aggregates).toHaveLength(4);
 
-    for (const entry of POSTGRES_STATISTICS_AGGREGATE_COLUMNS) {
+    POSTGRES_STATISTICS_AGGREGATE_COLUMNS.forEach((entry, index) => {
       expect(POSTGRES_STATISTICS_SELECT_SQL).toContain(
-        `(SELECT count(1)::int FROM ${entry.table} WHERE ${POSTGRES_STATISTICS_OWNER_COLUMN} = $1::uuid) AS ${entry.column}`,
+        `(SELECT count(1)::int FROM ${entry.table} WHERE ${POSTGRES_STATISTICS_OWNER_COLUMN} = $${index + 2}::uuid) AS ${entry.column}`,
       );
-    }
+    });
     expect(POSTGRES_STATISTICS_SELECT_SQL).toContain(
       `SELECT $1::uuid AS ${POSTGRES_STATISTICS_OWNER_COLUMN}`,
     );
@@ -373,10 +376,18 @@ describe('固定显式四聚合列 SELECT 与单一参数位', () => {
     }
   });
 
-  it('单一 $1::uuid 参数位：占位符序号恰为 [1]，四个子查询共用同一个参数', () => {
-    expect(statisticsPlaceholderIndexes(POSTGRES_STATISTICS_SELECT_SQL)).toEqual([1]);
-    const occurrences = [...POSTGRES_STATISTICS_SELECT_SQL.matchAll(/\$1::uuid/gu)].length;
+  it('逐位参数位：占位符序号恰为 [1…5] 且每位只出现一次（执行器不允许重复序号）', () => {
+    expect(statisticsPlaceholderIndexes(POSTGRES_STATISTICS_SELECT_SQL)).toEqual([1, 2, 3, 4, 5]);
+    const occurrences = [...POSTGRES_STATISTICS_SELECT_SQL.matchAll(/\$\d+::uuid/gu)].length;
     expect(occurrences).toBe(POSTGRES_STATISTICS_AGGREGATE_COLUMNS.length + 1);
+
+    // 逐位绑定同一主体：参数数组是同一个入参值的 N 份展开
+    const parameters = postgresStatisticsParameters(OWNER);
+    expect(parameters).toHaveLength(POSTGRES_STATISTICS_AGGREGATE_COLUMNS.length + 1);
+    expect(new Set(parameters)).toEqual(new Set([OWNER]));
+    expect(() =>
+      assertQueryParameterSlots(POSTGRES_STATISTICS_SELECT_SQL, parameters),
+    ).not.toThrow();
   });
 
   it('只读语句门禁：接受本语句，拒绝写操作 / DDL / 注释 / 通配 / 字面量', () => {
@@ -402,7 +413,7 @@ describe('固定显式四聚合列 SELECT 与单一参数位', () => {
     expect(withLiteral.issues).toContain('literal');
   });
 
-  it('语句形状自检能发现被篡改的语句（多参数 / 换表 / 少聚合列）', () => {
+  it('语句形状自检能发现被篡改的语句（参数位错位 / 复用同一位 / 换表 / 少聚合列）', () => {
     expect(() => assertPostgresStatisticsSqlShape(POSTGRES_STATISTICS_SELECT_SQL)).not.toThrow();
 
     const extraParameter = captureSyncError(() =>
@@ -414,6 +425,15 @@ describe('固定显式四聚合列 SELECT 与单一参数位', () => {
       ),
     );
     expect(extraParameter.code).toBe('SQL_VIOLATION');
+
+    // 复用同一位（把某个子查询的 $2 改回 $1）：唯一序号不再连续，必须被形状自检拦下
+    const reusedSlot = captureSyncError(() =>
+      assertPostgresStatisticsSqlShape(
+        POSTGRES_STATISTICS_SELECT_SQL.replace('$2::uuid', '$1::uuid'),
+      ),
+    );
+    expect(reusedSlot.code).toBe('SQL_VIOLATION');
+    expect(reusedSlot.issues).toContain('parameters');
 
     const otherTable = captureSyncError(() =>
       assertPostgresStatisticsSqlShape(
@@ -435,14 +455,15 @@ describe('固定显式四聚合列 SELECT 与单一参数位', () => {
     ]);
   });
 
-  it('运行期只执行这一条语句、只带一个主体参数', async () => {
+  it('运行期只执行这一条语句，参数逐位绑定同一主体（5 位同值）', async () => {
     const { repository, executor } = repoWith(rowResult(rowFromCounts()));
 
     const view = await repository.readCountsByUserId(OWNER);
 
     expect(executor.calls).toHaveLength(1);
     expect(executor.calls[0]?.sql).toBe(POSTGRES_STATISTICS_SELECT_SQL);
-    expect(executor.calls[0]?.parameters).toEqual([OWNER]);
+    expect(executor.calls[0]?.parameters).toEqual(postgresStatisticsParameters(OWNER));
+    expect(executor.calls[0]?.parameters).toEqual([OWNER, OWNER, OWNER, OWNER, OWNER]);
     expect(view).toEqual(expectedView());
   });
 });
@@ -594,7 +615,7 @@ describe('归属复核（owner）', () => {
     );
     const view = await ok.repository.readCountsByUserId(HEX_OWNER);
     expect(view).toEqual(expectedView());
-    expect(ok.executor.calls[0]?.parameters).toEqual([HEX_OWNER]);
+    expect(ok.executor.calls[0]?.parameters).toEqual(postgresStatisticsParameters(HEX_OWNER));
 
     const upper = repoWith(
       rowResult(rowFromCounts({ [POSTGRES_STATISTICS_OWNER_COLUMN]: HEX_OWNER_UPPER })),
