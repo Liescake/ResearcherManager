@@ -720,13 +720,16 @@ describe('判定器：生产环境的正向路径', () => {
   });
 
   it('就绪证据覆盖当前仓库真实迁移集合：已应用 = 可用才放行', () => {
-    const available = ['0001'];
+    // 就绪证据直接用磁盘上的真实迁移集合构造：新增迁移时本用例自动跟随，
+    // 不会因为「硬编码的版本清单过期」而产生与被测契约无关的假失败。
+    const available = [...REAL_MIGRATION_VERSIONS];
+    expect(available.length).toBeGreaterThan(0);
+    expect(available).toEqual([...available].sort());
+
     const target = fixture({
       readinessOverrides: { availableVersions: available, appliedVersions: available },
     });
     expect(evaluate(target).ok).toBe(true);
-    // 与磁盘事实一致：db/migrations 下当前只有一个迁移（0001_bootstrap.sql）
-    expect(REAL_MIGRATION_VERSIONS).toEqual(available);
   });
 
   it('判定时刻必须是可复现的带时区 ISO 时间戳（否则属于调用方错误）', () => {
@@ -1389,8 +1392,27 @@ describe('真实装配：启动期持久化边界把执行器契约一起判定'
     expect(service.verify().ok).toBe(true);
   });
 
-  it('PersistenceBoundaryService：只有能力声明的替身不在执行器契约范围内（既有装配不受影响）', () => {
-    const service = serviceWithSqlBinding(productionEnv(), {
+  it('PersistenceBoundaryService：只有能力声明的替身在数据库已配置时判「缺少执行器契约事实」', () => {
+    const service = serviceWithSqlBinding(productionEnv(), { capabilities: VERIFIED_CAPABILITIES });
+
+    let captured: unknown;
+    try {
+      service.verify();
+    } catch (error) {
+      captured = error;
+    }
+    expect(captured).toBeInstanceOf(PersistenceBoundaryError);
+    const violations = (captured as PersistenceBoundaryError).violations;
+    // 不是执行器形态 ⇒ 不进执行器契约的内部判定（没有任何执行器违规码）……
+    expect(violations.some((item) => item.rule === 'SQL_EXECUTOR_VERIFICATION_FAILED')).toBe(false);
+    // ……但数据库已配置时「没有契约事实」本身就是违规：能力自述（persistent/productionReady）
+    // 不再能绕过 attest 契约。
+    expect(violations.map((item) => item.rule)).toEqual(['SQL_EXECUTOR_VERIFICATION_REQUIRED']);
+    expect(violations[0]?.token).toBe('SQL_CONNECTION_FACTORY');
+  });
+
+  it('PersistenceBoundaryService：无数据库装配不要求执行器契约（非执行器替身不受影响）', () => {
+    const service = serviceWithSqlBinding(loadEnv({ NODE_ENV: 'test' }), {
       capabilities: VERIFIED_CAPABILITIES,
     });
     const report = service.verify();

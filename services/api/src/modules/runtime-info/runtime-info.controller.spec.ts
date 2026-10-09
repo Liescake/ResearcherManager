@@ -373,6 +373,68 @@ describe('敏感配置绝不进入 /runtime-info 响应', () => {
   });
 });
 
+describe('取值级脱敏门禁：白名单字段里塞进敏感取值同样 fail-closed', () => {
+  beforeEach(() => {
+    vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('真实 HTTP：nodeEnv 被替换成连接串 → 500，响应不回显任何敏感片段', async () => {
+    const leaked = {
+      ...validPayload,
+      nodeEnv: SECRETS.databaseUrl,
+    } as unknown as RuntimeInfoPayload;
+    const { status, text, body } = await getWithServiceDouble({
+      getRuntimeInfo: () => leaked,
+    });
+
+    expect(status).toBe(500);
+    expect(body.data).toBeNull();
+    expect(body.error?.code).toBe(ApiErrorCode.InternalError);
+    for (const fragment of SENSITIVE_FRAGMENTS) {
+      expect(text).not.toContain(fragment);
+    }
+    expect(text).not.toContain('databaseConfigured');
+  });
+
+  it('真实 HTTP：apiPrefix 被替换成内部文件路径 → 500（字段闭集挡不住取值泄露）', async () => {
+    const leaked = {
+      ...validPayload,
+      apiPrefix: 'D:\\WorkSpace\\ReseacherManager\\services\\api',
+    } as unknown as RuntimeInfoPayload;
+    const { status, text, body } = await getWithServiceDouble({
+      getRuntimeInfo: () => leaked,
+    });
+
+    expect(status).toBe(500);
+    expect(body.data).toBeNull();
+    expect(body.error?.code).toBe(ApiErrorCode.InternalError);
+    expect(text).not.toContain('WorkSpace');
+    expect(text).not.toContain('ReseacherManager');
+  });
+
+  it('控制器单元：取值级命中抛 500，且错误消息不回显取值', () => {
+    const controller = new RuntimeInfoController({
+      getRuntimeInfo: () =>
+        ({ ...validPayload, apiPrefix: SECRETS.databaseUrl }) as unknown as RuntimeInfoPayload,
+    } as unknown as RuntimeInfoService);
+
+    let thrown: unknown;
+    try {
+      controller.getRuntimeInfo();
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(InternalServerErrorException);
+    expect((thrown as InternalServerErrorException).getStatus()).toBe(500);
+    expect((thrown as Error).message).not.toContain('sup3rsecret');
+  });
+});
+
 describe('控制器字段闭集兜底（单元行为，与 HTTP 层互为佐证）', () => {
   beforeEach(() => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);

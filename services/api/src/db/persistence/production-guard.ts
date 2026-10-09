@@ -21,7 +21,14 @@ import type { PersistenceCapabilities } from '../ports/sql-executor.port';
  *    `ports/sql-executor-verification.ts` 的准入契约：封存（不可伪造/不可变）的 Postgres 能力声明、
  *    参数化查询能力、事务能力、已登记的验证来源与 schema/迁移就绪证据；内存替身、可变声明、
  *    缺失/过期/冲突证据与非参数化执行器都判 `SQL_EXECUTOR_VERIFICATION_FAILED`；
- * 5. 违规信息只包含端口名/后端名/规则，绝不包含连接串或口令。
+ * 5. `NODE_ENV=production`，**或**调用方声明「数据库已配置」（`requireAttestedExecutor`，见第 6 条）
+ *    时，装配必须真的提供执行器契约事实：数据库存在却没有执行器事实（例如把 `SQL_CONNECTION_FACTORY`
+ *    换绑成只有 `capabilities` 的替身、或干脆不绑定），判 `SQL_EXECUTOR_VERIFICATION_REQUIRED` ——
+ *    否则「自述生产可用」的能力声明可以绕过契约直接上线（fail-closed）；
+ * 6. `requireAttestedExecutor` 与 `databaseConfigured` 的组合语义：只要配置了 `DATABASE_URL`，
+ *    装配就必须有**经过 attest 且证据完整**的 SQL 执行器；没有数据库时该要求不生效，
+ *    无数据库启动（开发/测试的内存基线）保持默认放行；
+ * 7. 违规信息只包含端口名/后端名/规则，绝不包含连接串或口令。
  */
 
 export type PersistenceViolationRule =
@@ -30,7 +37,16 @@ export type PersistenceViolationRule =
   | 'IN_MEMORY_BACKEND_IN_PRODUCTION'
   | 'BACKEND_NOT_PRODUCTION_READY_IN_PRODUCTION'
   | 'DATABASE_NOT_CONFIGURED_IN_PRODUCTION'
+  | 'SQL_EXECUTOR_VERIFICATION_REQUIRED'
   | 'SQL_EXECUTOR_VERIFICATION_FAILED';
+
+/**
+ * 执行器契约失败时要落到的端口名。
+ *
+ * 与 `bindingTokenName(SQL_CONNECTION_FACTORY)` 同值（`SQL_CONNECTION_FACTORY`）；这里用字面量
+ * 而不是 import 那个 symbol：本函数是纯判定，不依赖 Nest DI 令牌对象，便于在任何装配之外复用。
+ */
+export const SQL_EXECUTOR_PORT_TOKEN = 'SQL_CONNECTION_FACTORY';
 
 export interface PersistenceViolation {
   readonly rule: PersistenceViolationRule;
@@ -59,6 +75,14 @@ export interface PersistenceBoundaryInput {
    * 装配没有执行器时省略；提供即参与判定，任一违规都让边界判定失败（fail-closed）。
    */
   readonly executorVerifications?: readonly PersistenceExecutorVerificationInput[];
+  /**
+   * 数据库已配置时装配**必须**提供「经过 attest 且证据完整」的 SQL 执行器契约事实。
+   *
+   * 由调用点按 `databaseConfigured` 显式传入（启动装配见 `db/database.module.ts`）：
+   * 把「有没有数据库」与「这个后端可否被信任」绑在一起判定，避免换绑成只有 `capabilities`
+   * 的替身后，能力自述直接绕过执行器契约。数据库未配置时传 false/省略，无数据库启动不受影响。
+   */
+  readonly requireAttestedExecutor?: boolean;
 }
 
 /** 一个执行器的契约事实：违规要落到具体端口上，便于定位 */
@@ -146,8 +170,26 @@ export function evaluatePersistenceBoundary(
   }
 
   // ---- SQL 执行器准入契约：只在装配提供了执行器事实时判定（没有执行器的装配不受影响） ----
-  for (const executor of input.executorVerifications ?? []) {
-    const report = evaluateSqlExecutorVerification(executor.input);
+  const executorVerifications = input.executorVerifications ?? [];
+  const requireAttestedExecutor = input.requireAttestedExecutor === true;
+
+  // 「数据库已配置」把执行器契约从可选变成必需：没有事实就等于无法证明执行器经过 attest。
+  // 与下面的逐项判定分开计数，便于运维区分「没有执行器」和「执行器不合规」。
+  if (requireAttestedExecutor && executorVerifications.length === 0) {
+    violations.push({
+      rule: 'SQL_EXECUTOR_VERIFICATION_REQUIRED',
+      token: SQL_EXECUTOR_PORT_TOKEN,
+      detail:
+        '数据库已配置（DATABASE_URL）但装配没有提供任何 SQL 执行器契约事实：无法证明执行器经过 attest 且证据完整，拒绝启动',
+    });
+  }
+
+  for (const executor of executorVerifications) {
+    // 数据库已配置时强制打开「生产准入」判定（requireAttestation），不依赖 nodeEnv：
+    // 否则 dev/test 环境的未封存执行器会通过契约，而它已经接到了真实数据库上。
+    const report = evaluateSqlExecutorVerification(
+      requireAttestedExecutor ? { ...executor.input, requireAttestation: true } : executor.input,
+    );
     for (const item of report.violations) {
       violations.push({
         rule: 'SQL_EXECUTOR_VERIFICATION_FAILED',

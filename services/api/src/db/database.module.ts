@@ -8,7 +8,12 @@ import {
   assertPersistenceBoundary,
   type PersistenceBoundaryReport,
   type PersistenceBinding,
+  type PersistenceExecutorVerificationInput,
 } from './persistence/production-guard';
+import {
+  collectSqlExecutorVerificationInput,
+  DEFAULT_SQL_EXECUTOR_VERIFICATION_REGISTRY,
+} from './ports/sql-executor-verification';
 import {
   createUnavailableSqlConnectionFactory,
   SQL_CONNECTION_FACTORY,
@@ -26,7 +31,16 @@ import {
  *   它如实声明「未验证驱动」，任何 `connect` 调用都抛错 —— 因此**运行时不会**悄悄把
  *   业务 provider 切到未验证数据库；
  * - `PersistenceBoundaryService`：启动阶段检查每个已登记持久化端口的能力声明，
- *   生产环境出现内存基线或未验证后端即拒绝启动（见 `persistence/production-guard.ts`）。
+ *   生产环境出现内存基线或未验证后端即拒绝启动（见 `persistence/production-guard.ts`）；
+ *   同时把 SQL 执行器（若有）交给 `ports/sql-executor-verification.ts` 的准入契约：执行器必须持有
+ *   不可伪造/不可变的封存声明、参数化查询与事务能力、已登记的验证来源与 schema/迁移就绪证据，
+ *   否则启动即失败。
+ *
+ * **数据库已配置时的强门禁（本次加固）**：只要 `DATABASE_URL` 解析成功（任何 `NODE_ENV`），
+ * 装配就必须提供**经过 attest 且证据完整**的 SQL 执行器契约事实 —— 没有事实判
+ * `SQL_EXECUTOR_VERIFICATION_REQUIRED`，有事实但未封存/证据过期/迁移不一致判
+ * `SQL_EXECUTOR_VERIFICATION_FAILED`，两类都在 `onApplicationBootstrap` 阶段抛错终止启动，
+ * 且发生在任何 `connect` 之前。未配置数据库时该要求不生效（无数据库默认启动保持放行）。
  *
  * 业务 repository 的 DI 绑定**不在本模块改动**：换绑到 Postgres 实现属于后续切片，
  * 且必须先有经评估的驱动依赖与集成测试证据。
@@ -73,18 +87,56 @@ export class PersistenceBoundaryService implements OnApplicationBootstrap {
       };
     });
 
+    const executorVerifications = this.collectExecutorVerifications();
+    const databaseConfigured = this.database.status === 'configured';
     const report = assertPersistenceBoundary({
       nodeEnv: this.env.NODE_ENV,
-      databaseConfigured: this.database.status === 'configured',
+      databaseConfigured,
       bindings,
+      // DATABASE_URL 存在 ⇒ 装配必须提供经过 attest 且证据完整的 SQL 执行器（与 NODE_ENV 无关）：
+      // 没有数据库时该要求不生效，无数据库启动保持默认放行。
+      requireAttestedExecutor: databaseConfigured,
+      ...(executorVerifications.length === 0 ? {} : { executorVerifications }),
     });
 
+    const executorSummary =
+      executorVerifications.length === 0
+        ? '未参与（本装配没有执行器形态的绑定）'
+        : `通过（${executorVerifications.length} 个执行器）`;
     this.logger.log(
-      `持久化边界校验通过：已检查 ${report.checkedTokens.length} 个端口；数据库配置=${JSON.stringify(
-        this.describeForLog(),
-      )}`,
+      `持久化边界校验通过：已检查 ${report.checkedTokens.length} 个端口；SQL 执行器契约 ${executorSummary}；执行器 attest ${
+        databaseConfigured ? '要求且满足' : '未要求（无数据库）'
+      }；数据库配置=${JSON.stringify(this.describeForLog())}`,
     );
     return report;
+  }
+
+  /**
+   * 采集 SQL 执行器契约事实：只对**执行器形态**的绑定（暴露 `connect` / `query`）生效，
+   * 只读实例字段与方法存在性，**不调用** `connect` / `query` 建立任何连接。
+   *
+   * 返回空数组有两种含义，必须由边界层区分（见 `requireAttestedExecutor`）：
+   * - 本装配没有执行器端口（无数据库装配）→ 无要求，放行；
+   * - 绑定了**非执行器形态**的替身（只有 `capabilities` 的自述对象）→ 数据库已配置时
+   *   判 `SQL_EXECUTOR_VERIFICATION_REQUIRED`，不允许能力自述绕过执行器契约。
+   */
+  private collectExecutorVerifications(): readonly PersistenceExecutorVerificationInput[] {
+    const token = bindingTokenName(SQL_CONNECTION_FACTORY);
+    const input = collectSqlExecutorVerificationInput(this.readInstance(SQL_CONNECTION_FACTORY), {
+      registry: DEFAULT_SQL_EXECUTOR_VERIFICATION_REGISTRY,
+      nodeEnv: this.env.NODE_ENV,
+      label: token,
+    });
+    return input === undefined ? [] : [{ token, input }];
+  }
+
+  /** 读取端口绑定的实例本体（未绑定时返回 undefined，交由对应守卫判定） */
+  private readInstance(token: symbol): unknown {
+    try {
+      return this.moduleRef.get<unknown, unknown>(token, { strict: false });
+    } catch {
+      return undefined;
+    }
   }
 
   /** 可写日志的配置摘要：只含状态与开关，不含主机、用户名、口令或连接串 */

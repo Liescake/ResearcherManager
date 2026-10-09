@@ -26,7 +26,7 @@ import {
  *    迁移部署守卫契约身份（`migrationContractId` / `migrationContractVersion`），迁移版本序列必须是
  *    「已应用 = 可用」的完整前缀（有未应用迁移、乱序、库里有代码里没有的版本都拒绝）；
  * 6. **内存替身**：不可信或不存在的声明，只要后端非持久（`persistent !== true` 或内存标记 backend），
- *    在前提是生产环境时一律判 `IN_MEMORY_DOUBLE`。
+ *    在要求 attest（production 或数据库已配置）时一律判 `IN_MEMORY_DOUBLE`。
  *
  * ## 边界事实
  * - **不引入任何数据库驱动、不建连接、不执行 SQL**：只做对象结构、冻结状态与登记表身份判定；
@@ -36,6 +36,8 @@ import {
  *   不枚举迁移目录、不读任何文件），因此本模块既不依赖文件系统也不依赖运行期配置；
  * - 非生产环境允许普通能力声明（内存基线仍可在开发/测试使用）；**声明一旦被封存**（或环境为
  *   production）就必须自洽，避免「开发期封存的声明带着过期证据上线」；
+ * - `requireAttestation`（由持久化边界层在**数据库已配置**时传入）把「生产准入」这一档强制打开，
+ *   与 `nodeEnv` 无关：只要 `DATABASE_URL` 存在，业务数据就会落到该后端，未验证执行器一律拒绝；
  * - 违规信息只含标识、契约版本、布尔与枚举能力值，**不含连接串、口令或业务字段取值**（本层不接触）。
  */
 
@@ -693,6 +695,14 @@ export interface SqlExecutorVerificationInput {
   readonly registry: SqlExecutorVerificationRegistry;
   /** 判定时刻（带时区 ISO 时间戳）；显式注入，保证同一输入判定可复现 */
   readonly now: string;
+  /**
+   * 强制按「生产准入」判定，**不依赖 `nodeEnv`**：数据库已配置时由持久化边界层传入。
+   *
+   * 为什么需要它：`nodeEnv !== 'production'` 只说明「当前不是生产进程」，不说明「没有数据库」。
+   * 一旦 `DATABASE_URL` 存在，业务数据就会落到该后端，因此开发/测试环境同样必须持封存声明与
+   * 完整证据；否则会出现「本地接上一个未经 attest 的执行器，验证契约被环境名绕过」。
+   */
+  readonly requireAttestation?: boolean;
   /** 违规主体名（默认 `SQL_EXECUTOR`） */
   readonly label?: string;
 }
@@ -732,7 +742,9 @@ export function evaluateSqlExecutorVerification(
 ): SqlExecutorVerificationReport {
   const subject = input.label ?? 'SQL_EXECUTOR';
   const violations: SqlExecutorVerificationViolation[] = [];
-  const isProduction = input.nodeEnv === 'production';
+  // 「生产准入」这一档有两个来源：进程环境是 production，或（数据库已配置时）边界层显式要求 attest。
+  // 二者共用同一套判定，避免出现「换个环境名就能接未验证执行器」的旁路。
+  const requireAttestation = input.nodeEnv === 'production' || input.requireAttestation === true;
   const parsedNow = Date.parse(input.now);
 
   if (!isIsoTimestamp(input.now) || Number.isNaN(parsedNow)) {
@@ -745,18 +757,18 @@ export function evaluateSqlExecutorVerification(
   const sealed = declarationIsSealed(input.registry, declaration);
   const declarationPresent = isRecord(declaration);
 
-  // ---- 1. 封存声明：生产必须有；一旦存在就必须不可伪造且不可变 ----
+  // ---- 1. 封存声明：要求 attest 时必须有；一旦存在就必须不可伪造且不可变 ----
   if (!declarationPresent) {
-    if (isProduction) {
+    if (requireAttestation) {
       violations.push(
         violation(
           'DECLARATION_MISSING',
           subject,
-          '生产执行器必须提供封存的能力声明（contractId/contractVersion + 参数化 + 事务 + 验证来源 + 迁移就绪证据）',
+          '必须提供封存的能力声明（contractId/contractVersion + 参数化 + 事务 + 验证来源 + 迁移就绪证据）',
         ),
       );
     }
-  } else if (!sealed && isProduction) {
+  } else if (!sealed && requireAttestation) {
     violations.push(
       violation(
         'DECLARATION_NOT_SEALED',
@@ -766,9 +778,9 @@ export function evaluateSqlExecutorVerification(
     );
   }
 
-  // 完整性只在「已封存」或「生产环境（未封存也必须证明自己不可变）」下判定，
-  // 避免开发/测试的字面量替身被准入契约误伤。
-  const enforceProductionClause = sealed || isProduction;
+  // 完整性只在「已封存」或「要求 attest（含 production / 数据库已配置）」下判定，
+  // 避免开发/测试里与数据库无关的字面量替身被准入契约误伤。
+  const enforceProductionClause = sealed || requireAttestation;
   if (declarationPresent && enforceProductionClause) {
     if (!isDeeplyImmutableDeclaration(declaration)) {
       violations.push(
@@ -1059,7 +1071,7 @@ export function evaluateSqlExecutorVerification(
     }
   }
 
-  // ---- 5. 实例结构事实：声明生产可用或处于生产环境时，参数化与事务能力必须可证 ----
+  // ---- 5. 实例结构事实：声明生产可用或要求 attest 时，参数化与事务能力必须可证 ----
   if (enforceProductionClause) {
     if (input.surface.kind === 'not-an-executor') {
       violations.push(

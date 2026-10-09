@@ -55,6 +55,10 @@ export async function createApp(
  * 生产环境缺少 / 非法 `DATABASE_URL`、对远端主机关闭 TLS，或在 `NODE_ENV=production` 下
  * 注入内存基线（含未验证 SQL 连接工厂）时，装配阶段直接失败：Nest 默认 `process.abort()`
  * 终止进程（子进程实测退出码 1），绝不带着坏配置继续跑。
+ *
+ * 门禁顺序（`startup-assembly.spec.ts` 守住）：配置解析 → 持久化能力声明 → SQL 执行器 attest
+ * 契约，全部通过后才 `listen`。只要 `DATABASE_URL` 解析成功，无论 `NODE_ENV` 是什么，
+ * 装配都必须提供经过 attest 且证据完整的 SQL 执行器，否则在**任何连接之前**终止启动。
  */
 async function bootstrap(): Promise<void> {
   const logger = new Logger('Bootstrap');

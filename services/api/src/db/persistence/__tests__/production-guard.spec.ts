@@ -1,10 +1,16 @@
 import { describe, expect, it } from 'vitest';
+import {
+  createSqlExecutorVerificationRegistry,
+  type SqlExecutorSurfaceFacts,
+} from '../../ports/sql-executor-verification';
 import type { PersistenceCapabilities } from '../../ports/sql-executor.port';
 import {
   assertPersistenceBoundary,
   evaluatePersistenceBoundary,
   PersistenceBoundaryError,
+  SQL_EXECUTOR_PORT_TOKEN,
   type PersistenceBinding,
+  type PersistenceExecutorVerificationInput,
 } from '../production-guard';
 
 const IN_MEMORY: PersistenceCapabilities = {
@@ -155,5 +161,125 @@ describe('assertPersistenceBoundary：抛出可定位且不含机密的错误', 
       bindings: [binding('GROUP_REPOSITORY', POSTGRES_VERIFIED)],
     });
     expect(report.ok).toBe(true);
+  });
+});
+
+describe('evaluatePersistenceBoundary：数据库已配置 ⇒ 必须有契约事实且必须 attest', () => {
+  /** 未封存的「能力自述」执行器：自称 postgres + 持久 + 生产可用 */
+  const SELF_DECLARED: PersistenceCapabilities = {
+    backend: 'postgres',
+    persistent: true,
+    productionReady: true,
+  };
+
+  /** 连接工厂形态的最小结构事实（只读判定用，不建连接） */
+  const FACTORY_SURFACE: SqlExecutorSurfaceFacts = {
+    kind: 'connection-factory',
+    hasConnect: true,
+    hasQuery: false,
+    queryParameterSlots: 0,
+    hasTransaction: false,
+    transactionParameterSlots: 0,
+    hasClose: false,
+  };
+
+  const NOW = new Date('2026-06-01T00:00:00.000Z').toISOString();
+
+  function executorFacts(nodeEnv: string): PersistenceExecutorVerificationInput {
+    return {
+      token: SQL_EXECUTOR_PORT_TOKEN,
+      input: {
+        nodeEnv,
+        declaration: SELF_DECLARED,
+        surface: FACTORY_SURFACE,
+        registry: createSqlExecutorVerificationRegistry(),
+        now: NOW,
+        label: SQL_EXECUTOR_PORT_TOKEN,
+      },
+    };
+  }
+
+  it('要求 attest 但装配没有执行器事实：判 SQL_EXECUTOR_VERIFICATION_REQUIRED', () => {
+    const report = evaluatePersistenceBoundary({
+      nodeEnv: 'test',
+      databaseConfigured: true,
+      bindings: [binding('GROUP_REPOSITORY', IN_MEMORY)],
+      requireAttestedExecutor: true,
+    });
+
+    expect(report.ok).toBe(false);
+    expect(report.violations).toEqual([
+      {
+        rule: 'SQL_EXECUTOR_VERIFICATION_REQUIRED',
+        token: SQL_EXECUTOR_PORT_TOKEN,
+        detail: expect.stringContaining('数据库已配置'),
+      },
+    ]);
+    expect(report.violations[0]?.detail).not.toContain('://');
+  });
+
+  it('要求 attest 时判定与 NODE_ENV 无关：测试环境的未封存执行器同样被拒', () => {
+    const facts = executorFacts('test');
+    const report = evaluatePersistenceBoundary({
+      nodeEnv: 'test',
+      databaseConfigured: true,
+      bindings: [binding('GROUP_REPOSITORY', IN_MEMORY)],
+      executorVerifications: [facts],
+      requireAttestedExecutor: true,
+    });
+
+    const executorViolations = report.violations.filter(
+      (item) => item.rule === 'SQL_EXECUTOR_VERIFICATION_FAILED',
+    );
+    expect(executorViolations.length).toBeGreaterThan(0);
+    expect(executorViolations.map((item) => item.executorCode)).toEqual(
+      expect.arrayContaining(['DECLARATION_NOT_SEALED']),
+    );
+  });
+
+  it('不要求 attest 时既有装配不受影响（开发/测试的内存替身继续放行）', () => {
+    const report = evaluatePersistenceBoundary({
+      nodeEnv: 'test',
+      databaseConfigured: true,
+      bindings: [binding('GROUP_REPOSITORY', IN_MEMORY)],
+      executorVerifications: [executorFacts('test')],
+    });
+    expect(report).toEqual({
+      ok: true,
+      violations: [],
+      checkedTokens: ['GROUP_REPOSITORY'],
+    });
+  });
+
+  it('无数据库时不要求执行器 attest（无数据库启动保持默认放行）', () => {
+    const report = evaluatePersistenceBoundary({
+      nodeEnv: 'test',
+      databaseConfigured: false,
+      bindings: [binding('GROUP_REPOSITORY', IN_MEMORY)],
+      executorVerifications: [executorFacts('test')],
+    });
+    expect(report.ok).toBe(true);
+  });
+
+  it('assertPersistenceBoundary 把缺失契约事实报成可定位且不含机密的错误', () => {
+    let captured: unknown;
+    try {
+      assertPersistenceBoundary({
+        nodeEnv: 'test',
+        databaseConfigured: true,
+        bindings: [binding('GROUP_REPOSITORY', IN_MEMORY)],
+        requireAttestedExecutor: true,
+      });
+    } catch (error) {
+      captured = error;
+    }
+
+    expect(captured).toBeInstanceOf(PersistenceBoundaryError);
+    const boundaryError = captured as PersistenceBoundaryError;
+    expect(boundaryError.message).toContain(
+      `${SQL_EXECUTOR_PORT_TOKEN}[SQL_EXECUTOR_VERIFICATION_REQUIRED]`,
+    );
+    expect(boundaryError.message).not.toContain('://');
+    expect(boundaryError.message).not.toContain('@');
   });
 });
