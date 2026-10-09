@@ -1,4 +1,5 @@
 import 'reflect-metadata';
+import type { IncomingHttpHeaders } from 'node:http';
 import { request } from 'node:http';
 import type { INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
@@ -131,9 +132,13 @@ async function captureInitFailure(): Promise<Error> {
   return captured;
 }
 
-function httpGet(baseUrl: string, path: string): Promise<{ status: number; body: unknown }> {
+function httpGet(
+  baseUrl: string,
+  path: string,
+  headers: Record<string, string> = {},
+): Promise<{ status: number; body: unknown; headers: IncomingHttpHeaders }> {
   return new Promise((resolvePromise, rejectPromise) => {
-    const req = request(`${baseUrl}${path}`, { method: 'GET' }, (res) => {
+    const req = request(`${baseUrl}${path}`, { method: 'GET', headers }, (res) => {
       const chunks: Buffer[] = [];
       res.on('data', (chunk: Buffer) => chunks.push(chunk));
       res.on('end', () => {
@@ -144,7 +149,7 @@ function httpGet(baseUrl: string, path: string): Promise<{ status: number; body:
         } catch {
           body = text;
         }
-        resolvePromise({ status: res.statusCode ?? 0, body });
+        resolvePromise({ status: res.statusCode ?? 0, body, headers: res.headers });
       });
     });
     req.on('error', rejectPromise);
@@ -637,6 +642,94 @@ describe('启动装配：默认装配应用全局前缀（容器健康检查路�
       // 旧默认前缀在改配置后不再可用：证明前缀来自运行时配置，不是两套并存
       const previousDefault = await httpGet(baseUrl, '/api/v1/health');
       expect(previousDefault.status).toBe(404);
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+/**
+ * 安全响应头在**真实启动链路**上的回归。
+ *
+ * 与 `common/security-headers.spec.ts` 的分工：那里用最小模块覆盖「生产 + 已确认 HTTPS ⇒
+ * 真的发出 HSTS」等条件分支（`AppModule` 在生产档位按设计 fail-closed，无法起监听）；
+ * 这里走**默认 `createApp()` + 真实 listen + 真实 HTTP**，守住三件只能在这一层观察到的事：
+ * 1. 装配真的把中间件挂上了（`applySecurityHeaders` 被调用，且早于路由注册 ⇒ 404 也带头）；
+ * 2. 非生产档位即使配置了 https 公开地址也不发 HSTS；
+ * 3. CORS 保持默认关闭：带 `Origin` 的请求不出现任何 `Access-Control-Allow-*`、不回显来源。
+ */
+describe('启动装配：安全响应头与 CORS 默认关闭（真实 HTTP）', () => {
+  it('测试环境真实装配：/health 与 404 都带安全响应头，且配置了 https 也不发 HSTS', async () => {
+    applyEnv({
+      NODE_ENV: 'test',
+      DATABASE_URL: undefined,
+      DATABASE_SSL: undefined,
+      API_PREFIX: '/api/v1',
+      // 显式给一个 https 公开地址：HSTS 仍然不出现，证明闸门是**环境档位**而不是「没配置」
+      API_PUBLIC_URL: 'https://api.example.com',
+    });
+    try {
+      const app = await createApp({ abortOnError: false });
+      startedApps.push(app);
+      await app.listen(0, '127.0.0.1');
+      const baseUrl = await app.getUrl();
+
+      const health = await httpGet(baseUrl, '/api/v1/health');
+      expect(health.status).toBe(200);
+      expect(health.headers['content-security-policy']).toBe(
+        "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+      );
+      expect(health.headers['x-content-type-options']).toBe('nosniff');
+      expect(health.headers['x-frame-options']).toBe('DENY');
+      expect(health.headers['referrer-policy']).toBe('no-referrer');
+      expect(health.headers['permissions-policy']).toContain('camera=()');
+      // 开发/测试的 HTTP 上绝不设置 HSTS（否则会把开发机锁死，也是错误的 HTTPS 承诺）
+      expect(health.headers['strict-transport-security']).toBeUndefined();
+      // JSON API 不受安全头影响：状态码与响应信封保持原样
+      expect((health.body as ApiEnvelope<unknown>).error).toBeNull();
+
+      // 未命中路由（含前缀之外的路径）同样带头：中间件必须先于路由注册
+      const missing = await httpGet(baseUrl, '/definitely-not-a-route');
+      expect(missing.status).toBe(404);
+      expect(missing.headers['x-content-type-options']).toBe('nosniff');
+      expect(missing.headers['x-frame-options']).toBe('DENY');
+      expect(missing.headers['content-security-policy']).toContain("default-src 'none'");
+      expect(missing.headers['strict-transport-security']).toBeUndefined();
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  it('带 Origin 的跨源请求：不回显 Origin、不出现 Access-Control-Allow-*', async () => {
+    applyEnv({ NODE_ENV: 'test', DATABASE_URL: undefined, DATABASE_SSL: undefined });
+    try {
+      const app = await createApp({ setGlobalPrefix: false, abortOnError: false });
+      startedApps.push(app);
+      await app.listen(0, '127.0.0.1');
+      const baseUrl = await app.getUrl();
+
+      const crossOrigin = await httpGet(baseUrl, '/health', {
+        Origin: 'https://admin.example.com',
+      });
+      expect(crossOrigin.status).toBe(200);
+
+      for (const name of [
+        'access-control-allow-origin',
+        'access-control-allow-credentials',
+        'access-control-allow-methods',
+        'access-control-allow-headers',
+        'access-control-expose-headers',
+        'access-control-max-age',
+      ]) {
+        expect(crossOrigin.headers[name]).toBeUndefined();
+      }
+      // 来源只在请求里，绝不出现在响应里（本用例的 Origin 是唯一出现该字符串的地方）
+      expect(JSON.stringify(crossOrigin.headers)).not.toContain('admin.example.com');
+      // 安全头仍必须存在：CORS 关闭不是「什么都不做」
+      expect(crossOrigin.headers['x-content-type-options']).toBe('nosniff');
+      // 不泄露值：头值都是固定常量，不含数据库/密钥等配置片段
+      const serialized = JSON.stringify(crossOrigin.headers);
+      expect(serialized).not.toMatch(/postgres|password|secret|bearer|token/iu);
     } finally {
       restoreEnv();
     }

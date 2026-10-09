@@ -2,6 +2,7 @@ import 'reflect-metadata';
 import { Logger, type INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
+import { applySecurityHeaders } from './common/security-headers';
 import { APP_ENV } from './config/config.module';
 import { describeEnv, type AppEnv } from './config/env';
 
@@ -50,6 +51,18 @@ export async function createApp(
   // （fail-closed 语义不变，仍在任何端口监听之前）。init() 仍负责 OnModuleInit /
   // OnApplicationBootstrap 与持久化边界守卫。
   const env = app.get<AppEnv>(APP_ENV);
+
+  // 安全响应头：注册在 `NestFactory.create()` 之后、`init()` **之前**。
+  // init() 会注册路由与内建 404 处理，而 Express 按注册顺序执行中间件 —— 只有先注册，
+  // 安全头才会出现在**所有**响应上（路由、404、异常出口），而不是只出现在命中的路由上。
+  //
+  // 取值与判定见 common/security-headers.ts：常量头始终设置；HSTS 只在
+  // 「生产 且 API_PUBLIC_URL 明确为 https」时设置（开发/测试的 HTTP 下绝不设置）。
+  // CORS 保持**默认关闭**：这里不调用 `app.enableCors()`，不发出任何 `Access-Control-Allow-*`，
+  // 不回显 `Origin`、不允许 credentials。跨源需求由部署侧（反向代理同源收敛）解决，
+  // 不为此开放任意跨源。
+  applySecurityHeaders(app, env);
+
   if (options.setGlobalPrefix !== false) {
     // Nest 的 setGlobalPrefix 不接受前导斜杠
     app.setGlobalPrefix(env.API_PREFIX.replace(/^\/+/u, ''));
