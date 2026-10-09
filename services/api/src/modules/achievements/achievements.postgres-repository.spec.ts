@@ -19,8 +19,8 @@ import {
 } from './achievements.contract';
 import type {
   Achievement,
+  AchievementRepository,
   AchievementRepositoryCapabilities,
-  AsyncAchievementRepository,
 } from './achievements.port';
 import {
   ACHIEVEMENT_REPOSITORY_BACKEND_POSTGRES,
@@ -46,8 +46,9 @@ import {
  *
  * 覆盖用户要求的五类补充测试与两条交付边界：
  * - **repository 契约**：能力声明（persistent=true / productionReady=false）、列 ↔ 读取契约字段
- *   一一对应、审核内部字段不进列清单、未被装配到 `AchievementsModule`、不引驱动/ORM、
- *   `achievements` 尚未转为迁移；异步契约与同步端口方法集逐字一致；
+ *   一一对应、审核内部字段不进列清单、**按「是否配置数据库」绑定到 `AchievementsModule`**
+ *   （工厂引用，类名不进 provider）、不引驱动/ORM、`achievements` 由迁移 0004 建表并由 0008
+ *   补齐存储层约束；端口是**单一异步契约**（内存基线与本 adapter 同签名）；
  * - **参数化 SQL 与固定标识符**：客户端可控值只出现在参数里，SQL 文本只由模块常量构成；
  * - **SQL 注入**：主体 / 文本字段等所有入口的注入载荷要么只进参数、要么在进入 SQL 之前被拒绝；
  * - **未知列 / 非法审核状态与边界**：未登记列（含审核留痕列）、未知审核态、越界标题、坏时间戳、
@@ -86,7 +87,6 @@ const ADAPTER_PATH = resolve(
 );
 const PORT_PATH = resolve(process.cwd(), 'src', 'modules', 'achievements', 'achievements.port.ts');
 const ADAPTER_CLASS = 'PostgresAchievementRepository';
-const ADAPTER_MODULE = 'achievements.postgres-repository';
 
 interface RecordedCall {
   readonly sql: string;
@@ -339,9 +339,9 @@ describe('PostgreSQL 成果仓储：repository 契约与能力声明', () => {
     }
   });
 
-  it('实现的是异步仓储契约（Promise 语义），未被绑定为同步端口', async () => {
+  it('实现的是异步仓储契约（Promise 语义），并被绑定为 ACHIEVEMENT_REPOSITORY 的数据库实现', async () => {
     const executor = new RecordingExecutor([{ rows: [rowFromRecord()], rowCount: 1 }]);
-    const repository: AsyncAchievementRepository = new PostgresAchievementRepository(executor);
+    const repository: AchievementRepository = new PostgresAchievementRepository(executor);
 
     expect(repository.capabilities).toEqual(POSTGRES_ACHIEVEMENT_REPOSITORY_CAPABILITIES);
     const created = repository.create(ACHIEVEMENT);
@@ -353,32 +353,27 @@ describe('PostgreSQL 成果仓储：repository 契约与能力声明', () => {
     await expect(listed).resolves.toEqual([]);
   });
 
-  it('adapter 不是 Nest provider：源码不含 @Injectable，也不在模块 provider 列表里', () => {
+  it('adapter 不是 Nest provider：源码不含 @Injectable，装配只经 Module 的工厂引用', () => {
     const source = readFileSync(ADAPTER_PATH, 'utf8');
     expect(source).not.toContain('@Injectable');
     expect(source).not.toContain('@Module');
     expect(source).not.toContain('Inject(');
   });
 
-  it('异步契约与同步端口方法集逐字一致：无分页窗口、无单条读取（本切片边界）', () => {
+  it('端口只有 create + listByUserId 两个异步方法：无分页窗口、无单条读取（本切片边界）', () => {
     const source = readFileSync(PORT_PATH, 'utf8');
-    const asyncStart = source.indexOf('export interface AsyncAchievementRepository {');
-    const asyncEnd = source.indexOf('/** DI 令牌：成果仓储 */');
-    expect(asyncStart).toBeGreaterThan(-1);
-    expect(asyncEnd).toBeGreaterThan(asyncStart);
-    const asyncBlock = source.slice(asyncStart, asyncEnd);
+    const portStart = source.indexOf('export interface AchievementRepository {');
+    expect(portStart).toBeGreaterThan(-1);
+    const portBlock = source.slice(portStart);
 
-    expect(asyncBlock).toContain('create(achievement: Achievement): Promise<Achievement>;');
-    expect(asyncBlock).toContain('listByUserId(userId: string): Promise<readonly Achievement[]>;');
-    // 单条读取（资源级取数）与分页窗口属于后续切片：异步契约不得预置用不上的参数，
-    // 否则 service / 内存基线 / controller 无法与它互换，切换数据库那一步会被迫一次性改三处
-    expect(asyncBlock).not.toContain('findById');
-    expect(asyncBlock).not.toMatch(/\b(?:window|limit|offset|page|cursor)\b/iu);
-
-    // 同步端口仍是同步的（本切片只新增并存的异步契约）
-    expect(source).toContain('export interface AchievementRepository {');
-    expect(source).toContain('create(achievement: Achievement): Achievement;');
-    expect(source).toContain('listByUserId(userId: string): readonly Achievement[];');
+    expect(portBlock).toContain('create(achievement: Achievement): Promise<Achievement>;');
+    expect(portBlock).toContain('listByUserId(userId: string): Promise<readonly Achievement[]>;');
+    // 单条读取（资源级取数）与分页窗口属于后续切片：端口不得预置用不上的参数，
+    // 否则 service / 内存基线 / PostgreSQL 实现无法互换，切换存储那一步会被迫一次性改三处
+    expect(portBlock).not.toContain('findById');
+    expect(portBlock).not.toMatch(/\b(?:window|limit|offset|page|cursor)\b/iu);
+    // 旧的双契约（同步端口 + 并存的异步契约）已在本切片收敛为单一异步契约
+    expect(source).not.toContain('AsyncAchievementRepository');
   });
 });
 
@@ -1179,14 +1174,14 @@ describe('PostgreSQL 成果仓储：分页与结果集边界（本切片无分�
     expect(executor.calls).toHaveLength(1);
   });
 
-  it('端口与异步契约都没有分页参数（一旦加入分页窗口，本 spec 与 adapter 必须同步改）', () => {
+  it('端口（单一异步契约）没有分页参数（一旦加入分页窗口，本 spec 与 adapter 必须同步改）', () => {
     const source = readFileSync(PORT_PATH, 'utf8');
-    const syncBlock = source.slice(
+    const portBlock = source.slice(
       source.indexOf('export interface AchievementRepository {'),
       source.indexOf('export const ACHIEVEMENT_REPOSITORY_BACKEND_POSTGRES'),
     );
-    expect(syncBlock).toContain('listByUserId(userId: string): readonly Achievement[];');
-    expect(syncBlock).not.toMatch(/\b(?:window|limit|offset|page|cursor|Page)\b/iu);
+    expect(portBlock).toContain('listByUserId(userId: string): Promise<readonly Achievement[]>;');
+    expect(portBlock).not.toMatch(/\b(?:window|limit|offset|page|cursor|Page)\b/iu);
   });
 });
 
@@ -1318,8 +1313,8 @@ describe('PostgreSQL 成果仓储：公开视图与错误信息（不泄露归�
   });
 });
 
-describe('PostgreSQL 成果仓储：未装配、无驱动依赖、与 schema 边界对齐', () => {
-  it('AchievementsModule 仍只绑定内存基线（本 adapter 未被装配）', () => {
+describe('PostgreSQL 成果仓储：按配置绑定、无驱动依赖、与 schema 边界对齐', () => {
+  it('AchievementsModule 通过工厂按「是否配置数据库」绑定（引用工厂导出名，不引用 adapter 类名）', () => {
     const moduleFile = resolve(
       process.cwd(),
       'src',
@@ -1329,22 +1324,27 @@ describe('PostgreSQL 成果仓储：未装配、无驱动依赖、与 schema 边
     );
     const content = readFileSync(moduleFile, 'utf8');
 
-    expect(content).not.toContain(ADAPTER_CLASS);
-    expect(content).not.toContain(ADAPTER_MODULE);
+    // 绑定事实：登记表要求模块里出现「端口令牌 + 工厂导出名」
+    expect(content).toContain('ACHIEVEMENT_REPOSITORY');
+    expect(content).toContain('createLazyPostgresAchievementRepository');
     expect(content).toContain('InMemoryAchievementRepository');
-    expect(content).toContain(
-      '{ provide: ACHIEVEMENT_REPOSITORY, useExisting: InMemoryAchievementRepository }',
-    );
+    // 装配只经工厂：模块不得自行 new 出 adapter，也不得带 Nest 装饰器
+    // （注意工厂名 `createLazyPostgresAchievementRepository` 含类名子串，因此断言的是「不得实例化」）
+    expect(content).not.toMatch(/new\s+PostgresAchievementRepository/u);
+    expect(content).not.toContain('@Injectable');
+    // 分流口径与 auth / profiles 完全一致：同一份纯函数 + 可选注入的执行器工厂
+    expect(content).toContain('resolveAppDatabaseConfig');
+    expect(content).toContain('SQL_CONNECTION_FACTORY');
+    expect(content).toContain('optional: true');
   });
 
-  it('持久化登记与数据库模块都不引用本 adapter（端口登记表仍按令牌判定）', () => {
+  it('持久化登记与数据库模块都不直接引用本 adapter（端口登记表仍按令牌判定）', () => {
     for (const relative of [
       join('src', 'db', 'persistence-bindings.ts'),
       join('src', 'db', 'database.module.ts'),
       join('src', 'db', 'ports', 'sql-executor.port.ts'),
       join('src', 'modules', 'achievements', 'achievements.port.ts'),
       join('src', 'app.module.ts'),
-      join('src', 'startup-assembly.spec.ts'),
     ]) {
       const content = readApiFile(relative);
       // 端口文件只在注释里以「示例路径」提到 adapter，这不构成装配；任何 import / provider
@@ -1353,6 +1353,16 @@ describe('PostgreSQL 成果仓储：未装配、无驱动依赖、与 schema 边
       expect(content).not.toMatch(
         /(?:from\s+['"][^'"]*achievements\.postgres-repository['"]|require\(\s*['"][^'"]*achievements\.postgres-repository['"]\s*\))/u,
       );
+    }
+    // `startup-assembly.spec.ts` 与 `achievements.module.ts` 是**允许**引用 adapter 模块的两处：
+    // 前者观察「配置了数据库 ⇒ 端口换绑」这一运行期事实（与画像切片同构），后者只引用工厂导出名。
+    for (const relative of [
+      join('src', 'startup-assembly.spec.ts'),
+      join('src', 'modules', 'achievements', 'achievements.module.ts'),
+    ]) {
+      const content = readApiFile(relative);
+      expect(content).toContain('achievements.postgres-repository');
+      expect(content).not.toMatch(/new\s+PostgresAchievementRepository/u);
     }
   });
 
@@ -1392,7 +1402,7 @@ describe('PostgreSQL 成果仓储：未装配、无驱动依赖、与 schema 边
     );
   });
 
-  it('工作区依赖里没有 pg / ORM 包', () => {
+  it('工作区依赖里没有未授权的 pg 族 / ORM 包（官方 pg 驱动已授权，仅限驱动层）', () => {
     for (const relative of [join('services', 'api', 'package.json'), 'package.json']) {
       const manifest = JSON.parse(readFileSync(join(REPO_ROOT, relative), 'utf8')) as {
         dependencies?: Record<string, string>;
@@ -1404,7 +1414,7 @@ describe('PostgreSQL 成果仓储：未装配、无驱动依赖、与 schema 边
       ];
       for (const name of names) {
         expect(
-          /^(?:pg|pg-pool|pg-promise|postgres|prisma|@prisma\/client|typeorm|kysely|drizzle-orm|sequelize|@mikro-orm\/core)$/u.test(
+          /^(?:pg-pool|pg-native|pg-promise|postgres|slonik|prisma|@prisma\/client|typeorm|kysely|drizzle-orm|drizzle-kit|sequelize|@mikro-orm\/core)$/u.test(
             name,
           ),
         ).toBe(false);
@@ -1412,22 +1422,41 @@ describe('PostgreSQL 成果仓储：未装配、无驱动依赖、与 schema 边
     }
   });
 
-  it('achievements 尚未转为迁移：与 productionReady=false 及验证清单第 3 项配对', () => {
+  it('achievements 由迁移 0004 建表并由 0008 补齐存储层约束（productionReady 保持 false）', () => {
     const migrations = readdirSync(join(REPO_ROOT, 'db', 'migrations'));
-    expect(migrations.some((file) => file.includes('achievement'))).toBe(false);
+    expect(migrations).toContain('0004_achievements.sql');
+    expect(migrations).toContain('0008_achievements_constraints.sql');
 
-    const drafts = readdirSync(join(REPO_ROOT, 'db', 'schema-drafts'));
-    expect(drafts.some((file) => file.includes('achievement'))).toBe(false);
+    const sql = readFileSync(join(REPO_ROOT, 'db', 'migrations', '0004_achievements.sql'), 'utf8');
+    // 建表语句必须真的存在，而不是只在注释里登记
+    expect(sql).toMatch(/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+achievements\s*\(/iu);
+    // 列清单里的每一列都必须在迁移里有定义（列清单 ↔ schema 单向核对）
+    for (const column of POSTGRES_ACHIEVEMENT_COLUMNS) {
+      expect(sql).toMatch(
+        new RegExp(
+          `\\b${column}\\s+(?:uuid|smallint|integer|varchar|timestamptz|jsonb|boolean)\\b`,
+          'u',
+        ),
+      );
+    }
+    // 统计聚合读按归属过滤：user_id 必须被索引
+    expect(sql).toMatch(/CREATE\s+INDEX[\s\S]*?\(\s*user_id/iu);
 
-    // bootstrap 迁移只在注释里登记了这张表，没有任何 CREATE TABLE achievements
-    const bootstrap = readFileSync(
-      join(REPO_ROOT, 'db', 'migrations', '0001_bootstrap.sql'),
+    // 0008：本切片把 adapter 契约里「标题非空且不超长」「归属不得为空 UUID」两条规则下沉到存储层
+    const constraints = readFileSync(
+      join(REPO_ROOT, 'db', 'migrations', '0008_achievements_constraints.sql'),
       'utf8',
     );
-    expect(bootstrap).toContain('achievements');
-    expect(bootstrap).not.toMatch(/CREATE\s+TABLE[^;]*achievements/iu);
-    expect(bootstrap).toContain('主键 UUID');
-    expect(bootstrap).toContain('created_at / updated_at');
+    expect(constraints).toMatch(/ALTER\s+TABLE\s+achievements\b/iu);
+    expect(constraints).toContain('ADD CONSTRAINT achievements_title_length');
+    expect(constraints).toContain('ADD CONSTRAINT achievements_owner_not_nil');
+    // 口径：不重复建表、不建索引（0004 的 (user_id, created_at, id) 已覆盖本切片两条取数路径）
+    expect(constraints).not.toMatch(/CREATE\s+TABLE\b/iu);
+    expect(constraints).not.toMatch(/CREATE\s+(?:UNIQUE\s+)?INDEX\b/iu);
+
+    // 草案目录里仍然没有 achievements（本切片直接落迁移，不落草案）
+    const drafts = readdirSync(join(REPO_ROOT, 'db', 'schema-drafts'));
+    expect(drafts.some((file) => file.includes('achievement'))).toBe(false);
 
     expect(POSTGRES_ACHIEVEMENT_REPOSITORY_CAPABILITIES.productionReady).toBe(false);
     expect(POSTGRES_ACHIEVEMENT_REPOSITORY_VERIFICATION_STEPS).toContain(
@@ -1435,7 +1464,7 @@ describe('PostgreSQL 成果仓储：未装配、无驱动依赖、与 schema 边
     );
   });
 
-  it('内存基线仍是同步契约的实现者（本切片不改动它）', () => {
+  it('内存基线实现同一异步端口（本切片与 adapter 逐字同签名）', () => {
     const source = readApiFile(
       join('src', 'modules', 'achievements', 'achievements.in-memory-repository.ts'),
     );
@@ -1443,14 +1472,18 @@ describe('PostgreSQL 成果仓储：未装配、无驱动依赖、与 schema 边
     expect(source).not.toContain(ADAPTER_CLASS);
     expect(source).toContain('persistent: false');
     expect(source).toContain('productionReady: false');
+    expect(source).toContain('async create(achievement: Achievement): Promise<Achievement>');
+    expect(source).toContain('async listByUserId(userId: string): Promise<readonly Achievement[]>');
   });
 
-  it('同步端口契约未被改成异步（本切片只新增并存的异步契约）', () => {
+  it('端口契约是单一异步契约（本切片完成的跨模块契约变更，无并存的同步端口）', () => {
     const source = readApiFile(join('src', 'modules', 'achievements', 'achievements.port.ts'));
     expect(source).toContain('export interface AchievementRepository {');
-    expect(source).toContain('create(achievement: Achievement): Achievement;');
-    expect(source).toContain('listByUserId(userId: string): readonly Achievement[];');
-    expect(source).toContain('export interface AsyncAchievementRepository {');
+    expect(source).toContain('create(achievement: Achievement): Promise<Achievement>;');
     expect(source).toContain('listByUserId(userId: string): Promise<readonly Achievement[]>;');
+    // 旧的「同步端口」与并存的 `AsyncAchievementRepository` 已收敛：只允许一个端口声明
+    expect(source).not.toContain('AsyncAchievementRepository');
+    expect(source).not.toContain('create(achievement: Achievement): Achievement;');
+    expect(source).not.toContain('listByUserId(userId: string): readonly Achievement[];');
   });
 });

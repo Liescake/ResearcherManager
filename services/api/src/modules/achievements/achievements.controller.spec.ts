@@ -22,6 +22,7 @@ import { loadEnv } from '../../config/env';
 import { AccessControlModule } from '../access-control/access-control.module';
 import { AuthModule } from '../auth/auth.module';
 import { InMemorySessionStore } from '../auth/session-store.in-memory';
+import { SESSION_STORE } from '../auth/session-subject.port';
 import { RUOYI_AUTHZ_ADAPTER } from '../ruoyi-adapter/ruoyi-adapter.port';
 import type { RuoYiAuthzAdapter } from '../ruoyi-adapter/ruoyi-adapter.port';
 import { ACHIEVEMENT_INPUT_FIELDS } from './achievements.contract';
@@ -30,7 +31,7 @@ import { InMemoryAchievementRepository } from './achievements.in-memory-reposito
 import type { Achievement } from './achievements.port';
 import { ACHIEVEMENT_REPOSITORY } from './achievements.port';
 import { AchievementsService } from './achievements.service';
-import { AchievementsModule } from './achievements.module';
+import { AchievementsModule, createAchievementRepository } from './achievements.module';
 
 /**
  * 成果切片（`/me/achievements`）的真实 HTTP 回归：
@@ -96,7 +97,7 @@ async function startAchievementsApp(): Promise<TestApp> {
   await app.listen(0, '127.0.0.1');
   startedApps.push(app);
 
-  const store = app.get(InMemorySessionStore);
+  const store = app.get<InMemorySessionStore>(SESSION_STORE);
   store.seed({
     sessionId: SESSION_STUDENT_1,
     subject: { userId: 'u-student-1', roles: [Role.Student] },
@@ -120,7 +121,7 @@ async function startAchievementsApp(): Promise<TestApp> {
     app,
     baseUrl: `${await app.getUrl()}/api/v1`,
     store,
-    repository: app.get(InMemoryAchievementRepository),
+    repository: app.get<InMemoryAchievementRepository>(ACHIEVEMENT_REPOSITORY),
   };
 }
 
@@ -243,7 +244,7 @@ describe('成果：成功路径（真实 HTTP + 统一响应信封）', () => {
     // 归属字段与其取值不出现在任何响应文本里
     expect(res.text).not.toContain('u-student-1');
 
-    const stored = repository.listByUserId('u-student-1');
+    const stored = await repository.listByUserId('u-student-1');
     expect(stored).toHaveLength(1);
     expect(stored[0]?.userId).toBe('u-student-1');
     expect(stored[0]?.id).toBe(data.id);
@@ -260,8 +261,8 @@ describe('成果：成功路径（真实 HTTP + 统一响应信封）', () => {
     expect(empty.body.error).toBeNull();
     expect(empty.body.data).toEqual([]);
 
-    const mine = repository.create(fixtureAchievement({ userId: 'u-student-1' }));
-    const others = repository.create(
+    const mine = await repository.create(fixtureAchievement({ userId: 'u-student-1' }));
+    const others = await repository.create(
       fixtureAchievement({ userId: 'u-student-2', title: '他人成果' }),
     );
 
@@ -304,8 +305,8 @@ describe('成果：成功路径（真实 HTTP + 统一响应信封）', () => {
     expect(res.status).toBe(201);
     expect(res.body.error).toBeNull();
     // 归属仍是会话主体，伪造的 x-user-id 既未进入判定也未落库
-    expect(repository.listByUserId('u-student-1')).toHaveLength(1);
-    expect(repository.listByUserId('u-victim-1')).toHaveLength(0);
+    await expect(repository.listByUserId('u-student-1')).resolves.toHaveLength(1);
+    await expect(repository.listByUserId('u-victim-1')).resolves.toHaveLength(0);
     expect(res.text).not.toContain('u-victim-1');
     expect(res.text).not.toContain(Role.SuperAdmin);
     expect(res.text).not.toContain(DataScope.Global);
@@ -354,7 +355,7 @@ describe('成果：输入拒绝（400 VALIDATION_FAILED，不落库）', () => {
     expect(res.body.error?.requestId).toBeTruthy();
     // 字段级错误（路径 + 消息）；不落库
     expect(issuesOf(res.body).length).toBeGreaterThan(0);
-    expect(repository.listByUserId('u-student-1')).toHaveLength(0);
+    await expect(repository.listByUserId('u-student-1')).resolves.toHaveLength(0);
   });
 
   it('客户端提交 userId/roles/scope/groupId/reviewStatus/id/时间戳 一律拒绝，且没有任何成果被写入', async () => {
@@ -394,9 +395,9 @@ describe('成果：输入拒绝（400 VALIDATION_FAILED，不落库）', () => {
     for (const key of unexpectedKeys) {
       expect(messages.some((message) => message.includes(key))).toBe(true);
     }
-    expect(repository.listByUserId('u-student-1')).toHaveLength(0);
+    await expect(repository.listByUserId('u-student-1')).resolves.toHaveLength(0);
     // 伪造的归属没有被采纳为「写入目标」
-    expect(repository.listByUserId('u-victim-1')).toHaveLength(0);
+    await expect(repository.listByUserId('u-victim-1')).resolves.toHaveLength(0);
   });
 });
 
@@ -430,7 +431,7 @@ describe('成果：认证边界 401（fail-closed）', () => {
 
     expect(res.status).toBe(401);
     expect(res.body.error?.code).toBe('UNAUTHENTICATED');
-    expect(repository.listByUserId('u-student-1')).toHaveLength(0);
+    await expect(repository.listByUserId('u-student-1')).resolves.toHaveLength(0);
   });
 });
 
@@ -452,8 +453,8 @@ describe('成果：越权 403（AuthorizationGuard + 服务端常量判定入参
     });
     expect(write.status).toBe(403);
     expect(write.body.error?.code).toBe('FORBIDDEN');
-    expect(repository.listByUserId('u-admin-1')).toHaveLength(0);
-    expect(repository.listByUserId('u-student-1')).toHaveLength(0);
+    await expect(repository.listByUserId('u-admin-1')).resolves.toHaveLength(0);
+    await expect(repository.listByUserId('u-student-1')).resolves.toHaveLength(0);
   });
 
   it('角色有权限点但范围不是 SELF：group_leader 读写成 403（不会退化成放行）', async () => {
@@ -470,7 +471,7 @@ describe('成果：越权 403（AuthorizationGuard + 服务端常量判定入参
       body: validCreateBody,
     });
     expect(write.status).toBe(403);
-    expect(repository.listByUserId('u-leader-1')).toHaveLength(0);
+    await expect(repository.listByUserId('u-leader-1')).resolves.toHaveLength(0);
   });
 
   it('授权先于仓储访问：403 时仓储的读写方法一次都不被调用', async () => {
@@ -549,7 +550,7 @@ describe('成果：未知枚举与存储异常 fail-closed（不得当正常输�
   it('存储记录的 type 为未登记枚举 → 500，且不把未知值/字段取值泄露给调用方', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startAchievementsApp();
-    const corrupted = repository.create(
+    const corrupted = await repository.create(
       fixtureAchievement({
         userId: 'u-student-1',
         type: 'unknown_type' as AchievementType,
@@ -571,10 +572,10 @@ describe('成果：未知枚举与存储异常 fail-closed（不得当正常输�
   it('存储记录的 reviewStatus 未登记 → 500；时间戳非法 → 500', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startAchievementsApp();
-    repository.create(
+    await repository.create(
       fixtureAchievement({ userId: 'u-student-1', reviewStatus: 'unknown_review' as ReviewStatus }),
     );
-    repository.create(
+    await repository.create(
       fixtureAchievement({ userId: 'u-student-1', createdAt: '2026-01-01 00:00:00' }),
     );
 
@@ -590,7 +591,7 @@ describe('成果：未知枚举与存储异常 fail-closed（不得当正常输�
   it('仓储返回他人归属 → 500，绝不把他人成果当作本人列表输出', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startAchievementsApp();
-    vi.spyOn(repository, 'listByUserId').mockReturnValue([
+    vi.spyOn(repository, 'listByUserId').mockResolvedValue([
       fixtureAchievement({ userId: 'u-student-2', title: '他人成果' }),
     ]);
 
@@ -608,7 +609,7 @@ describe('成果：未知枚举与存储异常 fail-closed（不得当正常输�
   it('创建回写记录损坏（未知枚举）→ 500，且不泄露标题', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startAchievementsApp();
-    vi.spyOn(repository, 'create').mockImplementation((record) => ({
+    vi.spyOn(repository, 'create').mockImplementation(async (record) => ({
       ...record,
       type: 'unknown_type' as AchievementType,
     }));
@@ -656,17 +657,24 @@ describe('成果：统一响应信封', () => {
 });
 
 describe('切片装配与既有路由回归', () => {
-  it('AchievementsModule 只注册本切片的路由与服务，并把仓储端口显式绑到内存基线', () => {
+  it('AchievementsModule 只注册本切片的路由与服务，并通过工厂把仓储端口按配置分流', () => {
     const providers = (Reflect.getMetadata('providers', AchievementsModule) ?? []) as unknown[];
     const controllers = (Reflect.getMetadata('controllers', AchievementsModule) ?? []) as unknown[];
     const moduleImports = (Reflect.getMetadata('imports', AchievementsModule) ?? []) as unknown[];
 
     expect(controllers).toEqual([AchievementsController]);
     expect(providers).toContain(AchievementsService);
-    expect(providers).toContainEqual({
-      provide: ACHIEVEMENT_REPOSITORY,
-      useExisting: InMemoryAchievementRepository,
-    });
+    // 换绑点是一个 factory provider（未配置数据库 → 内存基线；已配置 → PostgreSQL 实现），
+    // 因此端口令牌与工厂函数都必须出现在 provider 列表里，而内存实现不再是独立 provider。
+    expect(providers).toContainEqual(
+      expect.objectContaining({
+        provide: ACHIEVEMENT_REPOSITORY,
+        inject: [expect.any(String), expect.objectContaining({ optional: true })],
+      }),
+    );
+    expect(providers).not.toContain(InMemoryAchievementRepository);
+    expect(typeof createAchievementRepository).toBe('function');
+    expect(createAchievementRepository.length).toBe(2);
     // 依赖方向：认证（auth）与授权（access-control）各自只经端口/服务暴露
     expect(moduleImports).toContain(AuthModule);
     expect(moduleImports).toContain(AccessControlModule);
@@ -719,6 +727,7 @@ describe('切片装配与既有路由回归', () => {
       'apiPort',
       'apiPrefix',
       'databaseConfigured',
+      'dependencyGate',
       'nodeEnv',
     ]);
 

@@ -5,30 +5,29 @@ import { parseStoredAchievement, storedAchievementSchema } from './achievements.
 import {
   ACHIEVEMENT_REPOSITORY_BACKEND_POSTGRES,
   type Achievement,
+  type AchievementRepository,
   type AchievementRepositoryCapabilities,
-  type AsyncAchievementRepository,
 } from './achievements.port';
 
 /**
- * 成果的 **PostgreSQL 仓储 adapter（首个可验证实现，未接入运行时）**。
+ * 成果的 **PostgreSQL 仓储 adapter（已接入运行时：按「是否配置数据库」分流绑定）**。
  *
  * ## 交付边界（本切片刻意不做的事）
- * - **不绑定**到 `AchievementsModule`：模块仍然只绑定内存基线 `InMemoryAchievementRepository`
- *   （provider 列表与 DI 令牌一字未改），运行时行为与本切片之前逐字节一致（有回归断言，
- *   见同名 spec）；
+ * - **只被 `achievements.module.ts` 通过工厂引用**：模块按「是否解析出 `DATABASE_URL`」在内存基线与
+ *   本 adapter 之间分流，未配置数据库时行为与本切片之前逐字节一致（有回归断言，见同名 spec）；
  * - **不引入** `pg` / Prisma / TypeORM 等驱动或 ORM 依赖：本文件只依赖驱动无关的
  *   `SqlExecutor` 端口（`db/ports/sql-executor.port.ts`），真实执行器由消费方在「启用数据库」
  *   那一步显式提供；
  * - **不声称生产可用**：能力声明固定为 `backend = postgres`、`persistent = true`、
- *   `productionReady = false`。在引入经评估的驱动、完成对真实 PostgreSQL 的集成验证、并把
- *   `achievements` 从字段字典落成 schema 草案 → 迁移之前，生产启动会被
- *   `PersistenceBoundaryService` 拒绝（`productionReady !== true` 即违规）。
+ *   `productionReady = false`。生产启动会被 `PersistenceBoundaryService` /
+ *   `DependencyReadinessService` 拒绝（`productionReady !== true` 即违规），直到补齐 attest 证据；
+ * - **本切片只做必要读写**：`create`（创建本人成果）与 `listByUserId`（本人成果列表），
+ *   单条读取、更新、审核、分页与软删除都留给后续切片（端口方法集有边界断言）。
  *
- * ## 为什么先有异步契约
- * 现有 `AchievementRepository`（`achievements.port.ts`）是同步接口；把运行时端口改成 Promise 是
- * 跨模块契约变更（service / controller / 既有 spec 必须一起改），必须与真实驱动引入在同一片
- * 切片完成。因此本文件实现 `AsyncAchievementRepository`（Promise 版，语义与内存基线完全一致），
- * 让「SQL 与映射是否正确」可以在**没有驱动、也没有数据库**的情况下被离线验证。
+ * ## 为什么端口是异步的
+ * `AchievementRepository`（`achievements.port.ts`）本身就是 Promise 契约：会话主体解析、画像与
+ * 本人统计三个切片都已收敛到「端口返回 Promise、内存基线与 PostgreSQL 实现同一契约」的口径。
+ * 本 adapter 因此与内存基线**逐字同签名**，换绑只改一个 factory provider。
  *
  * ## 安全边界（本文件的五条硬约束）
  * 1. **参数化 SQL + 固定标识符**：所有客户端可控的值一律走 `$1…$n` 占位符绑定；进入 SQL 文本的
@@ -55,9 +54,10 @@ import {
  *    错误消息**只带字段路径与违规类型**，避免把数据内容或注入载荷写进日志与错误响应。
  *
  * ## 尚未解决 / 已登记的前置（因此 productionReady 恒为 false）
- * `db/migrations/0001_bootstrap.sql` 只在注释里登记了 `achievements` 的建表计划，
- * 该表既没有 schema 草案也没有迁移；真实 PostgreSQL 的集成验证（建表、`id` 主键冲突、
- * `user_id` 索引、按归属取数与排序）尚未进行。这些都已登记在
+ * `db/migrations/0004_achievements.sql` 建表、`db/migrations/0008_achievements_constraints.sql`
+ * 补齐存储层约束；真实 PostgreSQL 的集成验证（建表、`id` 主键冲突、`user_id` 索引、按归属取数
+ * 与排序）由 `db/postgres/__tests__/postgres-integration.spec.ts` 对真实库执行。剩余项（驱动证据、
+ * 会话主体收敛为 UUID 后翻 `productionReady`）都已登记在
  * `POSTGRES_ACHIEVEMENT_REPOSITORY_VERIFICATION_STEPS` 里，不能只写声明。
  */
 
@@ -153,15 +153,21 @@ export const POSTGRES_ACHIEVEMENT_REPOSITORY_CAPABILITIES: AchievementRepository
   });
 
 /**
- * 转成生产可用前必须完成的验证清单（每一项都需要证据，不能只写声明）：
+ * 转成生产可用前必须完成的验证清单（每一项都需要证据，不能只写声明）。
+ *
+ * 每一项的**当前状态**（本切片只推进有证据的部分，能力值仍未翻转，因此清单继续作为门禁依据）：
  * 1. 驱动依赖经评估后引入（`docs/P2-开源复用评估.md` 的 Prisma / TypeORM 比较结论）；
- * 2. 对真实 PostgreSQL 的集成测试：建表迁移、`id` 主键冲突、按 `user_id` 取数与排序；
+ * 2. 对真实 PostgreSQL 的集成测试：建表迁移、`id` 主键冲突、按 `user_id` 取数与排序
+ *    —— 已有证据：`db/postgres/__tests__/postgres-integration.spec.ts` 的成果存储用例；
  * 3. `achievements` 的 schema 草案创建并按 `db/migrations/README.md` 转为迁移并执行验证
- *    （当前 `db/migrations/0001_bootstrap.sql` 只在注释里登记了该表）；
- * 4. `AchievementRepository` 端口改为异步：service / controller 与其测试一起改；
- * 5. 会话主体 `userId` 收敛为 UUID（当前基线是 `u-student-1` 这类安全 ID，不满足存储 ID 域）；
+ *    —— 已有证据：`0004_achievements.sql` 建表 + `0008_achievements_constraints.sql` 补约束；
+ * 4. `AchievementRepository` 端口改为异步：service / controller 与其测试一起改
+ *    —— 已完成：端口、内存基线、service、controller 与全部 spec 同步改为 Promise 语义；
+ * 5. 会话主体 `userId` 收敛为 UUID（当前基线是 `u-student-1` 这类安全 ID，不满足存储 ID 域）
+ *    —— **尚未完成**：因此数据库实现仍会在进入 SQL 之前拒绝非 UUID 主体；
  * 6. 完成 1–5 后，才允许把 `productionReady` 改为 true，并同步删除能力自检
- *    （`assertPostgresAchievementRepositoryCapabilities` 会拒绝「未验证就声称生产可用」）。
+ *    （`assertPostgresAchievementRepositoryCapabilities` 会拒绝「未验证就声称生产可用」）
+ *    —— **尚未完成**：`productionReady` 恒为 `false`，生产启动由持久化边界与依赖就绪门禁拒绝。
  */
 export const POSTGRES_ACHIEVEMENT_REPOSITORY_VERIFICATION_STEPS = [
   'driver-dependency-evaluated',
@@ -489,7 +495,7 @@ function requireStorageUuid(
 }
 
 /** 写入记录校验：读取契约的严格版本 + 归属必须落在存储 ID 域内（合法且非空 UUID） */
-function assertWritableRecord(record: unknown): Achievement {
+export function assertPostgresAchievementWritableRecord(record: unknown): Achievement {
   const parsed = strictWritableAchievementSchema.safeParse(record);
   if (!parsed.success) {
     throw new PostgresAchievementRepositoryError(
@@ -560,9 +566,10 @@ function writeParameters(record: Achievement): readonly unknown[] {
  *
  * 构造与每次调用都会重新校验执行器（`assertUsableExecutor`）与自身能力声明，
  * 因此「执行器被换掉 / 被降级」或「能力声明被改写」都会 fail-closed，而不是静默继续。
- * 本类**不是** Nest provider（不带任何 Nest 装饰器），也未在任何模块中注册。
+ * 本类**不是** Nest provider（不带任何 Nest 装饰器）：装配只发生在 `achievements.module.ts` 的
+ * factory provider 里，且引用的是下面的工厂导出名，而不是这个类名。
  */
-export class PostgresAchievementRepository implements AsyncAchievementRepository {
+export class PostgresAchievementRepository implements AchievementRepository {
   readonly capabilities: AchievementRepositoryCapabilities =
     POSTGRES_ACHIEVEMENT_REPOSITORY_CAPABILITIES;
 
@@ -590,7 +597,7 @@ export class PostgresAchievementRepository implements AsyncAchievementRepository
    */
   async create(achievement: Achievement): Promise<Achievement> {
     const executor = this.usableExecutor();
-    const writable = assertWritableRecord(achievement);
+    const writable = assertPostgresAchievementWritableRecord(achievement);
 
     const result = await executor.query(INSERT_SQL, writeParameters(writable));
 
@@ -676,4 +683,65 @@ export class PostgresAchievementRepository implements AsyncAchievementRepository
     }
     return achievements;
   }
+}
+
+/** DI 工厂：把驱动无关的 `SqlExecutor` 装成成果仓储端口实现 */
+export function createPostgresAchievementRepository(executor: SqlExecutor): AchievementRepository {
+  return new PostgresAchievementRepository(executor);
+}
+
+/** 把「主体必须在存储 ID 域内」变成可先于建连执行的断言（供分流点与测试复用） */
+export function assertPostgresAchievementSubject(userId: unknown): string {
+  return requireStorageUuid(
+    userId,
+    'INVALID_SUBJECT',
+    '取数主体必须落在存储 ID 域内（合法且非空的 UUID）：非 UUID 的 userId 属于服务端缺陷，不得进入 SQL',
+    'userId',
+  );
+}
+
+/**
+ * 延迟建连的成果仓储：**模块装配阶段不碰数据库**。
+ *
+ * 为什么必须延迟：`SQL_CONNECTION_FACTORY.connect()` 在数据库已配置但执行器未通过 attest 契约时
+ * 会抛错。如果在这里急切建连，启动失败会表现为「模块工厂抛了数据库错」，而不是启动期持久化边界
+ * 给出的**结构化违规**（`SQL_EXECUTOR_VERIFICATION_REQUIRED` / `DECLARATION_NOT_SEALED` 等）；
+ * 依赖就绪门禁也必须能在**任何连接之前**给出 `ACHIEVEMENT_REPOSITORY[DEPENDENCY_NOT_VERIFIED]`。
+ * 延迟后，判定顺序保持为「配置 → 持久化边界 / 依赖就绪 → 首次真正读写库」。
+ *
+ * 连接只在首次读写时建立并被复用；建立失败不缓存失败结果（下一次调用会重试）。
+ * 主体域（写记录用严格记录契约）先判、再建连：非存储 ID 域的主体不会触发任何数据库连接，
+ * 且**错误码与直接调用 adapter 完全一致**（读 `INVALID_SUBJECT`、写 `INVALID_RECORD`）。
+ */
+export function createLazyPostgresAchievementRepository(
+  resolveExecutor: () => Promise<SqlExecutor>,
+  capabilities: AchievementRepositoryCapabilities = POSTGRES_ACHIEVEMENT_REPOSITORY_CAPABILITIES,
+): AchievementRepository {
+  assertPostgresAchievementRepositoryCapabilities(capabilities);
+
+  let pending: Promise<SqlExecutor> | undefined;
+  const executor = (): Promise<SqlExecutor> => {
+    if (pending === undefined) {
+      pending = resolveExecutor().catch((error: unknown) => {
+        pending = undefined;
+        throw error;
+      });
+    }
+    return pending;
+  };
+
+  return {
+    capabilities,
+    async create(achievement: Achievement): Promise<Achievement> {
+      // 严格记录契约（含存储 ID 域）先判、再建连：非法写入不触发任何数据库连接
+      const writable = assertPostgresAchievementWritableRecord(achievement);
+      const resolved = await executor();
+      return new PostgresAchievementRepository(resolved).create(writable);
+    },
+    async listByUserId(userId: string): Promise<readonly Achievement[]> {
+      const ownerId = assertPostgresAchievementSubject(userId);
+      const resolved = await executor();
+      return new PostgresAchievementRepository(resolved).listByUserId(ownerId);
+    },
+  };
 }

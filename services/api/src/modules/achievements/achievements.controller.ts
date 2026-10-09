@@ -31,19 +31,19 @@ export class AchievementsController {
   ) {}
 
   @Get()
-  listMyAchievements(
+  async listMyAchievements(
     @Headers('authorization') authorization: string | undefined,
-  ): AchievementView[] {
-    return this.achievements.listMyAchievements(requireSubject(this.sessions, authorization));
+  ): Promise<AchievementView[]> {
+    return this.achievements.listMyAchievements(await requireSubject(this.sessions, authorization));
   }
 
   @Post()
-  createMyAchievement(
+  async createMyAchievement(
     @Headers('authorization') authorization: string | undefined,
     @Body() body: unknown,
-  ): AchievementView {
+  ): Promise<AchievementView> {
     return this.achievements.createMyAchievement(
-      requireSubject(this.sessions, authorization),
+      await requireSubject(this.sessions, authorization),
       body,
     );
   }

@@ -16,6 +16,9 @@ import { AchievementsService } from './achievements.service';
  * 成果服务层回归（不启 HTTP）：把「判定入参来自服务端」「授权先于仓储访问」
  * 「未知枚举 fail-closed」「仓储越界取数不当作正常输出」四条约束固定在 service 这一层，
  * 避免它们只靠 HTTP 用例间接覆盖。
+ *
+ * 端口是**异步契约**（内存基线与 PostgreSQL 实现同签名），因此这里也断言「先授权、后 await 取数」
+ * 的顺序事实：授权拒绝时仓储方法一次都不被调用。
  */
 
 const policy = new AuthorizationPolicy();
@@ -41,17 +44,17 @@ class StubAchievementRepository implements AchievementRepository {
     for (const record of seed) this.records.set(record.id, record);
   }
 
-  create(achievement: Achievement): Achievement {
+  create(achievement: Achievement): Promise<Achievement> {
     this.createCalls += 1;
     this.created.push(achievement);
     this.records.set(achievement.id, achievement);
-    return achievement;
+    return Promise.resolve(achievement);
   }
 
-  listByUserId(userId: string): readonly Achievement[] {
+  listByUserId(userId: string): Promise<readonly Achievement[]> {
     this.listCalls += 1;
-    if (this.listOverride) return this.listOverride;
-    return [...this.records.values()].filter((record) => record.userId === userId);
+    if (this.listOverride) return Promise.resolve(this.listOverride);
+    return Promise.resolve([...this.records.values()].filter((record) => record.userId === userId));
   }
 }
 
@@ -85,9 +88,10 @@ function serviceWith(repository: AchievementRepository): AchievementsService {
   return new AchievementsService(guard, repository);
 }
 
-function captureError(run: () => unknown): unknown {
+/** 端口是异步契约：同步抛出的授权/校验拒绝会变成 rejected promise，因此捕获也必须是异步的 */
+async function captureError(run: () => Promise<unknown>): Promise<unknown> {
   try {
-    run();
+    await run();
   } catch (error) {
     return error;
   }
@@ -95,11 +99,11 @@ function captureError(run: () => unknown): unknown {
 }
 
 describe('AchievementsService：主体与归属只来自服务端', () => {
-  it('创建：归属、审核态、时间戳由服务端写入，视图不含 userId', () => {
+  it('创建：归属、审核态、时间戳由服务端写入，视图不含 userId', async () => {
     const repository = new StubAchievementRepository();
     const service = serviceWith(repository);
 
-    const view = service.createMyAchievement(student, { ...validBody });
+    const view = await service.createMyAchievement(student, { ...validBody });
 
     expect(repository.created).toHaveLength(1);
     const stored = repository.created[0];
@@ -126,21 +130,21 @@ describe('AchievementsService：主体与归属只来自服务端', () => {
     expect(JSON.stringify(view)).not.toContain('u-student-1');
   });
 
-  it('列表：只按服务端主体取数，绝不返回他人记录', () => {
+  it('列表：只按服务端主体取数，绝不返回他人记录', async () => {
     const repository = new StubAchievementRepository([
       record({ userId: 'u-student-1' }),
       record({ userId: 'u-student-2', title: '他人成果' }),
     ]);
     const service = serviceWith(repository);
 
-    const items = service.listMyAchievements(student);
+    const items = await service.listMyAchievements(student);
 
     expect(items).toHaveLength(1);
     expect(JSON.stringify(items)).not.toContain('他人成果');
     expect(JSON.stringify(items)).not.toContain('u-student-2');
   });
 
-  it('授权先于仓储访问：端口拒绝时仓储的读写方法一次都不被调用', () => {
+  it('授权先于仓储访问：端口拒绝时仓储的读写方法一次都不被调用', async () => {
     const denying: RuoYiAuthzAdapter = {
       capabilities: new BaselineRuoYiAuthzAdapter(policy).capabilities,
       checkAuthorization: (): AuthorizationDecision => ({
@@ -152,11 +156,11 @@ describe('AchievementsService：主体与归属只来自服务端', () => {
     const repository = new StubAchievementRepository([record()]);
     const service = new AchievementsService(new AuthorizationGuard(denying), repository);
 
-    expect(captureError(() => service.listMyAchievements(student))).toBeInstanceOf(
+    expect(await captureError(async () => service.listMyAchievements(student))).toBeInstanceOf(
       ForbiddenException,
     );
     expect(
-      captureError(() => service.createMyAchievement(student, { ...validBody })),
+      await captureError(async () => service.createMyAchievement(student, { ...validBody })),
     ).toBeInstanceOf(ForbiddenException);
 
     expect(repository.listCalls).toBe(0);
@@ -166,11 +170,11 @@ describe('AchievementsService：主体与归属只来自服务端', () => {
 });
 
 describe('AchievementsService：输入闭集与字段校验（fail-closed）', () => {
-  it('服务端独占字段（userId/roles/scope/groupId/reviewStatus）→ ZodError，且不落库', () => {
+  it('服务端独占字段（userId/roles/scope/groupId/reviewStatus）→ ZodError，且不落库', async () => {
     const repository = new StubAchievementRepository();
     const service = serviceWith(repository);
 
-    const error = captureError(() =>
+    const error = await captureError(async () =>
       service.createMyAchievement(student, {
         ...validBody,
         userId: 'u-victim-1',
@@ -190,7 +194,7 @@ describe('AchievementsService：输入闭集与字段校验（fail-closed）', (
     expect(repository.createCalls).toBe(0);
   });
 
-  it('未知枚举/越界/非法时间/非 UUID 佐证/敏感内容 → ZodError', () => {
+  it('未知枚举/越界/非法时间/非 UUID 佐证/敏感内容 → ZodError', async () => {
     const repository = new StubAchievementRepository();
     const service = serviceWith(repository);
 
@@ -208,9 +212,9 @@ describe('AchievementsService：输入闭集与字段校验（fail-closed）', (
     ];
 
     for (const body of cases) {
-      expect(captureError(() => service.createMyAchievement(student, body))).toBeInstanceOf(
-        ZodError,
-      );
+      expect(
+        await captureError(async () => service.createMyAchievement(student, body)),
+      ).toBeInstanceOf(ZodError);
     }
     expect(repository.created).toHaveLength(0);
   });
@@ -221,37 +225,43 @@ describe('AchievementsService：输入闭集与字段校验（fail-closed）', (
     );
   });
 
-  it('授权先于字段校验：无权限角色得到 403，而不是校验结果', () => {
+  it('授权先于字段校验：无权限角色得到 403，而不是校验结果', async () => {
     const repository = new StubAchievementRepository();
     const service = serviceWith(repository);
 
-    const error = captureError(() => service.createMyAchievement(admin, { type: 'unknown_type' }));
+    const error = await captureError(async () =>
+      service.createMyAchievement(admin, { type: 'unknown_type' }),
+    );
 
     expect(error).toBeInstanceOf(ForbiddenException);
     expect(repository.createCalls).toBe(0);
   });
 
-  it('未登记角色/空主体的主体一律 403（fail-closed）', () => {
+  it('未登记角色/空主体的主体一律 403（fail-closed）', async () => {
     const repository = new StubAchievementRepository();
     const service = serviceWith(repository);
 
     expect(
-      captureError(() => service.listMyAchievements({ userId: 'u-x', roles: ['guest' as Role] })),
+      await captureError(async () =>
+        service.listMyAchievements({ userId: 'u-x', roles: ['guest' as Role] }),
+      ),
     ).toBeInstanceOf(ForbiddenException);
     expect(
-      captureError(() =>
+      await captureError(async () =>
         service.listMyAchievements({ userId: 'u-x', roles: [Role.Student, 'guest' as Role] }),
       ),
     ).toBeInstanceOf(ForbiddenException);
     expect(
-      captureError(() => service.listMyAchievements({ userId: '', roles: [Role.Student] })),
+      await captureError(async () =>
+        service.listMyAchievements({ userId: '', roles: [Role.Student] }),
+      ),
     ).toBeInstanceOf(ForbiddenException);
     expect(repository.listCalls).toBe(0);
   });
 });
 
 describe('AchievementsService：存储异常 fail-closed', () => {
-  it('存储枚举未登记 → 500，且异常不携带原始取值', () => {
+  it('存储枚举未登记 → 500，且异常不携带原始取值', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const corrupted = record({
       type: 'unknown_type' as AchievementType,
@@ -259,7 +269,7 @@ describe('AchievementsService：存储异常 fail-closed', () => {
     });
     const service = serviceWith(new StubAchievementRepository([corrupted]));
 
-    const error = captureError(() => service.listMyAchievements(student));
+    const error = await captureError(async () => service.listMyAchievements(student));
 
     expect(error).toBeInstanceOf(InternalServerErrorException);
     expect((error as InternalServerErrorException).getStatus()).toBe(500);
@@ -270,24 +280,24 @@ describe('AchievementsService：存储异常 fail-closed', () => {
     expect(Logger.prototype.error).toHaveBeenCalled();
   });
 
-  it('存储时间戳非法 → 500（读取契约包含时间格式）', () => {
+  it('存储时间戳非法 → 500（读取契约包含时间格式）', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const service = serviceWith(
       new StubAchievementRepository([record({ createdAt: '2026-01-01 00:00:00' })]),
     );
 
-    expect(captureError(() => service.listMyAchievements(student))).toBeInstanceOf(
+    expect(await captureError(async () => service.listMyAchievements(student))).toBeInstanceOf(
       InternalServerErrorException,
     );
   });
 
-  it('仓储返回他人归属 → 500，绝不把他人记录当作本人列表输出', () => {
+  it('仓储返回他人归属 → 500，绝不把他人记录当作本人列表输出', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const repository = new StubAchievementRepository();
     repository.listOverride = [record({ userId: 'u-student-2', title: '他人成果' })];
     const service = serviceWith(repository);
 
-    const error = captureError(() => service.listMyAchievements(student));
+    const error = await captureError(async () => service.listMyAchievements(student));
 
     expect(error).toBeInstanceOf(InternalServerErrorException);
     // 与「存储记录损坏」共用同一文案：调用方无法据此区分内部原因

@@ -151,6 +151,7 @@ describe('readMigrationDirectory：与仓库真实迁移对齐', () => {
       '0005_ai_match_records.sql',
       '0006_sessions.sql',
       '0007_student_profiles.sql',
+      '0008_achievements_constraints.sql',
     ]);
     expect(descriptors.map((item) => item.version)).toEqual([
       '0001',
@@ -160,9 +161,12 @@ describe('readMigrationDirectory：与仓库真实迁移对齐', () => {
       '0005',
       '0006',
       '0007',
+      '0008',
     ]);
-    // 全部迁移都必须是「可回滚」：四位序号迁移由 DROP TABLE IF EXISTS 恢复
+    // 全部迁移都必须是「可回滚」：建表迁移由 DROP TABLE IF EXISTS 恢复，约束迁移由
+    // ALTER TABLE ... DROP CONSTRAINT IF EXISTS 恢复
     expect(descriptors.map((item) => item.reversible)).toEqual([
+      true,
       true,
       true,
       true,
@@ -188,6 +192,19 @@ describe('readMigrationDirectory：与仓库真实迁移对齐', () => {
         new RegExp(`CREATE\\s+TABLE\\s+IF\\s+NOT\\s+EXISTS\\s+${table}\\s*\\(`, 'u'),
       );
     }
+
+    // 0008 是**约束补齐**（不建表）：它必须真的给 0004 建出的表加约束，而不是只在注释里声明
+    const constraintMigration = readFileSync(
+      join(repoRoot, 'db', 'migrations', '0008_achievements_constraints.sql'),
+      'utf8',
+    );
+    expect(constraintMigration).toMatch(/ALTER\s+TABLE\s+achievements\b/iu);
+    for (const constraint of ['achievements_title_length', 'achievements_owner_not_nil']) {
+      expect(constraintMigration).toContain(`ADD CONSTRAINT ${constraint}`);
+    }
+    // 约束迁移不得顺手建表 / 建索引（一份迁移只做一件事，索引已由 0004 建立）
+    expect(constraintMigration).not.toMatch(/CREATE\s+TABLE\b/iu);
+    expect(constraintMigration).not.toMatch(/CREATE\s+(?:UNIQUE\s+)?INDEX\b/iu);
   });
 });
 

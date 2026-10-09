@@ -18,6 +18,9 @@ import type {
  *   而不是让「重启即丢数据」的内存结构悄悄承担生产存储职责；
  * - 不做授权判定、不生成归属信息：`userId`/`reviewStatus` 由 service 从服务端主体与
  *   服务端常量写入。
+ *
+ * 方法签名与 PostgreSQL 实现**逐字一致**（都返回 `Promise`）：换绑实现不需要改 service，
+ * 也不会出现「同步实现被当成已完成、异步实现尚未返回」这类只在生产才暴露的时序差异。
  */
 @Injectable()
 export class InMemoryAchievementRepository implements AchievementRepository {
@@ -37,7 +40,7 @@ export class InMemoryAchievementRepository implements AchievementRepository {
     }
   }
 
-  create(achievement: Achievement): Achievement {
+  async create(achievement: Achievement): Promise<Achievement> {
     if (this.achievements.has(achievement.id)) {
       // 主键冲突属于服务端缺陷（ID 由服务端生成），不得静默覆盖
       throw new Error(`成果 ID 冲突: ${achievement.id}`);
@@ -46,7 +49,7 @@ export class InMemoryAchievementRepository implements AchievementRepository {
     return { ...achievement };
   }
 
-  listByUserId(userId: string): readonly Achievement[] {
+  async listByUserId(userId: string): Promise<readonly Achievement[]> {
     return [...this.achievements.values()]
       .filter((record) => record.userId === userId)
       .map((record) => ({ ...record }));

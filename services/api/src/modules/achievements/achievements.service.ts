@@ -39,6 +39,9 @@ import type { Achievement, AchievementRepository } from './achievements.port';
  * 尚不包含（明确留给后续切片）：单条读取、更新（`achievement:self:update`）、
  * 审核（`achievement:review`，含审核人/意见/时间落库）、附件实体校验、
  * 幂等键与审计落库、列表分页与排序。
+ *
+ * 持久化绑定由 `achievements.module.ts` 的单个 factory provider 决定（未配置数据库 → 内存基线；
+ * 已配置 → PostgreSQL 实现），service 只依赖端口，因此这份实现不区分存储后端。
  */
 @Injectable()
 export class AchievementsService {
@@ -49,16 +52,23 @@ export class AchievementsService {
     @Inject(ACHIEVEMENT_REPOSITORY) private readonly repository: AchievementRepository,
   ) {}
 
-  /** 本人成果列表：先做集合级 SELF 判定，再按服务端主体取数 */
-  listMyAchievements(subject: AuthorizationSubject): AchievementView[] {
+  /**
+   * 本人成果列表：先做集合级 SELF 判定，再按服务端主体取数。
+   *
+   * 端口是异步的（内存基线与 PostgreSQL 实现同一契约）：`await` 之后才开始逐条复核归属，
+   * 因此「未授权就取数」不可能因为同步返回而被掩盖（`authorizeSelf` 在任何仓储调用之前抛出）。
+   */
+  async listMyAchievements(subject: AuthorizationSubject): Promise<AchievementView[]> {
     this.authorizeSelf(subject, PermissionPoint.AchievementSelfRead);
-    return this.repository
-      .listByUserId(subject.userId)
-      .map((record) => this.toView(record, subject.userId));
+    const records = await this.repository.listByUserId(subject.userId);
+    return records.map((record) => this.toView(record, subject.userId));
   }
 
   /** 创建本人成果：归属与审核态都由服务端决定，请求体只提供业务字段 */
-  createMyAchievement(subject: AuthorizationSubject, body: unknown): AchievementView {
+  async createMyAchievement(
+    subject: AuthorizationSubject,
+    body: unknown,
+  ): Promise<AchievementView> {
     this.authorizeSelf(subject, PermissionPoint.AchievementSelfCreate);
 
     // 输入闭集 → 字段级校验（共享 zod schema）：未知枚举、越界标题、控制字符、
@@ -67,7 +77,7 @@ export class AchievementsService {
     const input = achievementInputSchema.parse(body);
 
     const now = new Date().toISOString();
-    const created = this.repository.create({
+    const created = await this.repository.create({
       id: randomUUID(),
       userId: subject.userId,
       type: input.type,

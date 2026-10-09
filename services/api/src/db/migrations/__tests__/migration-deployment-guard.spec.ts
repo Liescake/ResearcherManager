@@ -150,6 +150,7 @@ describe('部署守卫契约：身份与来源目录', () => {
       '0005_ai_match_records.sql',
       '0006_sessions.sql',
       '0007_student_profiles.sql',
+      '0008_achievements_constraints.sql',
     ];
     const candidates = collectMigrationDeploymentCandidates(MIGRATIONS_DIR);
     expect(candidates.map((item) => item.fileName)).toEqual(REAL_MIGRATIONS);
@@ -171,8 +172,18 @@ describe('部署守卫契约：身份与来源目录', () => {
       '0005',
       '0006',
       '0007',
+      '0008',
     ]);
-    expect(report.executionOrder).toEqual(['0001', '0002', '0003', '0004', '0005', '0006', '0007']);
+    expect(report.executionOrder).toEqual([
+      '0001',
+      '0002',
+      '0003',
+      '0004',
+      '0005',
+      '0006',
+      '0007',
+      '0008',
+    ]);
   });
 
   it('真实 db/schema-drafts 作为部署来源被整体拒绝（草案永不部署）', () => {

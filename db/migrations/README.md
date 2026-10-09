@@ -14,7 +14,8 @@ db/migrations/
 ├─ 0004_achievements.sql       成果表（本人统计来源表）
 ├─ 0005_ai_match_records.sql   AI 匹配记录表（本人统计来源表）
 ├─ 0006_sessions.sql           服务端会话表（会话存储切片）
-└─ 0007_student_profiles.sql   学生画像表（PostgreSQL 画像仓储切片）
+├─ 0007_student_profiles.sql   学生画像表（PostgreSQL 画像仓储切片）
+└─ 0008_achievements_constraints.sql  成果表存储层约束补齐（PostgreSQL 成果仓储切片）
 ```
 
 `0002`–`0005` 是第一个真实业务持久化切片（本人统计聚合读）所需的四张来源表：每张表都带
@@ -26,6 +27,12 @@ db/migrations/
 归属也是主键，一人一行）。两者都服务于「开发/测试无数据库走内存基线、配置了 `DATABASE_URL`
 则换绑 PostgreSQL 实现」的分流：PostgreSQL 实现只在配置了数据库时被装配，且如实声明
 `productionReady = false`，因此生产环境在补齐验证证据前会被启动期依赖就绪门禁拒绝。
+
+`0008` 是**约束补齐**（不建表）：成果表已在 `0004` 建好，本切片的自服务读写路径需要在存储层
+补上「标题非空且不超长」与「归属不得为空 UUID」两条 CHECK。口径仍是「只把 adapter 契约已经
+蕴含的规则下沉」，不引入应用层语义（内容安全、时间格式）与后续切片的对象（审核留痕、
+`deleted_at`、`users` 外键），也不新增索引（`0004` 的 `(user_id, created_at, id)` 已覆盖
+本人列表与本人统计两条取数路径）。
 
 ## 命名与顺序
 
