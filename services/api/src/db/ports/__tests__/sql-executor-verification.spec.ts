@@ -9,7 +9,10 @@ import {
 } from '../../database.module';
 import { MIGRATION_DEPLOYMENT_GUARD_CONTRACT } from '../../migrations/migration-deployment-guard';
 import { bindingTokenName, PERSISTENCE_BINDINGS } from '../../persistence-bindings';
-import { isForbiddenDriverSpecifier } from '../../persistence/postgres-adapter-registry';
+import {
+  isForbiddenDriverSpecifier,
+  isAuthorizedDriverSpecifier,
+} from '../../persistence/postgres-adapter-registry';
 import {
   assertPersistenceBoundary,
   evaluatePersistenceBoundary,
@@ -1260,7 +1263,7 @@ function serviceWithSqlBinding(
 }
 
 const productionEnv = (): ReturnType<typeof loadEnv> =>
-  loadEnv({ NODE_ENV: 'production', DATABASE_URL: LOOPBACK_URL, DATABASE_SSL: 'false' });
+  loadEnv({ NODE_ENV: 'production', DATABASE_URL: LOOPBACK_URL, DATABASE_SSL_MODE: 'verify-full' });
 
 describe('真实装配：启动期持久化边界把执行器契约一起判定', () => {
   it('默认工厂（fail-closed 未验证驱动）不持有任何封存声明：默认登记表是空的', () => {
@@ -1431,12 +1434,24 @@ describe('端口层边界：不引入驱动、不建连接、不读磁盘', () =
       importSpecifiers(file.content).map((specifier) => ({ file: file.relative, specifier })),
     );
     expect(specifiers.filter((item) => isForbiddenDriverSpecifier(item.specifier))).toEqual([]);
-    // 提取器自证有效：真出现驱动名时必须能识别
+    // 提取器自证有效：官方 `pg` 已授权（不再判「被禁」，但由驱动层收敛规则单独管），
+    // 未授权的驱动与 ORM 仍必须被识别
     expect(
       importSpecifiers("import { Pool } from 'pg';").filter((value) =>
         isForbiddenDriverSpecifier(value),
       ),
-    ).toEqual(['pg']);
+    ).toEqual([]);
+    expect(isAuthorizedDriverSpecifier('pg')).toBe(true);
+    expect(
+      importSpecifiers("import Postgres from 'postgres';").filter((value) =>
+        isForbiddenDriverSpecifier(value),
+      ),
+    ).toEqual(['postgres']);
+    expect(
+      importSpecifiers("import { DataSource } from 'typeorm';").filter((value) =>
+        isForbiddenDriverSpecifier(value),
+      ),
+    ).toEqual(['typeorm']);
   });
 
   it('验证契约模块自身不 import node: 内置模块（不读磁盘、不连网、不建连接）', () => {

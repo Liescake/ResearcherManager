@@ -142,8 +142,15 @@ describe('部署守卫契约：身份与来源目录', () => {
   });
 
   it('真实 db/migrations 通过：采集候选、判定为可执行且给出升序执行顺序', () => {
+    const REAL_MIGRATIONS = [
+      '0001_bootstrap.sql',
+      '0002_education_records.sql',
+      '0003_join_applications.sql',
+      '0004_achievements.sql',
+      '0005_ai_match_records.sql',
+    ];
     const candidates = collectMigrationDeploymentCandidates(MIGRATIONS_DIR);
-    expect(candidates.map((item) => item.fileName)).toEqual(['0001_bootstrap.sql']);
+    expect(candidates.map((item) => item.fileName)).toEqual(REAL_MIGRATIONS);
     expect(candidates[0]?.source).toBe('migration-directory');
     expect(candidates[0]?.relativePath).toBe('db/migrations/0001_bootstrap.sql');
     expect(candidates[0]?.checksum).toBe(computeMigrationChecksum(candidates[0]?.content ?? ''));
@@ -153,9 +160,9 @@ describe('部署守卫契约：身份与来源目录', () => {
     );
     expect(report.violations).toEqual([]);
     expect(report.ok).toBe(true);
-    expect(report.checkedFiles).toEqual(['0001_bootstrap.sql']);
-    expect(report.pendingVersions).toEqual(['0001']);
-    expect(report.executionOrder).toEqual(['0001']);
+    expect(report.checkedFiles).toEqual(REAL_MIGRATIONS);
+    expect(report.pendingVersions).toEqual(['0001', '0002', '0003', '0004', '0005']);
+    expect(report.executionOrder).toEqual(['0001', '0002', '0003', '0004', '0005']);
   });
 
   it('真实 db/schema-drafts 作为部署来源被整体拒绝（草案永不部署）', () => {

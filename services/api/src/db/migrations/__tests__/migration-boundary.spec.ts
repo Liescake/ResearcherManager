@@ -143,13 +143,37 @@ describe('readMigrationDirectory：与仓库真实迁移对齐', () => {
     const repoRoot = findRepoRoot(process.cwd());
     const descriptors = readMigrationDirectory(join(repoRoot, 'db', 'migrations'));
 
-    expect(descriptors.map((item) => item.fileName)).toEqual(['0001_bootstrap.sql']);
-    expect(descriptors[0]?.version).toBe('0001');
-    expect(descriptors[0]?.reversible).toBe(true);
+    expect(descriptors.map((item) => item.fileName)).toEqual([
+      '0001_bootstrap.sql',
+      '0002_education_records.sql',
+      '0003_join_applications.sql',
+      '0004_achievements.sql',
+      '0005_ai_match_records.sql',
+    ]);
+    expect(descriptors.map((item) => item.version)).toEqual([
+      '0001',
+      '0002',
+      '0003',
+      '0004',
+      '0005',
+    ]);
+    // 全部迁移都必须是「可回滚」：四位序号迁移由 DROP TABLE IF EXISTS 恢复
+    expect(descriptors.map((item) => item.reversible)).toEqual([true, true, true, true, true]);
     // 与 CI 静态门禁同源：文件内容必须真的可解析
     expect(
       readFileSync(join(repoRoot, 'db', 'migrations', '0001_bootstrap.sql'), 'utf8'),
     ).toContain('schema_migrations');
+    // 本人统计切片依赖的四张来源表必须真的由迁移建出来（不是只在注释里登记）
+    for (const [file, table] of [
+      ['0002_education_records.sql', 'education_records'],
+      ['0003_join_applications.sql', 'join_applications'],
+      ['0004_achievements.sql', 'achievements'],
+      ['0005_ai_match_records.sql', 'ai_match_records'],
+    ] as const) {
+      expect(readFileSync(join(repoRoot, 'db', 'migrations', file), 'utf8')).toMatch(
+        new RegExp(`CREATE\\s+TABLE\\s+IF\\s+NOT\\s+EXISTS\\s+${table}\\s*\\(`, 'u'),
+      );
+    }
   });
 });
 

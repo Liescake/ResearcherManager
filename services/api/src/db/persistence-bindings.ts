@@ -17,6 +17,7 @@ import {
   APPLICATION_STATISTICS_REPOSITORY,
   EDUCATION_STATISTICS_REPOSITORY,
   MATCHING_STATISTICS_REPOSITORY,
+  SELF_STATISTICS_REPOSITORY,
 } from '../modules/statistics/statistics.port';
 import { SQL_CONNECTION_FACTORY } from './ports/sql-executor.port';
 
@@ -146,6 +147,13 @@ export const PERSISTENCE_BINDINGS: readonly PersistenceBindingDescriptor[] = [
     token: MATCHING_STATISTICS_REPOSITORY,
     module: 'statistics',
     responsibility: '匹配计数来源',
+    role: 'business',
+  },
+  {
+    token: SELF_STATISTICS_REPOSITORY,
+    module: 'statistics',
+    responsibility:
+      '本人统计聚合读端口：未配置数据库时由四个内存来源组合，配置数据库后换绑 PostgreSQL 聚合读 adapter',
     role: 'business',
   },
   {

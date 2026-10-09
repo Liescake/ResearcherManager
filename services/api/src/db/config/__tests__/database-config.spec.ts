@@ -1,3 +1,5 @@
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   DatabaseConfigError,
@@ -118,22 +120,88 @@ describe('resolveDatabaseConfig：配置 fail-closed', () => {
     expect(error.message).not.toContain('sup3r-s3cret');
   });
 
-  it('生产环境未显式配置 TLS（DATABASE_SSL 缺省）时：非回环主机按安全默认要求 TLS，不抛错', () => {
-    // 「未配置」走安全默认值（require），不会被上层默认成显式 false 而静默降级；
-    // 显式关闭 TLS 的情况由上一条用例拒绝
-    expect(
+  it('生产环境未显式配置 TLS（DATABASE_SSL 缺省）：安全默认只是 require，仍按未验证身份拒绝启动', () => {
+    const error = captureConfigError(() =>
       resolveDatabaseConfig({ NODE_ENV: 'production', DATABASE_URL: REMOTE_URL }),
-    ).toMatchObject({ status: 'configured', config: { ssl: 'require' } });
+    );
+    expect(error.code).toBe('DATABASE_TLS_NOT_VERIFIED_IN_PRODUCTION');
+    expect(error.message).toContain('verify-full');
+    expect(error.message).not.toContain('sup3r-s3cret');
   });
 
-  it('生产环境允许回环地址关闭 TLS（本地/WSL 部署）', () => {
-    expect(
+  it('生产环境即使本地回环也不接受关闭 TLS / 未校验身份的 TLS（fail-closed）', () => {
+    // 「本地部署就能明文」不再成立：生产只接受 verify-full，本地开发请用 NODE_ENV=development
+    for (const source of [
+      { DATABASE_SSL: 'false' as const },
+      { DATABASE_SSL: 'true' as const },
+      { DATABASE_SSL_MODE: 'require' as const },
+      { DATABASE_SSL_MODE: 'disable' as const },
+    ]) {
+      const error = captureConfigError(() =>
+        resolveDatabaseConfig({ NODE_ENV: 'production', DATABASE_URL: LOOPBACK_URL, ...source }),
+      );
+      expect(error.code).toBe('DATABASE_TLS_NOT_VERIFIED_IN_PRODUCTION');
+    }
+  });
+
+  it('生产环境接受 verify-full（显式档位或连接串 sslmode），并记录证书是否已注入', () => {
+    const viaMode = resolveDatabaseConfig({
+      NODE_ENV: 'production',
+      DATABASE_URL: REMOTE_URL,
+      DATABASE_SSL_MODE: 'verify-full',
+    });
+    expect(viaMode).toMatchObject({
+      status: 'configured',
+      config: { ssl: 'verify-full', tls: {} },
+    });
+
+    const viaSslmode = resolveDatabaseConfig({
+      NODE_ENV: 'production',
+      DATABASE_URL: `${REMOTE_URL}?sslmode=verify-full`,
+    });
+    expect(viaSslmode).toMatchObject({ status: 'configured', config: { ssl: 'verify-full' } });
+  });
+
+  it('TLS 证书只接受绝对路径，且证书与私钥必须成对（证书由挂载卷注入，不写入仓库）', () => {
+    const relative = captureConfigError(() =>
       resolveDatabaseConfig({
-        NODE_ENV: 'production',
         DATABASE_URL: LOOPBACK_URL,
-        DATABASE_SSL: 'false',
+        DATABASE_SSL_MODE: 'verify-full',
+        DATABASE_SSL_CA_PATH: 'certs/ca.pem',
       }),
-    ).toMatchObject({ status: 'configured', config: { ssl: 'disable' } });
+    );
+    expect(relative.code).toBe('DATABASE_TLS_FILE_PATH_INVALID');
+    expect(relative.message).toContain('DATABASE_SSL_CA_PATH');
+
+    const halfPair = captureConfigError(() =>
+      resolveDatabaseConfig({
+        DATABASE_URL: LOOPBACK_URL,
+        DATABASE_SSL_MODE: 'verify-full',
+        DATABASE_SSL_CERT_PATH: join(tmpdir(), 'client.crt'),
+      }),
+    );
+    expect(halfPair.code).toBe('DATABASE_TLS_FILE_PATH_INVALID');
+    expect(halfPair.message).toContain('成对配置');
+
+    // 绝对路径 + 成对的证书/私钥：只登记路径，不读内容
+    const resolved = resolveDatabaseConfig({
+      DATABASE_URL: LOOPBACK_URL,
+      DATABASE_SSL_MODE: 'verify-full',
+      DATABASE_SSL_CA_PATH: join(tmpdir(), 'ca.pem'),
+      DATABASE_SSL_CERT_PATH: join(tmpdir(), 'client.crt'),
+      DATABASE_SSL_KEY_PATH: join(tmpdir(), 'client.key'),
+    });
+    expect(resolved).toMatchObject({
+      status: 'configured',
+      config: {
+        ssl: 'verify-full',
+        tls: {
+          caPath: join(tmpdir(), 'ca.pem'),
+          certPath: join(tmpdir(), 'client.crt'),
+          keyPath: join(tmpdir(), 'client.key'),
+        },
+      },
+    });
   });
 
   it('数值型配置非法时抛错，消息只含变量名与规则、不含取值', () => {

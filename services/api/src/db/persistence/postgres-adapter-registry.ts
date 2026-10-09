@@ -153,6 +153,41 @@ export const POSTGRES_ADAPTER_REGISTRY: readonly PostgresAdapterDescriptor[] = [
     repositoryClass: 'PostgresStudentProfileRepository',
     moduleFile: 'modules/profiles/profiles.module.ts',
   },
+];
+
+/**
+ * **已绑定**的持久化切片：adapter 已经进入业务 Module 的 provider（经工厂构造），因此
+ * 「未装配」那一组规则（不得被 Module 引用）对它们**不成立** —— 但必须换成另一组同样可机器
+ * 判定的规则，而不是简单地放行：
+ *
+ * 1. adapter 文件仍然必须在磁盘上存在，且不得 import / 转发另一个 `*.postgres-repository`；
+ * 2. 能力声明仍是 `backend = postgres`、`persistent = true`、`productionReady = false`
+ *    （本阶段尚未取得 attest 证据，不得声称生产可用）；
+ * 3. 能力自检仍必须拒绝「未验证就声称生产可用 / 降级为非持久 / 换后端」三类错误登记；
+ * 4. 业务 Module **必须**引用绑定点（令牌名 + 工厂导出名）：换绑与登记表必须同时更新，
+ *    只改其中一处即 fail-closed；
+ * 5. adapter 源文件不得 import 任何驱动（含已授权的 `pg`）：驱动只允许出现在
+ *    `db/postgres/` 驱动层；
+ * 6. 其余十个 adapter 继续留在 `POSTGRES_ADAPTER_REGISTRY`（未装配组），两组互斥。
+ */
+export interface PostgresBoundSliceDescriptor {
+  /** 稳定 id */
+  readonly id: string;
+  readonly module: string;
+  /** adapter 源文件（相对 `services/api/src`，posix） */
+  readonly file: string;
+  readonly capabilitiesExport: string;
+  readonly assertExport: string;
+  readonly repositoryClass: string;
+  /** 业务 Module 文件（相对 `services/api/src`，posix） */
+  readonly moduleFile: string;
+  /** 该切片换绑的 DI 令牌可读名（必须出现在 module 源文件里） */
+  readonly token: string;
+  /** adapter 侧提供给 Module 的工厂导出名（必须出现在 module 源文件里） */
+  readonly factoryExport: string;
+}
+
+export const POSTGRES_BOUND_SLICE_REGISTRY: readonly PostgresBoundSliceDescriptor[] = [
   {
     id: 'statistics',
     module: 'statistics',
@@ -161,6 +196,8 @@ export const POSTGRES_ADAPTER_REGISTRY: readonly PostgresAdapterDescriptor[] = [
     assertExport: 'assertPostgresStatisticsRepositoryCapabilities',
     repositoryClass: 'PostgresStatisticsRepository',
     moduleFile: 'modules/statistics/statistics.module.ts',
+    token: 'SELF_STATISTICS_REPOSITORY',
+    factoryExport: 'createLazyPostgresSelfStatisticsRepository',
   },
 ];
 
@@ -185,21 +222,25 @@ export const POSTGRES_ADAPTER_EXEMPTIONS: readonly PostgresAdapterExemption[] = 
 ];
 
 /**
- * 禁止出现在依赖 / import / 已安装包里的 PostgreSQL 驱动与 ORM / 查询构建器。
+ * **已授权引入**的 PostgreSQL 驱动包（本阶段：官方 `pg` 驱动 + 其类型声明）。
  *
- * 为什么连「已安装」也要判：只判 package.json 会漏掉「被传递依赖装进来、但没人声明」的驱动
- * ——那正是「运行时可以悄悄建连接」的前提。`pg` 家族另用前缀规则（`pg-pool` / `pg-types` /
- * `pg-native` …）覆盖，避免每出一个子包就漏一次。
+ * 用户已明确授权引入官方 `pg` 驱动。授权不是「随便 import」：`pg` 只允许出现在
+ * `db/postgres/` 驱动层（见 `POSTGRES_DRIVER_LAYER_DIRECTORY` 与
+ * `DRIVER_IMPORT_OUTSIDE_DRIVER_LAYER`），业务 adapter 仍只能依赖驱动无关的 `SqlExecutor` 端口。
+ * `pg` 家族的传递依赖（`pg-pool` / `pg-types` / `pg-protocol` / `pg-connection-string` …）随官方
+ * 驱动一起被安装，属于同一授权范围，但**不在本清单里**：清单只登记**直接声明**的包，
+ * 传递依赖由 `AUTHORIZED_POSTGRES_DRIVER_PACKAGE_PATTERN` 覆盖。
  */
-export const FORBIDDEN_POSTGRES_DRIVER_PACKAGES: readonly string[] = [
-  // node-postgres 家族
-  'pg',
-  'pg-pool',
+export const AUTHORIZED_POSTGRES_DRIVER_PACKAGES: readonly string[] = ['pg', '@types/pg'];
+
+/** 已授权包名（含官方 `pg` 的家族传递依赖）的匹配口径 */
+export const AUTHORIZED_POSTGRES_DRIVER_PACKAGE_PATTERN = /^(?:pg|pg-[a-z0-9-]+|@types\/pg)$/u;
+
+/** 即使匹配家族前缀也**不允许**出现的包（原生绑定与第三方 wrapper：引入需单独评估） */
+export const DENIED_POSTGRES_DRIVER_PACKAGES: readonly string[] = [
   'pg-native',
-  'pg-types',
-  'pgpass',
-  'pg-connection-string',
-  '@types/pg',
+  'pg-promise',
+  // 第三方 pg 之上/之外的驱动与查询构建器
   'postgres',
   'slonik',
   // ORM / 查询构建器 / Nest 集成
@@ -226,8 +267,23 @@ export const FORBIDDEN_POSTGRES_DRIVER_PACKAGES: readonly string[] = [
   'sqlite3',
 ];
 
-/** pg 家族前缀规则（`pg-*` / `pg/子路径`）；单独成规则便于注释与测试固定 */
-const POSTGRES_DRIVER_FAMILY_PATTERN = /^pg(?:-|\/)/u;
+/**
+ * 被禁驱动清单（保留导出名以兼容既有 spec 与调用方）。
+ *
+ * 与「未授权时代」的差异：官方 `pg` 驱动与 `@types/pg` 已从禁止集合转到
+ * `AUTHORIZED_POSTGRES_DRIVER_PACKAGES`；`pg` 家族的前缀规则被收窄为
+ * 「匹配前缀但不在 `DENIED_POSTGRES_DRIVER_PACKAGES` 里才算已授权」。
+ */
+export const FORBIDDEN_POSTGRES_DRIVER_PACKAGES: readonly string[] =
+  DENIED_POSTGRES_DRIVER_PACKAGES;
+
+/** 判定一个包名是否属于**已授权**的官方 pg 驱动家族 */
+export function isAuthorizedDriverPackageName(packageName: string): boolean {
+  return (
+    AUTHORIZED_POSTGRES_DRIVER_PACKAGE_PATTERN.test(packageName) &&
+    !DENIED_POSTGRES_DRIVER_PACKAGES.includes(packageName)
+  );
+}
 
 /** 规范化 pnpm 存储目录名 → 包名（`pg@8.11.3` → `pg`，`@prisma+client@5.0.0_x` → `@prisma/client`） */
 export function normalizeInstalledPackageName(directoryName: string): string {
@@ -257,10 +313,30 @@ export function isForbiddenDriverSpecifier(
   ) {
     return false;
   }
-  if (POSTGRES_DRIVER_FAMILY_PATTERN.test(specifier)) {
-    return true;
+  const normalized = specifier.replace(/^npm:/u, '').replace(/@[^/]+$/u, '');
+  if (isAuthorizedDriverPackageName(normalized)) {
+    return false;
   }
-  return forbidden.some((name) => specifier === name || specifier.startsWith(`${name}/`));
+  return forbidden.some(
+    (name) => specifier === name || specifier.startsWith(`${name}/`) || specifier.startsWith(name),
+  );
+}
+
+/** 判定一个 import specifier 是否指向**已授权**的官方 pg 驱动（用于「驱动导入层」收敛判定） */
+export function isAuthorizedDriverSpecifier(specifier: string): boolean {
+  if (
+    specifier.startsWith('.') ||
+    specifier.startsWith('/') ||
+    specifier.startsWith('node:') ||
+    specifier.startsWith('#')
+  ) {
+    return false;
+  }
+  const normalized = specifier.replace(/^npm:/u, '');
+  const packageName = normalized.startsWith('@')
+    ? normalized.split('/').slice(0, 2).join('/')
+    : (normalized.split('/')[0] ?? normalized);
+  return isAuthorizedDriverPackageName(packageName);
 }
 
 /** 判定一个已安装包名（已规范化）是否被禁 */
@@ -268,7 +344,11 @@ export function isForbiddenDriverPackageName(
   packageName: string,
   forbidden: readonly string[] = FORBIDDEN_POSTGRES_DRIVER_PACKAGES,
 ): boolean {
-  if (POSTGRES_DRIVER_FAMILY_PATTERN.test(packageName)) {
+  if (isAuthorizedDriverPackageName(packageName)) {
+    return false;
+  }
+  if (/^pg(?:-|\/)/u.test(packageName)) {
+    // 家族前缀命中但不在已授权集合里 ⇒ 属于 `DENIED_POSTGRES_DRIVER_PACKAGES`
     return true;
   }
   return forbidden.includes(packageName);
@@ -332,6 +412,16 @@ export type PostgresAdapterBoundaryCode =
   | 'MODULE_PROVIDER_BINDING'
   | 'ADAPTER_REFERENCED_ELSEWHERE'
   | 'PENDING_TOKEN_NOT_BOUND_IN_MODULE'
+  // 已绑定切片（与「未装配」组互斥）
+  | 'BOUND_SLICE_REGISTRATION_CONFLICT'
+  | 'BOUND_SLICE_MODULE_DIRECTORY_MISMATCH'
+  | 'BOUND_SLICE_MODULE_FILE_MISMATCH'
+  | 'BOUND_SLICE_NOT_REFERENCED_BY_MODULE'
+  | 'BOUND_SLICE_TOKEN_NOT_BOUND_IN_MODULE'
+  // 驱动导入层收敛
+  | 'DRIVER_IMPORT_OUTSIDE_DRIVER_LAYER'
+  | 'DRIVER_IMPORT_IN_ADAPTER'
+  | 'AUTHORIZED_DRIVER_NOT_DECLARED'
   // 端口覆盖
   | 'PERSISTENCE_PORT_WITHOUT_ADAPTER'
   | 'PERSISTENCE_PORT_ADAPTER_DUPLICATED'
@@ -414,6 +504,8 @@ export interface PersistencePortModule {
 export interface PostgresAdapterBoundaryInput {
   /** 登记表（生产值即 `POSTGRES_ADAPTER_REGISTRY`；作为输入便于穷举「重复 / 错误登记」） */
   readonly registry: readonly PostgresAdapterDescriptor[];
+  /** 已绑定切片登记表（生产值即 `POSTGRES_BOUND_SLICE_REGISTRY`） */
+  readonly boundSlices?: readonly PostgresBoundSliceDescriptor[];
   /** 豁免表（生产值即 `POSTGRES_ADAPTER_EXEMPTIONS`） */
   readonly exemptions: readonly PostgresAdapterExemption[];
   /** 磁盘自动枚举到的 adapter 文件（相对 `services/api/src`，posix） */
@@ -425,8 +517,15 @@ export interface PostgresAdapterBoundaryInput {
   readonly declaredDependencyNames: readonly string[];
   /** `services/api/src` 下所有 import/require 的 specifier */
   readonly importedSpecifiers: readonly string[];
+  /** `services/api/src` 下**逐文件**的 import specifier（判定「驱动只允许出现在驱动层」） */
+  readonly importedSpecifiersByFile?: readonly {
+    readonly file: string;
+    readonly specifier: string;
+  }[];
   /** pnpm 存储目录里的已安装包名（原始目录名，判定前规范化） */
   readonly installedPackageDirectories: readonly string[];
+  /** 驱动导入层目录（仓库相对 `services/api/src`，posix）；省略时用默认值 */
+  readonly driverLayerDirectory?: string;
 }
 
 /**
@@ -468,14 +567,21 @@ export function evaluatePostgresAdapterBoundary(
 ): PostgresAdapterBoundaryReport {
   const violations: PostgresAdapterBoundaryViolation[] = [];
   const registry = input.registry;
+  const boundSliceTable = input.boundSlices ?? [];
   const exemptionTable = input.exemptions;
+  const driverLayerDirectory = input.driverLayerDirectory ?? 'db/postgres/';
 
-  // ---- 1. 登记表自洽性：命名、目录归属、id/文件/类/导出名唯一 ----
+  // ---- 1. 登记表自洽性：命名、目录归属、id/文件/类/导出名唯一；两组互斥 ----
   const seenIds = new Map<string, string>();
   const seenFiles = new Map<string, string>();
   const seenClasses = new Map<string, string>();
   const seenCapabilityExports = new Map<string, string>();
-  for (const descriptor of registry) {
+  const allDescriptors: readonly (PostgresAdapterDescriptor | PostgresBoundSliceDescriptor)[] = [
+    ...registry,
+    ...boundSliceTable,
+  ];
+  for (const descriptor of allDescriptors) {
+    const isBound = boundSliceTable.some((item) => item.id === descriptor.id);
     if (!descriptor.file.endsWith(POSTGRES_ADAPTER_FILE_SUFFIX)) {
       violations.push(
         violation(
@@ -489,7 +595,7 @@ export function evaluatePostgresAdapterBoundary(
     if (!descriptor.file.startsWith(expectedPrefix)) {
       violations.push(
         violation(
-          'ADAPTER_MODULE_DIRECTORY_MISMATCH',
+          isBound ? 'BOUND_SLICE_MODULE_DIRECTORY_MISMATCH' : 'ADAPTER_MODULE_DIRECTORY_MISMATCH',
           descriptor.id,
           `登记模块 ${descriptor.module} 与文件目录不一致（期望前缀 ${expectedPrefix}）：adapter 必须与被替换的端口同模块`,
         ),
@@ -499,9 +605,9 @@ export function evaluatePostgresAdapterBoundary(
     if (descriptor.moduleFile !== expectedModuleFile) {
       violations.push(
         violation(
-          'ADAPTER_MODULE_FILE_MISMATCH',
+          isBound ? 'BOUND_SLICE_MODULE_FILE_MISMATCH' : 'ADAPTER_MODULE_FILE_MISMATCH',
           descriptor.id,
-          `登记模块文件 ${descriptor.moduleFile} 不是 ${expectedModuleFile}：无法据此判定「业务 Module 未绑定该 adapter」`,
+          `登记模块文件 ${descriptor.moduleFile} 不是 ${expectedModuleFile}：无法据此判定业务 Module 的绑定事实`,
         ),
       );
     }
@@ -525,9 +631,20 @@ export function evaluatePostgresAdapterBoundary(
       map.set(value, descriptor.id);
     }
   }
+  for (const descriptor of boundSliceTable) {
+    if (registry.some((item) => item.id === descriptor.id || item.file === descriptor.file)) {
+      violations.push(
+        violation(
+          'BOUND_SLICE_REGISTRATION_CONFLICT',
+          descriptor.id,
+          '同一个 adapter 同时出现在「未装配」与「已绑定」两张登记表里：两组规则互斥，必须只留一处',
+        ),
+      );
+    }
+  }
 
   // ---- 2. 登记表 ↔ 磁盘：双向比对（缺失登记与陈旧登记都失败） ----
-  const registeredFiles = new Set(registry.map((item) => item.file));
+  const registeredFiles = new Set(allDescriptors.map((item) => item.file));
   const discoveredFiles = new Set(input.discoveredAdapterFiles);
   for (const file of discoveredFiles) {
     if (!registeredFiles.has(file)) {
@@ -535,7 +652,7 @@ export function evaluatePostgresAdapterBoundary(
         violation(
           'ADAPTER_FILE_NOT_REGISTERED',
           file,
-          '磁盘上存在未被登记的 *.postgres-repository.ts：新 adapter 必须在 POSTGRES_ADAPTER_REGISTRY 登记后才能进入门禁',
+          '磁盘上存在未被登记的 *.postgres-repository.ts：新 adapter 必须在 POSTGRES_ADAPTER_REGISTRY 或 POSTGRES_BOUND_SLICE_REGISTRY 登记后才能进入门禁',
         ),
       );
     }
@@ -552,10 +669,11 @@ export function evaluatePostgresAdapterBoundary(
     }
   }
 
-  // ---- 3. 逐 adapter 事实判定 ----
+  // ---- 3. 逐 adapter 事实判定（未装配组 / 已绑定组各自一套规则） ----
   const factsByFile = new Map(input.adapters.map((facts) => [facts.descriptor.file, facts]));
-  const registeredIds = new Set(registry.map((item) => item.id));
-  for (const descriptor of registry) {
+  const registeredIds = new Set(allDescriptors.map((item) => item.id));
+  for (const descriptor of allDescriptors) {
+    const isBound = boundSliceTable.some((item) => item.id === descriptor.id);
     const facts = factsByFile.get(descriptor.file);
     if (facts === undefined) {
       violations.push(
@@ -679,52 +797,90 @@ export function evaluatePostgresAdapterBoundary(
       }
     }
 
-    // 装配边界：adapter 不得带 Nest 痕迹，模块不得引用 adapter，其它文件不得引用 adapter
+    // 装配边界：
+    // - 未装配 adapter：不得带 Nest 痕迹、模块不得引用、其它文件不得引用；
+    // - 已绑定切片：模块**必须**引用绑定点（令牌 + 工厂导出），但 adapter 仍不得带 Nest 痕迹。
     for (const { label, pattern } of NEST_ARTIFACT_PATTERNS) {
       if (pattern.test(facts.source)) {
         violations.push(
           violation(
             'NEST_DECORATOR_IN_ADAPTER',
             descriptor.id,
-            `adapter 源文件出现 Nest 装配痕迹（${label}）：未装配实现不得参与依赖注入`,
+            `adapter 源文件出现 Nest 装配痕迹（${label}）：实现不得自带依赖注入元数据，装配只允许发生在 Module 的工厂里`,
           ),
         );
       }
     }
-    const adapterBasename = descriptor.file.slice(descriptor.file.lastIndexOf('/') + 1);
-    const adapterModuleName = adapterBasename.replace(/\.ts$/u, '');
-    for (const [label, needle] of [
-      ['adapter 模块名', adapterModuleName],
-      ['仓储类名', descriptor.repositoryClass],
-      ['能力导出名', descriptor.capabilitiesExport],
-      ['自检导出名', descriptor.assertExport],
-    ] as const) {
-      if (facts.moduleSource.includes(needle)) {
+    if (isBound) {
+      const bound = descriptor as PostgresBoundSliceDescriptor;
+      if (!facts.moduleSource.includes(bound.factoryExport)) {
         violations.push(
           violation(
-            'MODULE_PROVIDER_BINDING',
+            'BOUND_SLICE_NOT_REFERENCED_BY_MODULE',
             descriptor.id,
-            `${descriptor.moduleFile} 出现 ${label}（${needle}）：业务 Module 仍必须绑定内存基线，换绑属于「启用数据库」那一步`,
+            `${descriptor.moduleFile} 未引用工厂导出 ${bound.factoryExport}：登记为「已绑定」但 Module 里找不到绑定，绑定事实不成立`,
           ),
         );
       }
-    }
-    if (facts.externalReferences.length > 0) {
-      violations.push(
-        violation(
-          'ADAPTER_REFERENCED_ELSEWHERE',
-          descriptor.id,
-          `adapter 被边界之外的文件引用：${facts.externalReferences.join(', ')}`,
-        ),
-      );
-    }
-    for (const token of persistenceTokensOf(input, descriptor.module)) {
-      if (!facts.moduleSource.includes(token)) {
+      if (!facts.moduleSource.includes(bound.token)) {
         violations.push(
           violation(
-            'PENDING_TOKEN_NOT_BOUND_IN_MODULE',
+            'BOUND_SLICE_TOKEN_NOT_BOUND_IN_MODULE',
             descriptor.id,
-            `${descriptor.moduleFile} 里找不到端口令牌 ${token}：登记模块文件与实际装配不符`,
+            `${descriptor.moduleFile} 里找不到绑定的端口令牌 ${bound.token}：换绑必须与登记表同时更新`,
+          ),
+        );
+      }
+    } else {
+      const adapterBasename = descriptor.file.slice(descriptor.file.lastIndexOf('/') + 1);
+      const adapterModuleName = adapterBasename.replace(/\.ts$/u, '');
+      for (const [label, needle] of [
+        ['adapter 模块名', adapterModuleName],
+        ['仓储类名', descriptor.repositoryClass],
+        ['能力导出名', descriptor.capabilitiesExport],
+        ['自检导出名', descriptor.assertExport],
+      ] as const) {
+        if (facts.moduleSource.includes(needle)) {
+          violations.push(
+            violation(
+              'MODULE_PROVIDER_BINDING',
+              descriptor.id,
+              `${descriptor.moduleFile} 出现 ${label}（${needle}）：业务 Module 仍必须绑定内存基线，换绑属于「启用数据库」那一步`,
+            ),
+          );
+        }
+      }
+      if (facts.externalReferences.length > 0) {
+        violations.push(
+          violation(
+            'ADAPTER_REFERENCED_ELSEWHERE',
+            descriptor.id,
+            `adapter 被边界之外的文件引用：${facts.externalReferences.join(', ')}`,
+          ),
+        );
+      }
+      for (const token of persistenceTokensOf(input, descriptor.module)) {
+        if (!facts.moduleSource.includes(token)) {
+          violations.push(
+            violation(
+              'PENDING_TOKEN_NOT_BOUND_IN_MODULE',
+              descriptor.id,
+              `${descriptor.moduleFile} 里找不到端口令牌 ${token}：登记模块文件与实际装配不符`,
+            ),
+          );
+        }
+      }
+    }
+
+    // 驱动导入收敛：adapter（无论是否已绑定）都不得直接 import 已授权的 `pg` 驱动。
+    // 驱动只允许出现在 `db/postgres/` 驱动层，adapter 一律经 `SqlExecutor` 端口。
+    for (const specifier of specifiersOfFile(input, descriptor.file)) {
+      if (isAuthorizedDriverSpecifier(specifier)) {
+        violations.push(
+          violation(
+            'DRIVER_IMPORT_IN_ADAPTER',
+            descriptor.id,
+            `adapter 直接 import 了驱动 ${specifier}：业务实现必须依赖驱动无关的 SqlExecutor 端口，驱动只允许出现在 ${driverLayerDirectory}`,
           ),
         );
       }
@@ -768,26 +924,27 @@ export function evaluatePostgresAdapterBoundary(
   const businessModules = input.persistencePortModules.filter((item) => item.module !== 'db');
   for (const business of businessModules) {
     const adapters = registry.filter((item) => item.module === business.module);
+    const bound = boundSliceTable.filter((item) => item.module === business.module);
     const exemptions = exemptionTable.filter((item) => item.module === business.module);
-    if (adapters.length === 0 && exemptions.length === 0) {
+    if (adapters.length === 0 && bound.length === 0 && exemptions.length === 0) {
       violations.push(
         violation(
           'PERSISTENCE_PORT_WITHOUT_ADAPTER',
           business.module,
-          `模块 ${business.module} 有持久化端口（${business.tokens.join(', ')}）但既没有登记 adapter 也没有豁免理由：必须在 POSTGRES_ADAPTER_REGISTRY 或 POSTGRES_ADAPTER_EXEMPTIONS 登记`,
+          `模块 ${business.module} 有持久化端口（${business.tokens.join(', ')}）但既没有登记 adapter 也没有豁免理由：必须在 POSTGRES_ADAPTER_REGISTRY / POSTGRES_BOUND_SLICE_REGISTRY / POSTGRES_ADAPTER_EXEMPTIONS 登记`,
         ),
       );
     }
-    if (adapters.length > 1) {
+    if (adapters.length + bound.length > 1) {
       violations.push(
         violation(
           'PERSISTENCE_PORT_ADAPTER_DUPLICATED',
           business.module,
-          `模块 ${business.module} 登记了多个 adapter（${adapters.map((item) => item.id).join(', ')}）：一个模块只能有一个持久化适配切片，重复登记会让能力判定重复计数`,
+          `模块 ${business.module} 登记了多个 adapter（${[...adapters, ...bound].map((item) => item.id).join(', ')}）：一个模块只能有一个持久化适配切片，重复登记会让能力判定重复计数`,
         ),
       );
     }
-    if (adapters.length > 0 && exemptions.length > 0) {
+    if ((adapters.length > 0 || bound.length > 0) && exemptions.length > 0) {
       violations.push(
         violation(
           'ADAPTER_EXEMPTION_CONFLICT',
@@ -797,7 +954,7 @@ export function evaluatePostgresAdapterBoundary(
       );
     }
   }
-  for (const descriptor of registry) {
+  for (const descriptor of allDescriptors) {
     if (!businessModules.some((item) => item.module === descriptor.module)) {
       violations.push(
         violation(
@@ -830,14 +987,14 @@ export function evaluatePostgresAdapterBoundary(
     }
   }
 
-  // ---- 5. 驱动 / ORM 依赖：声明、import、已安装三者都不得出现 ----
+  // ---- 5. 驱动依赖：被禁的不得声明 / import / 已安装；已授权的只允许出现在驱动层 ----
   for (const name of input.declaredDependencyNames) {
     if (isForbiddenDriverPackageName(name)) {
       violations.push(
         violation(
           'FORBIDDEN_DRIVER_DEPENDENCY',
           name,
-          'package.json 声明了被禁的 PostgreSQL 驱动 / ORM 依赖：驱动引入属于「启用数据库」那一步，必须与能力声明、集成验证一起发生',
+          'package.json 声明了被禁的 PostgreSQL 驱动 / ORM 依赖：除官方 pg 驱动之外的驱动与 ORM 仍需单独评估',
         ),
       );
     }
@@ -853,6 +1010,37 @@ export function evaluatePostgresAdapterBoundary(
       );
     }
   }
+
+  // 已授权驱动的**导入层收敛**：`pg` 只允许出现在驱动层目录（`db/postgres/`）。
+  const driverImports = (input.importedSpecifiersByFile ?? []).filter((item) =>
+    isAuthorizedDriverSpecifier(item.specifier),
+  );
+  for (const item of driverImports) {
+    if (!item.file.startsWith(driverLayerDirectory)) {
+      violations.push(
+        violation(
+          'DRIVER_IMPORT_OUTSIDE_DRIVER_LAYER',
+          item.file,
+          `已授权的 PostgreSQL 驱动 ${item.specifier} 出现在驱动层之外（允许目录：${driverLayerDirectory}）：换驱动只应改动驱动层`,
+        ),
+      );
+    }
+  }
+  // 反过来：真有人 import 驱动时，必须在 package.json 里**显式声明**（不能只靠传递依赖装上）
+  if (driverImports.length > 0) {
+    for (const required of AUTHORIZED_POSTGRES_DRIVER_PACKAGES) {
+      if (!input.declaredDependencyNames.includes(required)) {
+        violations.push(
+          violation(
+            'AUTHORIZED_DRIVER_NOT_DECLARED',
+            required,
+            `源码 import 了 ${required}，但 package.json 未显式声明该依赖：禁止依赖「被传递依赖悄悄装上」的驱动`,
+          ),
+        );
+      }
+    }
+  }
+
   for (const directory of input.installedPackageDirectories) {
     const name = normalizeInstalledPackageName(directory);
     if (isForbiddenDriverPackageName(name)) {
@@ -866,7 +1054,7 @@ export function evaluatePostgresAdapterBoundary(
     }
   }
 
-  const checkedAdapters = registry.map((item) => item.id);
+  const checkedAdapters = [...registry, ...boundSliceTable].map((item) => item.id);
   return {
     ok: violations.length === 0,
     violations,
@@ -880,6 +1068,13 @@ function persistenceTokensOf(
   module: string,
 ): readonly string[] {
   return input.persistencePortModules.find((item) => item.module === module)?.tokens ?? [];
+}
+
+/** 某个源文件里出现的 import specifier（未提供逐文件事实时返回空数组，由调用方另行判定） */
+function specifiersOfFile(input: PostgresAdapterBoundaryInput, file: string): readonly string[] {
+  return (input.importedSpecifiersByFile ?? [])
+    .filter((item) => item.file === file)
+    .map((item) => item.specifier);
 }
 
 /**

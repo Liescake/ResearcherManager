@@ -7,18 +7,21 @@ import {
   statisticsCountSchema,
 } from './statistics.contract';
 import type { SelfStatisticsView } from './statistics.contract';
+import type { SelfStatisticsRepository } from './statistics.port';
 
 /**
- * 本人统计（`GET /me/statistics`）的 **PostgreSQL 聚合读 adapter（未接入运行时）**。
+ * 本人统计（`GET /me/statistics`）的 **PostgreSQL 聚合读 adapter**。
  *
- * ## 交付边界（本切片刻意不做的事）
- * - **不绑定**到 `StatisticsModule`：模块的四个 provider（四个内存基线 `useFactory`）与四个 DI
- *   令牌一字未改，运行时行为与本切片之前逐字节一致；`db/persistence-bindings.ts` 的端口登记
- *   同样未改动；换绑属于「启用数据库」那一步，必须与驱动引入、集成验证一起发生；
+ * ## 交付边界
+ * - **已接入运行时**：`StatisticsModule` 的 `SELF_STATISTICS_REPOSITORY` 工厂在「解析出
+ *   `DATABASE_URL`」时换绑到本文件的 `createLazyPostgresSelfStatisticsRepository`；未配置数据库时
+ *   仍走四个内存基线组合出的内存聚合基线（默认全零，开发/测试行为不变）；
+ * - **延迟建连**：装配阶段不碰数据库。未 attest 的执行器由启动期持久化边界**结构化拒绝**
+ *   （而不是在这里静默降级成内存实现）；配置了数据库却没拿到执行器工厂时直接抛错；
  * - **不引入** `pg` / Prisma / TypeORM 等驱动或 ORM 依赖：本文件只依赖驱动无关的 `SqlExecutor`
- *   端口（`db/ports/sql-executor.port.ts`），真实执行器由消费方在「启用数据库」那一步显式提供；
- * - **不是 Nest provider**：没有任何 Nest 装饰器（`@Injectable`、`@Inject`、`@Module` 一律没有）、不参与依赖注入、
- *   不注册路由、不改动 `statistics.module.ts` / `statistics.controller.ts`；
+ *   端口（`db/ports/sql-executor.port.ts`），真实执行器由 `SQL_CONNECTION_FACTORY` 提供；
+ * - **不是 Nest provider**：没有任何 Nest 装饰器（`@Injectable`、`@Inject`、`@Module` 一律没有）、
+ *   不参与依赖注入、不注册路由；换绑只发生在 `statistics.module.ts` 的工厂里；
  * - **不声称生产可用**：能力声明固定为 `backend = postgres`、`persistent = true`、
  *   `productionReady = false`（原因见下方「已登记的前置」）。
  *
@@ -66,9 +69,10 @@ import type { SelfStatisticsView } from './statistics.contract';
  *    `INVALID_SUBJECT` 且**一个 SQL 都不执行**（错误信息也不回显该值本身）。
  *
  * ## 已登记的前置（因此 `productionReady` 恒为 false）
- * 驱动依赖未经评估引入、四张来源表（`education_records` / `join_applications` / `achievements` /
- * `ai_match_records`）的 schema 草案与迁移未落地、对真实 PostgreSQL 的集成验证未进行、会话主体
- * `u-student-1` 形不在存储 ID 域内、异步契约尚未迁回 `statistics.port.ts`。这些都已登记在
+ * 四张来源表已由迁移 `0002_education_records.sql` … `0005_ai_match_records.sql` 建出（本切片补齐），
+ * 对真实 PostgreSQL 的集成验证也已在 `db/postgres/__tests__/postgres-integration.spec.ts` 就位；
+ * 但**生产可用**仍需：驱动依赖的评估证据、在 `TEST_DATABASE_URL` 指向的测试库上真实跑过该集成
+ * 套件、会话主体收敛为 UUID、以及聚合列类型在真实驱动下的复核。这些都已登记在
  * `POSTGRES_STATISTICS_REPOSITORY_VERIFICATION_STEPS` 里，不能只写声明。
  */
 
@@ -132,8 +136,9 @@ export const POSTGRES_STATISTICS_REPOSITORY_CAPABILITIES: PersistenceCapabilitie
  * 1. 驱动依赖经评估后引入（`docs/P2-开源复用评估.md` 的 Prisma / TypeORM 比较结论）；
  * 2. 对真实 PostgreSQL 的集成测试：建表迁移、四张来源表的 `user_id` 索引、按主体计数语义、
  *    以及**存储层不产生跨主体计数**（他人记录不出库）；
- * 3. 四张来源表按 `db/schema-drafts/README.md` 的规范创建 schema 草案并转成迁移执行验证
- *    （`db/migrations/0001_bootstrap.sql` 目前只在注释里登记这些表）；
+ * 3. 四张来源表的 schema 已由 `db/migrations/0002_education_records.sql` … `0005_ai_match_records.sql`
+ *    落地；剩余动作是在目标库上执行 `pnpm db:migrate` 并核对 `user_id` 索引确实生效
+ *    （`db/migrations/0001_bootstrap.sql` 只在注释里登记表名，真实建表在这些主题迁移里）；
  * 4. 契约迁回端口：把 `AsyncSelfStatisticsRepository` 从本文件迁入 `statistics.port.ts`，并把
  *    service / controller / 模块的四个内存 provider 绑定一起改为异步实现；
  * 5. 会话主体 `userId` 收敛为 UUID（当前基线是 `u-student-1` 这类安全 ID，不在存储 ID 域内）；
@@ -145,7 +150,7 @@ export const POSTGRES_STATISTICS_REPOSITORY_CAPABILITIES: PersistenceCapabilitie
 export const POSTGRES_STATISTICS_REPOSITORY_VERIFICATION_STEPS = [
   'driver-dependency-evaluated',
   'integration-tests-against-real-postgres',
-  'statistics-source-tables-schema-drafts-created-and-promoted-to-migration',
+  'statistics-source-tables-schema-migrated-and-verified',
   'async-self-statistics-contract-migrated-into-port',
   'session-subject-converged-to-uuid',
   'aggregate-column-types-verified-with-real-driver',
@@ -632,16 +637,9 @@ if (findStatisticsViewExclusionLeaks(SELF_STATISTICS_FIELDS).length > 0) {
 }
 
 /**
- * 本人统计的异步读取契约（**暂放本文件**，见文件头「为什么异步契约暂放在本文件」）。
- *
- * 它与 `statistics.port.ts` 的四个同步端口语义一致：只按**服务端主体**计数、只返回计数、
- * 不做授权判定（资源级判定属于 `AuthorizationGuard`，调用方必须先授权）。
+ * 本人统计的异步读取契约已在 `statistics.port.ts` 落地（`SelfStatisticsRepository`）：本模块只提供
+ * **实现**，不再自带一份契约副本，避免两份定义漂移。
  */
-export interface AsyncSelfStatisticsRepository {
-  readonly capabilities: PersistenceCapabilities;
-  /** 一次聚合读取该主体名下四类记录的条数；主体必须是服务端会话解析出的 ownerUserId */
-  readCountsByUserId(ownerUserId: string): Promise<SelfStatisticsView>;
-}
 
 /**
  * 基于 `SqlExecutor` 的 PostgreSQL 本人统计聚合读仓储。
@@ -650,7 +648,7 @@ export interface AsyncSelfStatisticsRepository {
  * 被降级」或「能力声明被改写」都会 fail-closed，而不是静默继续。
  * 本类**不是** Nest provider（不带任何 Nest 装饰器），也未在任何模块中注册。
  */
-export class PostgresStatisticsRepository implements AsyncSelfStatisticsRepository {
+export class PostgresStatisticsRepository implements SelfStatisticsRepository {
   readonly capabilities: PersistenceCapabilities = POSTGRES_STATISTICS_REPOSITORY_CAPABILITIES;
 
   private readonly executor: SqlExecutor;
@@ -706,4 +704,55 @@ export class PostgresStatisticsRepository implements AsyncSelfStatisticsReposito
 
     return toSelfStatisticsView(row);
   }
+}
+
+/** DI 工厂：把驱动无关的 `SqlExecutor` 装成聚合读端口实现（本切片**唯一**的换绑点） */
+export function createPostgresSelfStatisticsRepository(
+  executor: SqlExecutor,
+): SelfStatisticsRepository {
+  return new PostgresStatisticsRepository(executor);
+}
+
+/** 仅供开发/测试装配以外的地方复用：把「主体必须在存储 ID 域内」变成可先于建连执行的断言 */
+export function assertPostgresStatisticsSubject(ownerUserId: unknown): string {
+  return requireSubject(ownerUserId);
+}
+
+/**
+ * 延迟建连的聚合读端口：**模块装配阶段不碰数据库**。
+ *
+ * 为什么必须延迟：`SQL_CONNECTION_FACTORY.connect()` 在数据库已配置但执行器未通过 attest 契约时
+ * 会抛错。如果在这里急切建连，启动失败会表现为「模块工厂抛了数据库错」，而不是启动期持久化边界
+ * 给出的**结构化违规**（`SQL_EXECUTOR_VERIFICATION_REQUIRED` / `DECLARATION_NOT_SEALED` 等）。
+ * 延迟后，判定顺序保持为「配置 → 持久化边界 → 首次真正读库」，与切片原则一致。
+ *
+ * 连接只在首次读取时建立并被复用；建立失败不缓存失败结果（下一次调用会重试），
+ * 但错误文本一律经 adapter 的 `EXECUTOR_FAILURE` 收敛，不含驱动原文。
+ */
+export function createLazyPostgresSelfStatisticsRepository(
+  resolveExecutor: () => Promise<SqlExecutor>,
+  capabilities: PersistenceCapabilities = POSTGRES_STATISTICS_REPOSITORY_CAPABILITIES,
+): SelfStatisticsRepository {
+  assertPostgresStatisticsRepositoryCapabilities(capabilities);
+
+  let pending: Promise<SqlExecutor> | undefined;
+  const executor = (): Promise<SqlExecutor> => {
+    if (pending === undefined) {
+      pending = resolveExecutor().catch((error: unknown) => {
+        pending = undefined;
+        throw error;
+      });
+    }
+    return pending;
+  };
+
+  return {
+    capabilities,
+    async readCountsByUserId(ownerUserId: string): Promise<SelfStatisticsView> {
+      // 主体域先判、再建连：非存储 ID 域的主体不应该触发任何数据库连接
+      const ownerId = assertPostgresStatisticsSubject(ownerUserId);
+      const resolved = await executor();
+      return new PostgresStatisticsRepository(resolved).readCountsByUserId(ownerId);
+    },
+  };
 }

@@ -20,6 +20,7 @@ import {
 import {
   assertPostgresAdapterBoundary,
   evaluatePostgresAdapterBoundary,
+  isAuthorizedDriverSpecifier,
   isForbiddenDriverPackageName,
   isForbiddenDriverSpecifier,
   normalizeInstalledPackageName,
@@ -28,6 +29,7 @@ import {
   POSTGRES_ADAPTER_FILE_SUFFIX,
   POSTGRES_ADAPTER_REDIRECT_PATTERN,
   POSTGRES_ADAPTER_REGISTRY,
+  POSTGRES_BOUND_SLICE_REGISTRY,
   POSTGRES_CAPABILITY_PROBE_VARIANTS,
   PostgresAdapterBoundaryError,
   type PersistencePortModule,
@@ -142,9 +144,12 @@ function declaredDependencyNames(): readonly string[] {
   return [...names].sort();
 }
 
-/** `services/api/src` 下所有 import / require / 动态 import 的 specifier */
-function importedSpecifiers(): readonly string[] {
-  const specifiers = new Set<string>();
+/** `services/api/src` 下所有 import / require / 动态 import 的 specifier（含所属文件） */
+function importedSpecifiersByFile(): readonly {
+  readonly file: string;
+  readonly specifier: string;
+}[] {
+  const rows: { file: string; specifier: string }[] = [];
   for (const file of sourceFiles()) {
     for (const match of file.content.matchAll(IMPORT_SPECIFIER_PATTERN)) {
       const specifier =
@@ -153,11 +158,19 @@ function importedSpecifiers(): readonly string[] {
         match.groups?.['require'] ??
         match.groups?.['dynamic'];
       if (specifier !== undefined) {
-        specifiers.add(specifier);
+        rows.push({ file: file.relative, specifier });
       }
     }
   }
-  return [...specifiers].sort();
+  return rows.sort(
+    (left, right) =>
+      left.file.localeCompare(right.file) || left.specifier.localeCompare(right.specifier),
+  );
+}
+
+/** `services/api/src` 下所有 import / require / 动态 import 的 specifier（去重升序） */
+function importedSpecifiers(): readonly string[] {
+  return [...new Set(importedSpecifiersByFile().map((item) => item.specifier))].sort();
 }
 
 /**
@@ -220,9 +233,13 @@ function externalReferences(descriptor: PostgresAdapterDescriptor): readonly str
 
 let factsCache: Promise<readonly PostgresAdapterFacts[]> | undefined;
 
-/** 采集全部 adapter 的运行时事实（每个文件只动态 import 一次） */
+/** 采集全部 adapter 的运行时事实（每个文件只动态 import 一次；未装配组 + 已绑定组） */
 function collectAdapterFacts(): Promise<readonly PostgresAdapterFacts[]> {
-  factsCache ??= Promise.all(POSTGRES_ADAPTER_REGISTRY.map(buildAdapterFacts));
+  factsCache ??= Promise.all(
+    [...POSTGRES_ADAPTER_REGISTRY, ...POSTGRES_BOUND_SLICE_REGISTRY].map((descriptor) =>
+      buildAdapterFacts(descriptor as PostgresAdapterDescriptor),
+    ),
+  );
   return factsCache;
 }
 
@@ -290,12 +307,14 @@ function buildCapabilityProbes(
 async function collectedBoundaryInput(): Promise<PostgresAdapterBoundaryInput> {
   return {
     registry: POSTGRES_ADAPTER_REGISTRY,
+    boundSlices: POSTGRES_BOUND_SLICE_REGISTRY,
     exemptions: POSTGRES_ADAPTER_EXEMPTIONS,
     discoveredAdapterFiles: discoverAdapterFiles(),
     adapters: await collectAdapterFacts(),
     persistencePortModules: persistencePortModules(),
     declaredDependencyNames: declaredDependencyNames(),
     importedSpecifiers: importedSpecifiers(),
+    importedSpecifiersByFile: importedSpecifiersByFile(),
     installedPackageDirectories: installedPackageDirectories(),
   };
 }
@@ -307,8 +326,15 @@ async function collectedBoundaryInput(): Promise<PostgresAdapterBoundaryInput> {
 describe('未装配 Postgres adapter 边界：磁盘自动枚举 + 登记表 + 运行时事实', () => {
   it('磁盘枚举到的 adapter 文件与登记表双向一致（数量与集合都固定）', async () => {
     const discovered = discoverAdapterFiles();
-    expect(discovered).toHaveLength(POSTGRES_ADAPTER_REGISTRY.length);
-    expect(discovered).toEqual(POSTGRES_ADAPTER_REGISTRY.map((item) => item.file).sort());
+    const registered = [
+      ...POSTGRES_ADAPTER_REGISTRY.map((item) => item.file),
+      ...POSTGRES_BOUND_SLICE_REGISTRY.map((item) => item.file),
+    ].sort();
+    expect(discovered).toHaveLength(registered.length);
+    expect(discovered).toEqual(registered);
+    // 12 个 adapter：11 个未装配 + 1 个已绑定（statistics）
+    expect(POSTGRES_ADAPTER_REGISTRY).toHaveLength(10);
+    expect(POSTGRES_BOUND_SLICE_REGISTRY.map((item) => item.id)).toEqual(['statistics']);
     // 枚举口径必须由后缀唯一决定：任何名字不以该后缀结尾的 adapter 都不在门禁范围内
     for (const file of discovered) {
       expect(file.endsWith(POSTGRES_ADAPTER_FILE_SUFFIX)).toBe(true);
@@ -320,7 +346,9 @@ describe('未装配 Postgres adapter 边界：磁盘自动枚举 + 登记表 + �
     // 失败时打印全部违规项，便于定位（判定器不抛错，只返回清单）
     expect(report.violations).toEqual([]);
     expect(report.ok).toBe(true);
-    expect(report.checkedAdapters).toEqual(POSTGRES_ADAPTER_REGISTRY.map((item) => item.id));
+    expect(report.checkedAdapters).toEqual(
+      [...POSTGRES_ADAPTER_REGISTRY, ...POSTGRES_BOUND_SLICE_REGISTRY].map((item) => item.id),
+    );
     expect(report.exemptedModules).toEqual(['auth']);
   });
 
@@ -333,6 +361,7 @@ describe('未装配 Postgres adapter 边界：磁盘自动枚举 + 登记表 + �
     const input = await collectedBoundaryInput();
     const covered = new Set([
       ...input.registry.map((item) => item.module),
+      ...(input.boundSlices ?? []).map((item) => item.module),
       ...input.exemptions.map((item) => item.module),
     ]);
     const business = input.persistencePortModules
@@ -341,10 +370,12 @@ describe('未装配 Postgres adapter 边界：磁盘自动枚举 + 登记表 + �
     expect(business.filter((module) => !covered.has(module))).toEqual([]);
     // db 自身（SQL_CONNECTION_FACTORY）不属于业务模块，必须被排除，否则会出现「没有 adapter」的假阳性
     expect(business).not.toContain('db');
-    expect(business.length).toBeGreaterThanOrEqual(POSTGRES_ADAPTER_REGISTRY.length);
+    expect(business.length).toBeGreaterThanOrEqual(
+      POSTGRES_ADAPTER_REGISTRY.length + POSTGRES_BOUND_SLICE_REGISTRY.length,
+    );
   });
 
-  it('无 pg / ORM 驱动依赖：未声明、未 import、未安装', async () => {
+  it('无未授权驱动 / ORM 依赖：官方 pg 已授权，其余仍不得声明 / import / 安装', async () => {
     const input = await collectedBoundaryInput();
     expect(
       input.declaredDependencyNames.filter((name) => isForbiddenDriverPackageName(name)),
@@ -357,12 +388,24 @@ describe('未装配 Postgres adapter 边界：磁盘自动枚举 + 登记表 + �
         .map(normalizeInstalledPackageName)
         .filter((name) => isForbiddenDriverPackageName(name)),
     ).toEqual([]);
-    // 提取器自身有效：真出现驱动名时必须能识别（否则上面的空数组可能是「没扫到」而不是「没有」）
-    expect(isForbiddenDriverSpecifier('pg')).toBe(true);
-    expect(isForbiddenDriverSpecifier('pg-pool')).toBe(true);
+
+    // 官方 pg 驱动已显式声明；且驱动只允许出现在驱动层
+    expect(input.declaredDependencyNames).toContain('pg');
+    expect(input.declaredDependencyNames).toContain('@types/pg');
+    const driverImports = (input.importedSpecifiersByFile ?? []).filter((item) =>
+      isAuthorizedDriverSpecifier(item.specifier),
+    );
+    expect(driverImports.length).toBeGreaterThan(0);
+    expect(driverImports.map((item) => item.file)).toEqual(['db/postgres/postgres-driver.ts']);
+
+    // 提取器自身有效：未授权驱动仍必须被识别（否则上面的空数组可能是「没扫到」而不是「没有」）
+    expect(isForbiddenDriverSpecifier('pg')).toBe(false);
+    expect(isForbiddenDriverSpecifier('pg-native')).toBe(true);
+    expect(isForbiddenDriverSpecifier('typeorm')).toBe(true);
     expect(isForbiddenDriverSpecifier('@prisma/client/edge')).toBe(true);
     expect(isForbiddenDriverSpecifier('./local-module')).toBe(false);
     expect(isForbiddenDriverSpecifier('node:fs')).toBe(false);
+    expect(isAuthorizedDriverSpecifier('pg/lib/client')).toBe(true);
     expect(normalizeInstalledPackageName('@prisma+client@5.0.0_encoding@0.1.0')).toBe(
       '@prisma/client',
     );
@@ -580,12 +623,14 @@ function syntheticInput(
 ): PostgresAdapterBoundaryInput {
   return {
     registry: [syntheticDescriptor()],
+    boundSlices: [],
     exemptions: [],
     discoveredAdapterFiles: [SYNTHETIC_FILE],
     adapters: [syntheticFacts()],
     persistencePortModules: [{ module: 'synthetic', tokens: [SYNTHETIC_MODULE] }],
     declaredDependencyNames: [],
     importedSpecifiers: [],
+    importedSpecifiersByFile: [],
     installedPackageDirectories: [],
     ...overrides,
   };
@@ -877,8 +922,8 @@ describe('fail-closed：合成事实下的缺失 / 重复 / 错误登记一律�
       code: 'EXECUTOR_GUARD_NOT_REJECTING',
     },
     {
-      name: 'package.json 声明了被禁驱动依赖',
-      input: () => syntheticInput({ declaredDependencyNames: ['pg'] }),
+      name: 'package.json 声明了未授权的驱动 / ORM 依赖',
+      input: () => syntheticInput({ declaredDependencyNames: ['typeorm'] }),
       code: 'FORBIDDEN_DRIVER_DEPENDENCY',
     },
     {
@@ -887,9 +932,76 @@ describe('fail-closed：合成事实下的缺失 / 重复 / 错误登记一律�
       code: 'FORBIDDEN_DRIVER_IMPORT',
     },
     {
-      name: 'node_modules 里已装进被禁驱动',
-      input: () => syntheticInput({ installedPackageDirectories: ['pg@8.11.3'] }),
+      name: 'node_modules 里已装进未授权驱动',
+      input: () => syntheticInput({ installedPackageDirectories: ['typeorm@0.3.20'] }),
       code: 'FORBIDDEN_DRIVER_INSTALLED',
+    },
+    {
+      name: '已授权驱动出现在驱动层之外（业务 adapter 直接 import pg）',
+      input: () =>
+        syntheticInput({
+          declaredDependencyNames: ['pg', '@types/pg'],
+          importedSpecifiersByFile: [{ file: SYNTHETIC_FILE, specifier: 'pg' }],
+        }),
+      code: 'DRIVER_IMPORT_IN_ADAPTER',
+    },
+    {
+      name: '已授权驱动出现在驱动层之外（业务代码直接 import pg）',
+      input: () =>
+        syntheticInput({
+          declaredDependencyNames: ['pg', '@types/pg'],
+          importedSpecifiersByFile: [{ file: 'modules/other/other.service.ts', specifier: 'pg' }],
+        }),
+      code: 'DRIVER_IMPORT_OUTSIDE_DRIVER_LAYER',
+    },
+    {
+      name: 'import 了驱动但 package.json 未显式声明',
+      input: () =>
+        syntheticInput({
+          importedSpecifiersByFile: [{ file: 'db/postgres/postgres-driver.ts', specifier: 'pg' }],
+        }),
+      code: 'AUTHORIZED_DRIVER_NOT_DECLARED',
+    },
+    {
+      name: '同一个切片同时登记为未装配与已绑定',
+      input: () =>
+        syntheticInput({
+          boundSlices: [
+            {
+              id: 'synthetic',
+              module: 'synthetic',
+              file: SYNTHETIC_FILE,
+              capabilitiesExport: 'SYNTHETIC_CAPABILITIES',
+              assertExport: 'assertSyntheticCapabilities',
+              repositoryClass: 'SyntheticRepository',
+              moduleFile: 'modules/synthetic/synthetic.module.ts',
+              token: SYNTHETIC_MODULE,
+              factoryExport: 'createSyntheticRepository',
+            },
+          ],
+        }),
+      code: 'BOUND_SLICE_REGISTRATION_CONFLICT',
+    },
+    {
+      name: '登记为已绑定但 Module 里没有引用工厂导出',
+      input: () =>
+        syntheticInput({
+          registry: [],
+          boundSlices: [
+            {
+              id: 'synthetic',
+              module: 'synthetic',
+              file: SYNTHETIC_FILE,
+              capabilitiesExport: 'SYNTHETIC_CAPABILITIES',
+              assertExport: 'assertSyntheticCapabilities',
+              repositoryClass: 'SyntheticRepository',
+              moduleFile: 'modules/synthetic/synthetic.module.ts',
+              token: SYNTHETIC_MODULE,
+              factoryExport: 'createSyntheticRepository',
+            },
+          ],
+        }),
+      code: 'BOUND_SLICE_NOT_REFERENCED_BY_MODULE',
     },
   ])('失败路径：$name → $code', ({ input, code }) => {
     expect(codesOf(input())).toContain(code);
@@ -907,7 +1019,7 @@ describe('fail-closed：合成事实下的缺失 / 重复 / 错误登记一律�
           externalReferences: ['modules/other/other.module.ts'],
         }),
       ],
-      declaredDependencyNames: ['pg'],
+      declaredDependencyNames: ['typeorm'],
     });
     let captured: unknown;
     try {

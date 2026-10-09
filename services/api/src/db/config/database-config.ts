@@ -1,3 +1,4 @@
+import { isAbsolute } from 'node:path';
 import { z } from 'zod';
 
 /**
@@ -18,7 +19,7 @@ import { z } from 'zod';
 /** 允许的连接串协议：只接受 PostgreSQL，其他协议视为配置错误 */
 export const DATABASE_SCHEME_ALLOWLIST = ['postgres:', 'postgresql:'] as const;
 
-/** 允许的 sslmode 取值，以及它们在本项目里的等价开关 */
+/** 允许的 sslmode 取值（连接串查询参数口径），以及它们在本项目里的等价开关 */
 export const DATABASE_SSL_MODE_ALLOWLIST = [
   'disable',
   'allow',
@@ -28,7 +29,26 @@ export const DATABASE_SSL_MODE_ALLOWLIST = [
   'verify-full',
 ] as const;
 
-export type DatabaseSslMode = 'disable' | 'require';
+/**
+ * `DATABASE_SSL_MODE` 环境变量允许的取值（**显式 TLS 档位**，与连接串的 `sslmode` 同义）。
+ *
+ * - `disable`：不使用 TLS（只允许本地回环 / 开发 Compose）；
+ * - `require`：加密但**不校验**服务端身份（中间人可替换证书）；
+ * - `verify-full`：加密 + 校验证书链与主机名（生产唯一可接受档位）。
+ *
+ * 为什么把 `allow` / `prefer` 排除在显式档位之外：它们是「尽量用 TLS」的宽松语义，
+ * 结果取决于服务端能力，属于**不可判定**的档位；显式配置必须给出确定强度。
+ */
+export const DATABASE_SSL_EXPLICIT_MODE_ALLOWLIST = ['disable', 'require', 'verify-full'] as const;
+
+export type DatabaseSslMode = 'disable' | 'require' | 'verify-full';
+
+/** 证书文件路径（**仓库外挂载**，只存路径不存内容） */
+export interface DatabaseTlsFiles {
+  readonly caPath?: string;
+  readonly certPath?: string;
+  readonly keyPath?: string;
+}
 
 export type DatabaseConfigErrorCode =
   | 'DATABASE_URL_REQUIRED_IN_PRODUCTION'
@@ -37,6 +57,8 @@ export type DatabaseConfigErrorCode =
   | 'DATABASE_URL_INCOMPLETE'
   | 'DATABASE_SSL_MODE_UNSUPPORTED'
   | 'DATABASE_SSL_DISABLED_FOR_REMOTE_HOST'
+  | 'DATABASE_TLS_NOT_VERIFIED_IN_PRODUCTION'
+  | 'DATABASE_TLS_FILE_PATH_INVALID'
   | 'DATABASE_NUMERIC_OPTION_INVALID'
   | 'DATABASE_APPLICATION_NAME_INVALID';
 
@@ -60,7 +82,10 @@ export interface ResolvedDatabaseConfig {
   readonly database: string;
   /** 数据库用户（内部使用；`describeDatabaseConfig` 不输出） */
   readonly user: string;
+  /** TLS 档位：`disable` / `require` / `verify-full`（生产只接受 `verify-full`） */
   readonly ssl: DatabaseSslMode;
+  /** TLS 证书文件路径（只存路径；证书内容由驱动在运行时读取，仓库内不写证书） */
+  readonly tls: DatabaseTlsFiles;
   readonly poolMax: number;
   readonly connectTimeoutMs: number;
   readonly statementTimeoutMs: number;
@@ -89,6 +114,14 @@ export interface DatabaseConfigSource {
   readonly NODE_ENV?: string | undefined;
   readonly DATABASE_URL?: string | undefined;
   readonly DATABASE_SSL?: string | boolean | undefined;
+  /** 显式 TLS 档位：disable / require / verify-full（优先于 `DATABASE_SSL` 与连接串 sslmode） */
+  readonly DATABASE_SSL_MODE?: string | undefined;
+  /** CA 证书文件路径（绝对路径；生产 verify-full 建议提供，用于校验证书链） */
+  readonly DATABASE_SSL_CA_PATH?: string | undefined;
+  /** 客户端证书文件路径（双向 TLS，可选） */
+  readonly DATABASE_SSL_CERT_PATH?: string | undefined;
+  /** 客户端私钥文件路径（双向 TLS，可选） */
+  readonly DATABASE_SSL_KEY_PATH?: string | undefined;
   readonly DATABASE_POOL_MAX?: string | number | undefined;
   readonly DATABASE_CONNECT_TIMEOUT_MS?: string | number | undefined;
   readonly DATABASE_STATEMENT_TIMEOUT_MS?: string | number | undefined;
@@ -169,11 +202,25 @@ function resolveSslMode(
   host: string,
   extraLoopbackHosts: readonly string[],
 ): DatabaseSslMode {
+  // 1. 显式档位优先：`DATABASE_SSL_MODE` 是唯一能表达 verify-full 的开关
+  const explicitMode = blankToUndefined(source.DATABASE_SSL_MODE)?.toLowerCase();
+  if (explicitMode !== undefined) {
+    if (!(DATABASE_SSL_EXPLICIT_MODE_ALLOWLIST as readonly string[]).includes(explicitMode)) {
+      throw new DatabaseConfigError(
+        'DATABASE_SSL_MODE_UNSUPPORTED',
+        `DATABASE_SSL_MODE 取值不受支持（允许: ${DATABASE_SSL_EXPLICIT_MODE_ALLOWLIST.join('/')}）`,
+      );
+    }
+    return explicitMode as DatabaseSslMode;
+  }
+
+  // 2. 旧开关 `DATABASE_SSL`：true = 加密（require），false = 关闭
   const explicit = parseBooleanOption(source.DATABASE_SSL);
   if (explicit !== undefined) {
     return explicit ? 'require' : 'disable';
   }
 
+  // 3. 连接串 sslmode
   const sslmode = parsed.searchParams.get('sslmode');
   if (sslmode !== null && sslmode.trim() !== '') {
     const normalized = sslmode.trim().toLowerCase();
@@ -183,12 +230,57 @@ function resolveSslMode(
         `DATABASE_URL 的 sslmode 取值不受支持（允许: ${DATABASE_SSL_MODE_ALLOWLIST.join('/')}）`,
       );
     }
-    // allow/prefer 只是「尽量用 TLS」的宽松语义，本项目按安全优先一律升级为 require
-    return normalized === 'disable' || normalized === 'allow' ? 'disable' : 'require';
+    if (normalized === 'disable' || normalized === 'allow') {
+      return 'disable';
+    }
+    if (normalized === 'verify-ca' || normalized === 'verify-full') {
+      return 'verify-full';
+    }
+    // prefer / require 只是「尽量用 TLS」的宽松语义，本项目按安全优先一律升级为 require
+    return 'require';
   }
 
-  // 未显式配置时：本地回环不强制 TLS，远端主机默认要求 TLS（安全默认值）
+  // 4. 未显式配置时：本地回环不强制 TLS，远端主机默认要求 TLS（安全默认值）
   return isLoopbackHost(host, extraLoopbackHosts) ? 'disable' : 'require';
+}
+
+/**
+ * 证书文件路径解析（**只存路径，不读内容**）。
+ *
+ * 安全约束：证书必须通过挂载卷或环境变量注入到**容器/主机上的绝对路径**；仓库只登记路径。
+ * 相对路径一律拒绝 —— 相对路径意味着证书可能落在仓库工作区内，存在被提交的风险
+ * （`.gitignore` 已排除 `*.pem` / `*.key`，但「不写进仓库」不能只靠忽略规则）。
+ */
+function resolveTlsFiles(source: DatabaseConfigSource): DatabaseTlsFiles {
+  const read = (label: string, value: string | undefined): string | undefined => {
+    const trimmed = blankToUndefined(value);
+    if (trimmed === undefined) {
+      return undefined;
+    }
+    if (!isAbsolute(trimmed) || trimmed.includes('\0')) {
+      throw new DatabaseConfigError(
+        'DATABASE_TLS_FILE_PATH_INVALID',
+        `${label} 必须是绝对路径（证书由挂载卷 / 环境变量注入，不得写入仓库工作区）`,
+      );
+    }
+    return trimmed;
+  };
+
+  const certPath = read('DATABASE_SSL_CERT_PATH', source.DATABASE_SSL_CERT_PATH);
+  const keyPath = read('DATABASE_SSL_KEY_PATH', source.DATABASE_SSL_KEY_PATH);
+  if ((certPath === undefined) !== (keyPath === undefined)) {
+    throw new DatabaseConfigError(
+      'DATABASE_TLS_FILE_PATH_INVALID',
+      'DATABASE_SSL_CERT_PATH 与 DATABASE_SSL_KEY_PATH 必须成对配置（双向 TLS 需要证书与私钥）',
+    );
+  }
+
+  const caPath = read('DATABASE_SSL_CA_PATH', source.DATABASE_SSL_CA_PATH);
+  return {
+    ...(caPath !== undefined ? { caPath } : {}),
+    ...(certPath !== undefined ? { certPath } : {}),
+    ...(keyPath !== undefined ? { keyPath } : {}),
+  };
 }
 
 const numericOptionsSchema = z.object({
@@ -308,11 +400,22 @@ export function resolveDatabaseConfig(
 
   const extraLoopbackHosts = options.loopbackHosts ?? [];
   const ssl = resolveSslMode(parsed, source, host, extraLoopbackHosts);
-  if (isProduction && ssl === 'disable' && !isLoopbackHost(host, extraLoopbackHosts)) {
-    throw new DatabaseConfigError(
-      'DATABASE_SSL_DISABLED_FOR_REMOTE_HOST',
-      '生产环境禁止对非回环主机关闭 TLS（DATABASE_SSL=false / sslmode=disable）：请启用 TLS 或改用本地回环地址',
-    );
+  const tls = resolveTlsFiles(source);
+  if (isProduction) {
+    // 生产 TLS 策略（fail-closed）：只接受 verify-full。
+    // 显式对非回环主机关闭 TLS 保留更具体的错误码，便于定位配置来源。
+    if (ssl === 'disable' && !isLoopbackHost(host, extraLoopbackHosts)) {
+      throw new DatabaseConfigError(
+        'DATABASE_SSL_DISABLED_FOR_REMOTE_HOST',
+        '生产环境禁止对非回环主机关闭 TLS（DATABASE_SSL=false / sslmode=disable）：请启用 TLS 或改用本地回环地址',
+      );
+    }
+    if (ssl !== 'verify-full') {
+      throw new DatabaseConfigError(
+        'DATABASE_TLS_NOT_VERIFIED_IN_PRODUCTION',
+        `生产环境必须使用可校验身份的 TLS（DATABASE_SSL_MODE=verify-full 或 sslmode=verify-full）：当前档位为 ${ssl}，缺失配置按安全默认值处理同样拒绝启动`,
+      );
+    }
   }
 
   const numeric = resolveNumericOptions(source);
@@ -330,6 +433,7 @@ export function resolveDatabaseConfig(
       database,
       user: decodeURIComponent(parsed.username),
       ssl,
+      tls,
       poolMax: numeric.DATABASE_POOL_MAX,
       connectTimeoutMs: numeric.DATABASE_CONNECT_TIMEOUT_MS,
       statementTimeoutMs: numeric.DATABASE_STATEMENT_TIMEOUT_MS,
@@ -356,6 +460,10 @@ export function describeDatabaseConfig(
     port: config.port,
     database: config.database,
     ssl: config.ssl,
+    // 只报告「证书是否已注入」的布尔事实：路径属于主机内部布局，不进入摘要
+    tlsCaConfigured: config.tls.caPath !== undefined,
+    tlsClientCertificateConfigured:
+      config.tls.certPath !== undefined && config.tls.keyPath !== undefined,
     poolMax: config.poolMax,
     connectTimeoutMs: config.connectTimeoutMs,
     statementTimeoutMs: config.statementTimeoutMs,

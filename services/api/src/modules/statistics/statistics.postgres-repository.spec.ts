@@ -292,23 +292,28 @@ describe('能力声明与交付边界', () => {
     ).toBe('production-ready-capability-flipped-with-evidence');
   });
 
-  it('adapter 未装配到模块 / 控制器 / 端口 / 持久化登记', () => {
+  it('adapter 只在装配分流点被引用：模块不 import 仓储类，控制器与端口保持无驱动', () => {
     const moduleSource = readApiFile('src/modules/statistics/statistics.module.ts');
+    // 换绑只发生在模块的工厂里，且只经「延迟建连工厂」导出，不直接引用仓储类
+    expect(moduleSource).toContain('createLazyPostgresSelfStatisticsRepository');
+    expect(moduleSource).toContain('SELF_STATISTICS_REPOSITORY');
     expect(moduleSource).not.toContain('PostgresStatisticsRepository');
-    expect(moduleSource).not.toContain('statistics.postgres-repository');
+    expect(moduleSource).not.toContain('createPostgresSelfStatisticsRepository');
 
     const controllerSource = readApiFile('src/modules/statistics/statistics.controller.ts');
-    expect(controllerSource).not.toContain('PostgresStatisticsRepository');
+    expect(controllerSource).not.toContain('statistics.postgres-repository');
+    expect(controllerSource).not.toMatch(/'pg'/u);
 
-    // 端口不依赖 adapter，且仍是**同步**端口（异步迁移属于「启用数据库」那一步）
+    // 端口只声明契约与令牌，不依赖 adapter，也不 import 驱动
     const portSource = readApiFile('src/modules/statistics/statistics.port.ts');
     expect(portSource).not.toContain('PostgresStatisticsRepository');
-    expect(portSource).not.toMatch(/Promise</u);
-    expect(portSource).toContain('countByUserId(userId: string): number');
+    expect(portSource).not.toMatch(/'pg'/u);
+    expect(portSource).toContain('SelfStatisticsRepository');
+    expect(portSource).toContain('SELF_STATISTICS_REPOSITORY');
 
-    // 持久化登记表仍只登记四个内存令牌，没有引用本 adapter
+    // 持久化登记表登记的是**聚合端口**（四个来源令牌保留为内存 seed 装配点）
     const bindingsSource = readApiFile('src/db/persistence-bindings.ts');
-    expect(bindingsSource).not.toContain('PostgresStatisticsRepository');
+    expect(bindingsSource).toContain('SELF_STATISTICS_REPOSITORY');
     expect(bindingsSource).toContain('EDUCATION_STATISTICS_REPOSITORY');
     expect(bindingsSource).toContain('MATCHING_STATISTICS_REPOSITORY');
   });

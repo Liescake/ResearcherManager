@@ -777,6 +777,7 @@ describe('本人统计：装配边界与纯函数门禁', () => {
       'apiPort',
       'apiPrefix',
       'databaseConfigured',
+      'dependencyGate',
       'nodeEnv',
     ]);
 

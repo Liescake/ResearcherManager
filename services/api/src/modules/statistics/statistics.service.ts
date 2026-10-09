@@ -6,17 +6,10 @@ import {
   STATISTICS_INTEGRITY_MESSAGE,
   assertDeclaredStatisticsQueryFields,
   parseSelfStatisticsView,
-  parseStatisticsCount,
 } from './statistics.contract';
 import type { SelfStatisticsView } from './statistics.contract';
-import {
-  ACHIEVEMENT_STATISTICS_REPOSITORY,
-  APPLICATION_STATISTICS_REPOSITORY,
-  EDUCATION_STATISTICS_REPOSITORY,
-  MATCHING_STATISTICS_REPOSITORY,
-  StatisticsSource,
-} from './statistics.port';
-import type { StatisticsCountRepository } from './statistics.port';
+import { SELF_STATISTICS_REPOSITORY } from './statistics.port';
+import type { SelfStatisticsRepository } from './statistics.port';
 
 /**
  * 统计切片（P8 最小垂直切片，本人侧）：
@@ -33,15 +26,16 @@ import type { StatisticsCountRepository } from './statistics.port';
  *    `SESSION_SUBJECT_RESOLVER` 从服务端会话存储解析），查询串与请求体、自定义头里的
  *    `userId`/`roles`/`scope`/`groupId` 既不能进入判定也不能改变取数主体。
  * 2. **授权先于一切**：四个来源各自的读取门控点先全部判定（见下表），任何一项不通过即整体
- *    403，此时**四个端口方法一次都不会被调用**，未授权主体也拿不到查询串级别的字段反馈
+ *    403，此时**仓储一次都不会被调用**，未授权主体也拿不到查询串级别的字段反馈
  *    （查询串闭集在授权之后才检查，与其它切片「授权先于字段校验」的顺序一致）。
  * 3. **不允许部分放行**：不按「可见类别」拼装响应，因为那会让响应形状随授权结果变化；
  *    本端点要么给出完整且稳定的四个计数，要么 403。这样调用方永远无法从响应形状推断
  *    「自己看不见哪一类」。
- * 4. **逐来源经显式端口取数**：四个 `StatisticsCountRepository` 端口各自独立，仓储只被要求
- *    「按主体计数」，不返回记录；端口装错来源（`capabilities.source` 与预期不符）按服务端缺陷 500。
- * 5. **计数必须合法**：仓储返回非整数/负数/NaN/超上限/非数字一律 500，且日志只写来源与
- *    字段路径，不写返回值；「空数据」是合法的 0，稳定返回四个 0，不是 404/500。
+ * 4. **读数经唯一聚合端口**：服务只依赖 `SELF_STATISTICS_REPOSITORY`（`statistics.port.ts`），
+ *    该端口只被要求「按服务端主体一次读出四类计数」，不返回记录。内存实现由四个来源端口组合，
+ *    持久化实现是一条参数化聚合 `SELECT`；两条路径的计数口径一致。
+ * 5. **计数必须合法**：仓储返回非整数/负数/NaN/超上限/非数字一律 500，且日志只写字段路径，
+ *    不写返回值；「空数据」是合法的 0，稳定返回四个 0，不是 404/500。
  * 6. **出口再校验一次**：聚合视图在返回前过一遍 `.strict()` 白名单，
  *    出现白名单之外的字段即 500，绝不外发。
  *
@@ -69,56 +63,32 @@ export class StatisticsService {
 
   constructor(
     @Inject(AuthorizationGuard) private readonly guard: AuthorizationGuard,
-    @Inject(EDUCATION_STATISTICS_REPOSITORY)
-    private readonly educationRecords: StatisticsCountRepository,
-    @Inject(APPLICATION_STATISTICS_REPOSITORY)
-    private readonly applications: StatisticsCountRepository,
-    @Inject(ACHIEVEMENT_STATISTICS_REPOSITORY)
-    private readonly achievements: StatisticsCountRepository,
-    @Inject(MATCHING_STATISTICS_REPOSITORY)
-    private readonly matchingRequests: StatisticsCountRepository,
+    @Inject(SELF_STATISTICS_REPOSITORY)
+    private readonly selfStatistics: SelfStatisticsRepository,
   ) {}
 
   /**
-   * 本人统计：授权 → 查询串闭集 → 逐来源端口计数 → 出口白名单。
+   * 本人统计：授权 → 查询串闭集 → 聚合端口一次读数 → 出口白名单。
    *
    * `query` 只是「需要被 fail-closed 拒绝的不应存在之物」：本端点不声明任何查询参数，
    * 因此它作为显式参数传入（服务是单例，绝不保存任何请求级状态），且**在授权之后**才检查，
    * 避免未授权主体通过字段级反馈探测端点内部结构。
    */
-  getMyStatistics(subject: AuthorizationSubject, query: unknown): SelfStatisticsView {
-    // 1. 授权先于查询串校验、先于任何端口读取
+  async getMyStatistics(
+    subject: AuthorizationSubject,
+    query: unknown,
+  ): Promise<SelfStatisticsView> {
+    // 1. 授权先于查询串校验、先于任何仓储读取
     this.assertAllSectionsAuthorized(subject);
 
     // 2. 查询串闭集：`?userId=`/`?roles=`/`?scope=`/`?groupId=` 等一律 400，不是静默忽略
     assertDeclaredStatisticsQueryFields(query);
 
-    // 3. 逐来源经各自显式端口，按服务端主体计数（端口不接受任何客户端提交的主体）
-    const view: SelfStatisticsView = {
-      educationRecords: this.readCount(
-        this.educationRecords,
-        StatisticsSource.Education,
-        subject.userId,
-      ),
-      applications: this.readCount(
-        this.applications,
-        StatisticsSource.Applications,
-        subject.userId,
-      ),
-      achievements: this.readCount(
-        this.achievements,
-        StatisticsSource.Achievements,
-        subject.userId,
-      ),
-      matchingRequests: this.readCount(
-        this.matchingRequests,
-        StatisticsSource.Matching,
-        subject.userId,
-      ),
-    };
+    // 3. 聚合端口一次读数：主体只来自服务端会话
+    const counts = await this.readCounts(subject.userId);
 
     // 4. 出口白名单门禁
-    return this.assertView(view);
+    return this.assertView(counts);
   }
 
   /**
@@ -143,26 +113,24 @@ export class StatisticsService {
   }
 
   /**
-   * 端口取数 + 读取契约校验。
-   * 违规（含端口装错来源）一律 500；日志只写来源与字段路径，不写返回值本身，
-   * 因此即便仓储返回了记录/对象/PII，也不会经由日志或响应外发。
+   * 聚合端口取数 + 读取契约校验。
+   * 违规（含持久化实现抛出的任何异常）一律 500；日志只写字段路径，**不写读取结果与异常原文**，
+   * 因此即便仓储返回了记录/对象/PII，或驱动异常里带着连接信息，也不会经由日志或响应外发。
    */
-  private readCount(
-    source: StatisticsCountRepository,
-    name: StatisticsSource,
-    userId: string,
-  ): number {
-    if (source.capabilities.source !== name) {
-      this.logger.error(
-        `[statistics] 统计来源装配错误: 端口期望 ${name}，实际 ${String(source.capabilities.source)}`,
-      );
+  private async readCounts(ownerUserId: string): Promise<SelfStatisticsView> {
+    let counts: unknown;
+    try {
+      counts = await this.selfStatistics.readCountsByUserId(ownerUserId);
+    } catch {
+      // 原始异常文本可能含连接串、SQL 与字段取值，一律不外发（也不写日志）
+      this.logger.error('[statistics] 聚合读数失败：原始异常不外发（见持久化层脱敏口径）');
       throw new InternalServerErrorException(STATISTICS_INTEGRITY_MESSAGE);
     }
 
-    const parsed = parseStatisticsCount(source.countByUserId(userId));
+    const parsed = parseSelfStatisticsView(counts);
     if (!parsed.ok) {
       this.logger.error(
-        `[statistics] ${name} 计数违反读取契约: ${parsed.issues
+        `[statistics] 聚合读数违反读取契约: ${parsed.issues
           .map((issue) => `${issue.path}(${issue.kind})`)
           .join(', ')}`,
       );

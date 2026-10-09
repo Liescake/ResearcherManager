@@ -1,3 +1,5 @@
+import type { SelfStatisticsView } from './statistics.contract';
+
 /**
  * 统计切片（`GET /me/statistics`）的**四个显式计数读取端口**。
  *
@@ -81,3 +83,40 @@ export const STATISTICS_REPOSITORY_TOKEN_NAMES: Readonly<Record<StatisticsSource
   [StatisticsSource.Achievements]: 'ACHIEVEMENT_STATISTICS_REPOSITORY',
   [StatisticsSource.Matching]: 'MATCHING_STATISTICS_REPOSITORY',
 };
+
+/**
+ * 聚合读数端口的能力声明（与四个来源端口同形，但**按后端**而不是按来源声明）。
+ *
+ * 为什么需要这一档：四个同步端口各自只能回答「某一个来源有几条」，而持久化实现必须一次聚合查询
+ * 读出四类计数（否则四次往返会让「同一响应里的四个数」来自四个不同时间点）。因此本切片把
+ * 「本人统计的读数」收敛成**一个**端口，能力声明只保留后端与持久性。
+ */
+export interface SelfStatisticsCapabilities {
+  readonly backend: string;
+  readonly persistent: boolean;
+  readonly productionReady: boolean;
+}
+
+/**
+ * 本人统计的**聚合读端口**（异步）。
+ *
+ * - 一次调用返回四类计数，语义与四个来源端口之和一致（默认全零：空数据不是异常）；
+ * - 只按**服务端主体**计数，不接受客户端提交的主体，也不做授权判定（调用方必须先授权）；
+ * - 不返回记录、主键与任何字段取值：聚合输出在结构上不可能携带记录内容与 PII；
+ * - SQL 实现必须走参数化（`$1::uuid`），且返回行要过严格行契约后才允许变成公开视图。
+ */
+export interface SelfStatisticsRepository {
+  readonly capabilities: SelfStatisticsCapabilities;
+  /** 只按服务端主体聚合计数；主体由 `SESSION_SUBJECT_RESOLVER` 解析 */
+  readCountsByUserId(ownerUserId: string): Promise<SelfStatisticsView>;
+}
+
+/**
+ * DI 令牌：本人统计的聚合读端口。
+ *
+ * 换绑点只有一处（`statistics.module.ts` 的 provider）：
+ * - 未配置数据库 → 由四个内存来源端口组合出的内存聚合基线；
+ * - 已配置数据库 → PostgreSQL 聚合读 adapter（延迟建连：模块装配阶段**不**碰数据库，
+ *   因此「数据库已配置但执行器未 attest」仍然由启动期持久化边界拒绝，而不是在这里静默降级）。
+ */
+export const SELF_STATISTICS_REPOSITORY = Symbol('SELF_STATISTICS_REPOSITORY');

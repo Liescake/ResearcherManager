@@ -394,13 +394,13 @@ describe('数据库配置工厂：fail-closed', () => {
     const env = loadEnv({
       NODE_ENV: 'production',
       DATABASE_URL: LOOPBACK_URL,
-      DATABASE_SSL: 'false',
+      DATABASE_SSL_MODE: 'verify-full',
       DATABASE_POOL_MAX: '20',
     });
     const resolution = resolveAppDatabaseConfig(env);
     expect(resolution).toMatchObject({
       status: 'configured',
-      config: { poolMax: 20, applicationName: 'researcher-manager-api', ssl: 'disable' },
+      config: { poolMax: 20, applicationName: 'researcher-manager-api', ssl: 'verify-full' },
     });
     if (resolution.status !== 'configured') {
       throw new Error('测试前置失败：配置应为 configured');
@@ -447,7 +447,7 @@ describe('PersistenceBoundaryService：生产边界守卫', () => {
     const env = loadEnv({
       NODE_ENV: 'production',
       DATABASE_URL: LOOPBACK_URL,
-      DATABASE_SSL: 'false',
+      DATABASE_SSL_MODE: 'verify-full',
     });
     const service = buildService(env, IN_MEMORY);
     const boundaryError = captureBoundaryFailure(service);
@@ -493,7 +493,7 @@ describe('PersistenceBoundaryService：生产边界守卫', () => {
     const env = loadEnv({
       NODE_ENV: 'production',
       DATABASE_URL: LOOPBACK_URL,
-      DATABASE_SSL: 'false',
+      DATABASE_SSL_MODE: 'verify-full',
     });
     const service = buildServiceWithSqlInstance(env, VERIFIED_POSTGRES, attestedExecutor());
     expect(service.verify().ok).toBe(true);
@@ -503,7 +503,7 @@ describe('PersistenceBoundaryService：生产边界守卫', () => {
     const env = loadEnv({
       NODE_ENV: 'production',
       DATABASE_URL: LOOPBACK_URL,
-      DATABASE_SSL: 'false',
+      DATABASE_SSL_MODE: 'verify-full',
     });
     const service = buildService(env, VERIFIED_POSTGRES);
     const boundaryError = captureBoundaryFailure(service);
@@ -835,7 +835,11 @@ describe('端口登记表：漂移门禁与卫生检查', () => {
 
 describe('生产依赖就绪门禁：认证先行、封存与证据、伪造能力自述', () => {
   const productionEnv = (): AppEnv =>
-    loadEnv({ NODE_ENV: 'production', DATABASE_URL: LOOPBACK_URL, DATABASE_SSL: 'false' });
+    loadEnv({
+      NODE_ENV: 'production',
+      DATABASE_URL: LOOPBACK_URL,
+      DATABASE_SSL_MODE: 'verify-full',
+    });
   const configuredTestEnv = (): AppEnv => loadEnv({ NODE_ENV: 'test', DATABASE_URL: LOOPBACK_URL });
 
   /** 「自称持久且生产可用」的可变字面量：这正是需要被拦下的伪造路径 */
@@ -1127,13 +1131,13 @@ describe('生产依赖就绪门禁：认证先行、封存与证据、伪造能�
 describe('生产依赖就绪门禁：真实 Nest 装配（不建连接）', () => {
   const originalDatabaseUrl = process.env.DATABASE_URL;
   const originalNodeEnv = process.env.NODE_ENV;
-  const originalSsl = process.env.DATABASE_SSL;
+  const originalSslMode = process.env.DATABASE_SSL_MODE;
 
   afterAll(() => {
     for (const [key, value] of [
       ['DATABASE_URL', originalDatabaseUrl],
       ['NODE_ENV', originalNodeEnv],
-      ['DATABASE_SSL', originalSsl],
+      ['DATABASE_SSL_MODE', originalSslMode],
     ] as const) {
       if (value === undefined) {
         delete process.env[key];
@@ -1146,7 +1150,7 @@ describe('生产依赖就绪门禁：真实 Nest 装配（不建连接）', () =
   it('生产环境 + 伪造能力自述的持久化绑定：装配在引导阶段被依赖就绪门禁拒绝', async () => {
     process.env.NODE_ENV = 'production';
     process.env.DATABASE_URL = LOOPBACK_URL;
-    process.env.DATABASE_SSL = 'false';
+    process.env.DATABASE_SSL_MODE = 'verify-full';
 
     const forged = { backend: 'postgres', persistent: true, productionReady: true };
 

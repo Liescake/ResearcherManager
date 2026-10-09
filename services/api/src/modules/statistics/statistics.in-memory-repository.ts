@@ -1,8 +1,11 @@
 import type { AppEnv } from '../../config/env';
-import { parseStatisticsCount } from './statistics.contract';
+import { parseSelfStatisticsView, parseStatisticsCount } from './statistics.contract';
+import type { SelfStatisticsView } from './statistics.contract';
 import {
   STATISTICS_REPOSITORY_TOKEN_NAMES,
   StatisticsSource,
+  type SelfStatisticsCapabilities,
+  type SelfStatisticsRepository,
   type StatisticsCountCapabilities,
   type StatisticsCountRepository,
 } from './statistics.port';
@@ -81,4 +84,102 @@ export function createAchievementStatisticsRepository(env: AppEnv): StatisticsCo
 /** DI 工厂：匹配请求计数来源（内存基线） */
 export function createMatchingStatisticsRepository(env: AppEnv): StatisticsCountRepository {
   return new InMemoryStatisticsCountRepository(env, StatisticsSource.Matching);
+}
+
+/** 聚合端口的内存基线所需的四个来源（由模块的四个 provider 注入，便于测试逐来源 seed） */
+export interface InMemorySelfStatisticsSources {
+  readonly education: StatisticsCountRepository;
+  readonly applications: StatisticsCountRepository;
+  readonly achievements: StatisticsCountRepository;
+  readonly matching: StatisticsCountRepository;
+}
+
+/**
+ * `SelfStatisticsRepository` 的**内存聚合基线**：把四个来源端口组合成一次读数。
+ *
+ * 为什么组合而不是另存一份 `Map`：四个来源端口是「本人有数据 / 他人有数据」这类场景的既有
+ * 装配点（控制器 spec 直接对它们 `seed()`），组合后内存路径与持久化路径的语义差异只剩
+ * 「一条聚合 SELECT」与「四次内存查表」—— 计数口径完全一致，测试夹具不需要改写。
+ *
+ * 能力声明如实为 `persistent = false`、`productionReady = false`，并在 `NODE_ENV=production`
+ * 下拒绝构造（与四个来源基线同一口径）。
+ */
+export class InMemorySelfStatisticsRepository implements SelfStatisticsRepository {
+  readonly capabilities: SelfStatisticsCapabilities = Object.freeze({
+    backend: 'in-memory-baseline',
+    persistent: false,
+    productionReady: false,
+  });
+
+  constructor(
+    env: AppEnv,
+    private readonly sources: InMemorySelfStatisticsSources,
+  ) {
+    if (env.NODE_ENV === 'production') {
+      throw new Error(
+        '生产环境禁止使用内存统计聚合基线（InMemorySelfStatisticsRepository）：请把 SELF_STATISTICS_REPOSITORY 绑定到持久化实现',
+      );
+    }
+  }
+
+  async readCountsByUserId(ownerUserId: string): Promise<SelfStatisticsView> {
+    const candidate = {
+      educationRecords: this.read(this.sources.education, StatisticsSource.Education, ownerUserId),
+      applications: this.read(
+        this.sources.applications,
+        StatisticsSource.Applications,
+        ownerUserId,
+      ),
+      achievements: this.read(
+        this.sources.achievements,
+        StatisticsSource.Achievements,
+        ownerUserId,
+      ),
+      matchingRequests: this.read(this.sources.matching, StatisticsSource.Matching, ownerUserId),
+    };
+    const parsed = parseSelfStatisticsView(candidate);
+    if (!parsed.ok) {
+      throw new Error(
+        `内存统计聚合基线读数违反读取契约: ${parsed.issues
+          .map((issue) => `${issue.path}(${issue.kind})`)
+          .join(', ')}`,
+      );
+    }
+    return parsed.value;
+  }
+
+  /**
+   * 单来源读数：先复核端口**声明的来源**与它被装配到的槽位一致，再校验计数值。
+   *
+   * 「端口装错来源」不会返回错误数字，而是返回**另一类口径**的数字 —— 那比报错更危险，
+   * 因为它看起来完全正常。因此这里 fail-closed，与持久化实现的「列清单 / 行契约」同一口径。
+   */
+  private read(
+    source: StatisticsCountRepository,
+    expected: StatisticsSource,
+    ownerUserId: string,
+  ): number {
+    if (source.capabilities.source !== expected) {
+      throw new Error(
+        `内存统计来源装配错误: 端口期望 ${expected}，实际 ${String(source.capabilities.source)}`,
+      );
+    }
+    const parsed = parseStatisticsCount(source.countByUserId(ownerUserId));
+    if (!parsed.ok) {
+      throw new Error(
+        `内存统计来源读数违反读取契约: ${parsed.issues
+          .map((issue) => `${issue.path}(${issue.kind})`)
+          .join(', ')}`,
+      );
+    }
+    return parsed.value;
+  }
+}
+
+/** DI 工厂：内存聚合基线（未配置数据库时的默认绑定） */
+export function createInMemorySelfStatisticsRepository(
+  env: AppEnv,
+  sources: InMemorySelfStatisticsSources,
+): SelfStatisticsRepository {
+  return new InMemorySelfStatisticsRepository(env, sources);
 }

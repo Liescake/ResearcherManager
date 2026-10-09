@@ -1,4 +1,5 @@
 import {
+  Global,
   Inject,
   Injectable,
   Logger,
@@ -30,6 +31,7 @@ import {
 import {
   collectSqlExecutorVerificationInput,
   DEFAULT_SQL_EXECUTOR_VERIFICATION_REGISTRY,
+  type SqlExecutorVerificationRegistry,
 } from './ports/sql-executor-verification';
 import {
   createUnavailableSqlConnectionFactory,
@@ -37,6 +39,13 @@ import {
   type PersistenceCapabilities,
   type SqlConnectionFactory,
 } from './ports/sql-executor.port';
+import {
+  POSTGRES_ATTESTATION_ABSENT,
+  registerPostgresExecutorAttestation,
+  resolvePostgresAttestationRegistration,
+} from './postgres/postgres-attestation';
+import { createPostgresSqlConnectionFactory } from './postgres/postgres-executor';
+import type { PostgresPoolFactory } from './postgres/postgres-pool';
 
 /**
  * 数据库基础设施模块（PostgreSQL 持久化基础层）。
@@ -77,6 +86,16 @@ export const DATABASE_CONFIG = Symbol('DATABASE_CONFIG');
 /** 未注册真实驱动时的说明：出现在 `DatabaseUnavailableError` 里，便于定位「为什么连不上」 */
 export const UNAVAILABLE_DRIVER_REASON =
   '尚未选定并验证 PostgreSQL 驱动（Prisma / TypeORM 选型未完成）：运行时不得切换到未验证数据库';
+
+/** 应用执行器工厂的接线选项（测试与未来的多后端场景可换一份登记表 / 池工厂） */
+export interface AppSqlConnectionFactoryOptions {
+  /** 封存身份集合；省略时使用 `DEFAULT_SQL_EXECUTOR_VERIFICATION_REGISTRY` */
+  readonly registry?: SqlExecutorVerificationRegistry;
+  /** 判定时刻；省略时取当前时间 */
+  readonly now?: string;
+  /** 池工厂；省略时使用真实 `pg` 实现 */
+  readonly poolFactory?: PostgresPoolFactory;
+}
 
 // ---------------------------------------------------------------------------
 // 容器读取基元（能力边界与依赖就绪门禁共用同一实现，避免两份读取口径漂移）
@@ -353,11 +372,42 @@ export function resolveAppDatabaseConfig(env: AppEnv): DatabaseConfigResolution 
   return resolveDatabaseConfig(env, { defaultApplicationName: 'researcher-manager-api' });
 }
 
-/** `SQL_CONNECTION_FACTORY` 的工厂：当前一律返回 fail-closed 的未验证驱动工厂 */
-export function createAppSqlConnectionFactory(): SqlConnectionFactory {
-  return createUnavailableSqlConnectionFactory(UNAVAILABLE_DRIVER_REASON);
+/**
+ * `SQL_CONNECTION_FACTORY` 的工厂。
+ *
+ * - 未配置 `DATABASE_URL`（或未解析成功）→ **fail-closed 的未验证驱动工厂**（无数据库启动保持现状）；
+ * - 已配置但缺 attest 取证事实（`DATABASE_EXECUTOR_*` / `DATABASE_SCHEMA_*` / `DATABASE_MIGRATION_*`）
+ *   → 同样是未验证驱动工厂：代码**不生成**「已验证」，由启动期持久化边界判定拒绝；
+ * - 已配置且取证事实齐全 → 登记证据并创建**受 attest 约束的真实 `pg` 执行器**。
+ *   若证据形状非法 / 迁移版本不一致（例如仍有未应用迁移），这里会直接抛错终止启动。
+ */
+export function createAppSqlConnectionFactory(
+  env?: AppEnv,
+  resolution?: DatabaseConfigResolution,
+  options: AppSqlConnectionFactoryOptions = {},
+): SqlConnectionFactory {
+  if (env === undefined || resolution === undefined || resolution.status !== 'configured') {
+    return createUnavailableSqlConnectionFactory(UNAVAILABLE_DRIVER_REASON);
+  }
+
+  const registration = resolvePostgresAttestationRegistration(env);
+  if (registration === undefined) {
+    return createUnavailableSqlConnectionFactory(POSTGRES_ATTESTATION_ABSENT);
+  }
+
+  const registry = options.registry ?? DEFAULT_SQL_EXECUTOR_VERIFICATION_REGISTRY;
+  const attestation = registerPostgresExecutorAttestation(registry, registration);
+  return createPostgresSqlConnectionFactory({
+    config: resolution.config,
+    registry,
+    attestation,
+    nodeEnv: env.NODE_ENV,
+    ...(options.now === undefined ? {} : { now: options.now }),
+    ...(options.poolFactory === undefined ? {} : { poolFactory: options.poolFactory }),
+  });
 }
 
+@Global()
 @Module({
   providers: [
     {
@@ -367,7 +417,9 @@ export function createAppSqlConnectionFactory(): SqlConnectionFactory {
     },
     {
       provide: SQL_CONNECTION_FACTORY,
-      useFactory: () => createAppSqlConnectionFactory(),
+      useFactory: (env: AppEnv, resolution: DatabaseConfigResolution): SqlConnectionFactory =>
+        createAppSqlConnectionFactory(env, resolution),
+      inject: [APP_ENV, DATABASE_CONFIG],
     },
     PersistenceBoundaryService,
   ],
