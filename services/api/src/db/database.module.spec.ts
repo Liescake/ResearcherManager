@@ -11,6 +11,7 @@ import { loadEnv, type AppEnv } from '../config/env';
 import { InMemorySessionStore } from '../modules/auth/session-store.in-memory';
 import { SESSION_STORE } from '../modules/auth/session-subject.port';
 import { DatabaseConfigError, describeDatabaseConfig } from './config/database-config';
+import type { ResolvedDatabaseConfig } from './config/database-config';
 import {
   createAppSqlConnectionFactory,
   DATABASE_CONFIG,
@@ -38,9 +39,11 @@ import {
 import { PersistenceBoundaryError } from './persistence/production-guard';
 import { MIGRATION_DEPLOYMENT_GUARD_CONTRACT } from './migrations/migration-deployment-guard';
 import {
+  createSqlExecutorVerificationRegistry,
   DEFAULT_SQL_EXECUTOR_VERIFICATION_REGISTRY,
   SQL_EXECUTOR_VERIFICATION_CONTRACT_ID,
   SQL_EXECUTOR_VERIFICATION_CONTRACT_VERSION,
+  SqlExecutorVerificationError,
   type SqlExecutorVerificationMethod,
 } from './ports/sql-executor-verification';
 import {
@@ -432,6 +435,122 @@ describe('SQL 连接工厂：默认绑定未验证驱动（不切换运行时 pr
     await expect(factory.connect(resolution.config)).rejects.toBeInstanceOf(
       DatabaseUnavailableError,
     );
+  });
+});
+
+/**
+ * `env.ts` 的取证字段与 `resolvePostgresAttestationRegistration(env)` 的类型契约（本次修复点）：
+ * 事实只来自显式配置；缺一项就退回未验证驱动，代码绝不生成「已验证」，也绝不把缺失说成已应用。
+ */
+describe('SQL 连接工厂：生产取证事实只来自显式配置（不臆造「已验证」）', () => {
+  /** 完整、自洽的取证事实：每一项都必须由做过验证的人 / CI 显式提供 */
+  const ATTESTATION_ENV: Record<string, string> = {
+    DATABASE_EXECUTOR_EVIDENCE_ID: 'ev-clean-checkout-1',
+    DATABASE_EXECUTOR_VERIFIED_BY: 'ci/integration',
+    DATABASE_EXECUTOR_VERIFIED_AT: '2026-01-01T00:00:00Z',
+    DATABASE_EXECUTOR_EVIDENCE_REF:
+      'services/api/src/db/postgres/__tests__/postgres-integration.spec.ts',
+    DATABASE_EXECUTOR_EVIDENCE_METHOD: 'integration-test',
+    DATABASE_SCHEMA_READINESS_ID: 'rd-clean-checkout-1',
+    DATABASE_SCHEMA_CHECKED_BY: 'ci/integration',
+    DATABASE_SCHEMA_CHECKED_AT: '2026-01-01T00:00:00Z',
+    DATABASE_SCHEMA_READINESS_REF: 'pnpm db:migrate:status',
+    DATABASE_MIGRATION_AVAILABLE_VERSIONS: '0001',
+    DATABASE_MIGRATION_APPLIED_VERSIONS: '0001',
+  };
+
+  /** 判定时刻显式注入：与取证时间同为固定值，判定可复现（不读取真实时钟） */
+  const JUDGE_NOW = '2026-01-02T00:00:00Z';
+
+  function configuredConfig(env: AppEnv): ResolvedDatabaseConfig {
+    const resolution = resolveAppDatabaseConfig(env);
+    if (resolution.status !== 'configured') {
+      throw new Error('测试前置失败：配置应为 configured');
+    }
+    return resolution.config;
+  }
+
+  it('取证事实缺失：工厂仍是未验证驱动，登记表一条证据都不落', async () => {
+    const env = devEnv({ DATABASE_URL: LOOPBACK_URL });
+    const registry = createSqlExecutorVerificationRegistry();
+    const factory = createAppSqlConnectionFactory(env, resolveAppDatabaseConfig(env), { registry });
+
+    expect(factory.capabilities).toEqual({
+      backend: UNVERIFIED_DRIVER_BACKEND,
+      persistent: false,
+      productionReady: false,
+    });
+    // 空登记表本身就是一条证据：没有显式事实就不签发封存身份
+    expect(registry.describe()).toEqual({
+      sealedDeclarations: 0,
+      verificationEvidence: 0,
+      schemaReadiness: 0,
+    });
+    await expect(factory.connect(configuredConfig(env))).rejects.toBeInstanceOf(
+      DatabaseUnavailableError,
+    );
+  });
+
+  it('取证事实齐全：登记验证证据与迁移就绪证据，并签发封存的生产执行器声明', () => {
+    const env = devEnv({ DATABASE_URL: LOOPBACK_URL, ...ATTESTATION_ENV });
+    const registry = createSqlExecutorVerificationRegistry();
+    const factory = createAppSqlConnectionFactory(env, resolveAppDatabaseConfig(env), { registry });
+
+    expect(registry.describe()).toEqual({
+      sealedDeclarations: 1,
+      verificationEvidence: 1,
+      schemaReadiness: 1,
+    });
+    expect(factory.capabilities).toMatchObject({
+      backend: 'postgres',
+      persistent: true,
+      productionReady: true,
+      parameterizedQueries: true,
+      transactions: true,
+      verification: { evidenceId: ATTESTATION_ENV.DATABASE_EXECUTOR_EVIDENCE_ID },
+    });
+    expect(registry.isSealed(factory.capabilities)).toBe(true);
+  });
+
+  it('事实缺一项（未给出已应用版本）：同样退回未验证驱动，不把缺失当成「已应用」', () => {
+    const env = devEnv({
+      DATABASE_URL: LOOPBACK_URL,
+      ...ATTESTATION_ENV,
+      DATABASE_MIGRATION_APPLIED_VERSIONS: '',
+    });
+    const registry = createSqlExecutorVerificationRegistry();
+    const factory = createAppSqlConnectionFactory(env, resolveAppDatabaseConfig(env), { registry });
+
+    expect(factory.capabilities).toEqual({
+      backend: UNVERIFIED_DRIVER_BACKEND,
+      persistent: false,
+      productionReady: false,
+    });
+    expect(registry.describe().sealedDeclarations).toBe(0);
+  });
+
+  it('事实不一致（尚有未应用迁移）：连接前即被契约拒绝，交不出「已验证」的连接', async () => {
+    const env = devEnv({
+      DATABASE_URL: LOOPBACK_URL,
+      ...ATTESTATION_ENV,
+      DATABASE_MIGRATION_AVAILABLE_VERSIONS: '0001,0002',
+    });
+    const registry = createSqlExecutorVerificationRegistry();
+    const factory = createAppSqlConnectionFactory(env, resolveAppDatabaseConfig(env), {
+      registry,
+      now: JUDGE_NOW,
+    });
+
+    let captured: unknown;
+    try {
+      await factory.connect(configuredConfig(env));
+    } catch (error) {
+      captured = error;
+    }
+    expect(captured).toBeInstanceOf(SqlExecutorVerificationError);
+    expect((captured as SqlExecutorVerificationError).violations.map((item) => item.code)).toEqual([
+      'SCHEMA_READINESS_PENDING_MIGRATIONS',
+    ]);
   });
 });
 

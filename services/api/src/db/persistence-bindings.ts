@@ -8,6 +8,7 @@ import { GROUP_REPOSITORY } from '../modules/groups/groups.port';
 import { MATCHING_AI_PROVIDER, MATCHING_FEATURE_SOURCE } from '../modules/matching/matching.port';
 import { MATCHING_REPOSITORY } from '../modules/matching/matching.port';
 import { APPLICATION_REPOSITORY } from '../modules/memberships/applications.port';
+import { APPLICATION_REVIEW_REPOSITORY } from '../modules/memberships/application-reviews.port';
 import { NOTIFICATION_REPOSITORY } from '../modules/notifications/notifications.port';
 import { PROFILE_REPOSITORY } from '../modules/profiles/student-profile.port';
 import { RUOYI_AUTHZ_ADAPTER } from '../modules/ruoyi-adapter/ruoyi-adapter.port';
@@ -75,6 +76,13 @@ export const PERSISTENCE_BINDINGS: readonly PersistenceBindingDescriptor[] = [
     token: APPLICATION_REPOSITORY,
     module: 'memberships',
     responsibility: '入组申请存储',
+    role: 'business',
+  },
+  {
+    token: APPLICATION_REVIEW_REPOSITORY,
+    module: 'memberships',
+    responsibility:
+      '入组申请审核端读写（按服务端解析的小组/全局范围）：与申请人端口是**两个独立绑定**，因此生产门禁分别判定，不会因申请人端已换绑就默认审核端也持久',
     role: 'business',
   },
   {
