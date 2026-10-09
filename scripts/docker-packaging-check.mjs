@@ -16,6 +16,12 @@
  *     （api 没有可写路径，因此不许声明 tmpfs；postgres 只许**恰好** /run/postgresql 与 /tmp：
  *     缺失、额外路径、重复项、以及带 mount 覆盖的等价写法（如 `/tmp:ro`）一律判失败，且
  *     持久数据卷与证书目录绝不能被 tmpfs 覆盖或只读化）；
+ *   - 生产档 api 的宿主端口**只许绑回环且恰好一条**：`ports` 必须用长语法逐项显式声明
+ *     `host_ip` / `target` / `published` / `protocol`，且 `host_ip` 精确等于 `127.0.0.1`；
+ *     短语法、`0.0.0.0`、`::` 这类通配地址、空 host、缺省 host_ip 与非 3000/tcp 一律判失败
+ *     （Compose 对 host_ip 的缺省行为就是绑所有网卡）；发布映射的数量必须**恰好 1 条**，
+ *     出现第 2 条起（即使第二条本身也写成回环合规）同样判失败：每多一条映射就多一个宿主暴露面；
+ *     postgres 则不得发布任何宿主端口；
  *   - 「禁止机密进日志」：`command` / `entrypoint` / `healthcheck` 不得引用任何机密类变量
  *     （它们会出现在 `docker inspect` / `docker ps` / 容器日志里），生产档不得开 DEBUG 类变量、
  *     `LOG_LEVEL` 默认值不得是 debug/trace，健康探针不得输出或序列化 `process.env`。
@@ -204,14 +210,7 @@ export function readScalarField(block, key) {
   if (match === null) {
     return null;
   }
-  let value = match[1].trim();
-  if (
-    (value.startsWith('"') && value.endsWith('"') && value.length >= 2) ||
-    (value.startsWith("'") && value.endsWith("'") && value.length >= 2)
-  ) {
-    value = value.slice(1, -1);
-  }
-  return value;
+  return unquoteValue(match[1].trim());
 }
 
 /**
@@ -227,17 +226,108 @@ export function readListField(block, key) {
   for (const line of section.split(/\r?\n/u).slice(1)) {
     const match = /^\s*-\s*(\S.*)$/u.exec(line);
     if (match !== null) {
-      let item = match[1].trim();
-      if (
-        (item.startsWith('"') && item.endsWith('"')) ||
-        (item.startsWith("'") && item.endsWith("'"))
-      ) {
-        item = item.slice(1, -1);
-      }
-      items.push(item);
+      items.push(unquoteValue(match[1].trim()));
     }
   }
   return items;
+}
+
+/** 去掉包裹引号（`'x'` 与 `"x"` 在本子集里等价，单字符引号串保持原样） */
+function unquoteValue(value) {
+  if (
+    ((value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))) &&
+    value.length >= 2
+  ) {
+    return value.slice(1, -1);
+  }
+  return value;
+}
+
+/** 取 `key: value` 形态（key 必须是标识符）；不是该形态返回 `null` */
+function splitInlineKeyValue(text) {
+  const match = /^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$/u.exec(text);
+  if (match === null) {
+    return null;
+  }
+  return { key: match[1], value: unquoteValue(match[2].trim()) };
+}
+
+/**
+ * Compose `ports` **长语法**允许的键（本仓库只对这几个键做端口断言）。
+ * 见 Compose 规范 long syntax：target / published / host_ip / protocol / mode / name / app_protocol。
+ */
+export const PORT_LONG_SYNTAX_KEYS = [
+  'target',
+  'published',
+  'host_ip',
+  'protocol',
+  'mode',
+  'name',
+  'app_protocol',
+];
+
+/**
+ * 解析服务块的 `ports:` 列表（缩进式 YAML 子集）。返回值：
+ *   - `null`：该服务**没有**声明 `ports:`；
+ *   - `[]`：声明了 `ports:` 但没有任何条目；
+ *   - 条目数组，每项 `{ kind, raw, value?, fields }`：
+ *       - `kind: 'long'`  → 长语法映射（`- host_ip: …` 及其后同级缩进的 target/published/…），
+ *         `fields` 是键到值的映射（值已去引号，因此 `${VAR:-x}` 保留字面形态）；
+ *       - `kind: 'short'` → 短语法字符串（`- "3000:3000"`、`- 127.0.0.1:3000:3000`、`- ${P}:3000`），
+ *         这类写法**无法**声明 `host_ip`，`fields` 恒为空。
+ * 只解析本项目编排用得到的子集：不处理 flow 映射（`- { host_ip: … }`）、锚点与多行标量。
+ */
+export function readPortMappings(block) {
+  const section = readBlockField(block, 'ports');
+  if (section === null) {
+    return null;
+  }
+  const entries = [];
+  let current = null;
+  const flush = () => {
+    if (current !== null) {
+      entries.push(current);
+      current = null;
+    }
+  };
+  for (const line of section.split(/\r?\n/u).slice(1)) {
+    if (line.trim() === '') {
+      continue;
+    }
+    const item = /^\s*-\s*(.*)$/u.exec(line);
+    if (item !== null) {
+      flush();
+      const body = item[1].trim();
+      const inline = splitInlineKeyValue(body);
+      if (inline !== null && PORT_LONG_SYNTAX_KEYS.includes(inline.key)) {
+        current = { kind: 'long', raw: [line], fields: { [inline.key]: inline.value } };
+      } else if (inline === null && body !== '') {
+        // 短语法字符串：没有 `<标识符>: ` 前缀（含 `${VAR}:3000`、`127.0.0.1:3000:3000`、带引号的写法）
+        entries.push({ kind: 'short', raw: [line], value: unquoteValue(body), fields: {} });
+      } else {
+        // `- key: value` 但不是已知长语法键（或空条目）：仍按长语法条目收集，
+        // 让断言按「未知/缺失字段」判定，而不是被静默当成短语法漏过去。
+        current = {
+          kind: 'long',
+          raw: [line],
+          fields: inline === null ? {} : { [inline.key]: inline.value },
+        };
+      }
+      continue;
+    }
+    if (current === null) {
+      // 条目之外的缩进行（注释等）：忽略
+      continue;
+    }
+    current.raw.push(line);
+    const inline = splitInlineKeyValue(line.trim());
+    if (inline !== null) {
+      current.fields[inline.key] = inline.value;
+    }
+  }
+  flush();
+  return entries;
 }
 
 /** 是否等价于「以 root 运行」：未声明、`root`、uid 0（任意 gid）都算 */
@@ -569,12 +659,146 @@ function describePostgresTmpfsIssue(fileName, issue) {
 }
 
 /**
+ * 生产档 api 端口的期望声明：host_ip 只允许**精确回环**，另外三项固定。
+ * 写成常量是为了让失败文案与断言共用同一份「期望事实」，避免两处漂移。
+ */
+export const API_PROD_PORT = Object.freeze({
+  hostIp: '127.0.0.1',
+  target: '3000',
+  published: '${API_PORT:-3000}',
+  protocol: 'tcp',
+});
+
+/**
+ * 是否通配 / 「所有网卡」形态的 host_ip：覆盖 IPv4 wildcard、IPv6 wildcard（含方括号写法）、
+ * 全零展开式与 `*`。去引号由解析器负责，这里再去掉 IPv6 方括号并做大小写归一。
+ */
+export function isWildcardHostIp(value) {
+  const normalized = String(value)
+    .trim()
+    .replace(/^\[|\]$/gu, '')
+    .toLowerCase();
+  return [
+    '0.0.0.0',
+    '::',
+    '::0',
+    '0:0:0:0:0:0:0:0',
+    '0000:0000:0000:0000:0000:0000:0000:0000',
+    '*',
+  ].includes(normalized);
+}
+
+/**
+ * 计算 api **生产端口暴露面**的违规项（纯函数，供门禁与 --self-test 共用，不读磁盘）。
+ *
+ * 规则（每条都对应一次真实事故场景）：
+ *   - `ports` 必须声明且至少一条：没有条目就没有显式绑定，暴露面不可复核；
+ *   - 发布映射必须**恰好 1 条**：第 2 条起一律判失败（`too-many-entries`），**即使它本身也符合
+ *     下面全部字段规则**（回环 + 3000/tcp）。理由：每多一条映射就多一个宿主暴露面，而「第二条
+ *     看起来合规」正是最容易被评审放过、却可能绑到另一个网卡/端口的形态；暴露面必须可枚举为 1；
+ *   - 每个条目必须是**长语法**：短语法（`"3000:3000"` / `${API_PORT:-3000}:3000`）无法声明
+ *     `host_ip`，Compose 的缺省行为就是绑 `0.0.0.0`（所有网卡）；
+ *   - 每项 `host_ip` 必须**精确**等于 127.0.0.1：通配（0.0.0.0 / :: / 全零展开 / `*`）、
+ *     空值、缺省、以及任何非回环地址一律判失败；
+ *   - `target` / `published` / `protocol` 必须显式写出且与期望一致：缺省值会让实际发布端口与
+ *     协议只能靠推断，评审无法从文件本身看到最终事实。
+ */
+export function findApiPortExposureIssues(entries, expected = API_PROD_PORT) {
+  const issues = [];
+  if (entries === null || entries.length === 0) {
+    issues.push({ kind: 'missing' });
+    return issues;
+  }
+  // 数量断言先于逐条字段断言：先把「暴露面必须恰好一条」这条结构性事实固定下来，
+  // 再逐条复核字段。这样「第二条也完全合规」时仍然必然产出一条稳定的失败原因。
+  if (entries.length > 1) {
+    issues.push({ kind: 'too-many-entries', count: entries.length, index: 1 });
+  }
+  entries.forEach((entry, index) => {
+    if (entry.kind !== 'long') {
+      issues.push({ kind: 'short-syntax', index, entry: (entry.raw ?? []).join(' ').trim() });
+      return;
+    }
+    const fields = entry.fields ?? {};
+    if (!Object.hasOwn(fields, 'host_ip')) {
+      issues.push({ kind: 'missing-host-ip', index });
+    } else {
+      const hostIp = String(fields.host_ip).trim();
+      if (hostIp === '') {
+        issues.push({ kind: 'empty-host-ip', index });
+      } else if (hostIp !== expected.hostIp) {
+        issues.push({
+          kind: isWildcardHostIp(hostIp) ? 'wildcard-host-ip' : 'non-loopback-host-ip',
+          index,
+          hostIp,
+        });
+      }
+    }
+    for (const spec of [
+      { field: 'target', missing: 'missing-target', wrong: 'wrong-target' },
+      { field: 'published', missing: 'missing-published', wrong: 'wrong-published' },
+      { field: 'protocol', missing: 'missing-protocol', wrong: 'wrong-protocol' },
+    ]) {
+      if (!Object.hasOwn(fields, spec.field)) {
+        issues.push({
+          kind: spec.missing,
+          index,
+          field: spec.field,
+          expected: expected[spec.field],
+        });
+        continue;
+      }
+      const actual = String(fields[spec.field]).trim();
+      if (actual !== expected[spec.field]) {
+        issues.push({
+          kind: spec.wrong,
+          index,
+          field: spec.field,
+          actual,
+          expected: expected[spec.field],
+        });
+      }
+    }
+  });
+  return issues;
+}
+
+/** 把 api 端口违规项渲染成一条人类可读的失败原因（文件名由调用方补上） */
+function describeApiPortIssue(fileName, issue) {
+  const expected = `host_ip: ${API_PROD_PORT.hostIp} / target: ${API_PROD_PORT.target} / published: "${API_PROD_PORT.published}" / protocol: ${API_PROD_PORT.protocol}`;
+  const where = `api ports 第 ${issue.index + 1} 条`;
+  switch (issue.kind) {
+    case 'missing':
+      return `${fileName}: api 必须用 ports 长语法把生产端口只绑回环（期望 ${expected}）；当前未声明 ports 或没有任何条目`;
+    case 'short-syntax':
+      return `${fileName}: ${where} ${issue.entry} 是短语法，无法声明 host_ip（Compose 缺省即绑 0.0.0.0 暴露到所有网卡）；必须改用长语法：${expected}`;
+    case 'too-many-entries':
+      return `${fileName}: api 的宿主端口发布映射必须恰好 1 条，当前 ${issue.count} 条（第 ${issue.index + 1} 条起一律判失败，即使它本身也是回环合规的 ${expected}）：每多一条映射就多一个宿主暴露面，必须删到只剩一条`;
+    case 'missing-host-ip':
+      return `${fileName}: ${where} 缺少 host_ip（缺省即绑所有网卡），必须显式写 host_ip: ${API_PROD_PORT.hostIp}`;
+    case 'empty-host-ip':
+      return `${fileName}: ${where} 的 host_ip 是空值（等价于绑所有网卡），必须精确写 ${API_PROD_PORT.hostIp}`;
+    case 'wildcard-host-ip':
+      return `${fileName}: ${where} 的 host_ip ${issue.hostIp} 是通配/所有网卡地址（含 IPv6 wildcard），禁止 0.0.0.0、::、空 host；必须精确写 ${API_PROD_PORT.hostIp}`;
+    case 'non-loopback-host-ip':
+      return `${fileName}: ${where} 的 host_ip 必须是精确的 ${API_PROD_PORT.hostIp}，当前: ${issue.hostIp}`;
+    default:
+      return issue.actual === undefined
+        ? `${fileName}: ${where} 缺少 ${issue.field}，必须显式写 ${issue.field}: ${issue.expected}`
+        : `${fileName}: ${where} 的 ${issue.field} 必须是 ${issue.expected}，当前: ${issue.actual}`;
+  }
+}
+
+/**
  * 生产档容器加固 + 「禁止机密进日志」断言（本地开发档不受影响）。
  *
  * 加固基线（两个服务都必须显式声明，不接受「靠镜像默认」）：
  *   read_only: true / cap_drop: [ALL] / security_opt: no-new-privileges:true / user: 非 root。
  * 可写路径必须是最小集：
  *   - api：运行时代码只读文件、只写 stdout，探针也不写文件 → **不许**声明 tmpfs；
+ *   - api 的宿主端口必须**恰好一条**、用长语法且 `host_ip` **精确等于 127.0.0.1**（禁止 0.0.0.0 /
+ *     :: / 空 / 缺省 host_ip，也禁止短语法——短语法的缺省行为就是绑所有网卡），
+ *     target/published/protocol 必须显式写出并与期望一致；第 2 条起的映射一律失败（即使回环合规）；
  *   - postgres：只读根下仅 /run/postgresql（Unix socket 目录）与 /tmp（TMPDIR）需要可写；
  *     持久数据卷必须保持可写、证书目录必须保持只读，二者都不得被 tmpfs 覆盖。
  * postgres 的 cap_add：非 root 启动时官方 entrypoint 不走 chown/gosu 分支，因此不需要任何能力；
@@ -614,6 +838,13 @@ function checkProductionHardening(fileName, api, postgres) {
       restart !== null && restart !== 'no',
       `${fileName}: ${name} 必须保留重启策略（restart 缺失或为 no 会在故障后留下停摆容器）`,
     );
+  }
+
+  // api 的宿主端口绑定：必须**恰好一条**、长语法 + host_ip 精确 127.0.0.1
+  // （详见 findApiPortExposureIssues）。这是「端口暴露面」断言的单一控制点：条目数量、短语法、
+  // 通配、空 host、缺 host、非 3000/tcp 都在这里拦下——包括「第二条也回环合规」的额外映射。
+  for (const issue of findApiPortExposureIssues(readPortMappings(api))) {
+    failures.push(describeApiPortIssue(fileName, issue));
   }
 
   // api：没有可写路径，多声明一个 tmpfs 就多一个可写面
@@ -1130,9 +1361,183 @@ function selfTest() {
     [['missing'], ['missing', 'missing']],
   );
 
+  // ---- api 生产端口暴露面：长语法 + host_ip 精确 127.0.0.1 ----
+  const portsBlock = (lines) => ['    ports:', ...lines].join('\n');
+  const portIssueKinds = (lines) =>
+    findApiPortExposureIssues(readPortMappings(portsBlock(lines))).map((issue) => issue.kind);
+  const compliantPort = [
+    '      - host_ip: 127.0.0.1',
+    '        target: 3000',
+    '        published: "${API_PORT:-3000}"',
+    '        protocol: tcp',
+  ];
+  expect(
+    'readPortMappings 识别长语法条目与字段（去引号保留 ${VAR:-x} 字面形态）',
+    readPortMappings(
+      portsBlock([
+        '      - host_ip: 127.0.0.1',
+        '        target: 3000',
+        '        published: "${API_PORT:-3000}"',
+      ]),
+    ).map((entry) => [
+      entry.kind,
+      entry.fields.host_ip,
+      entry.fields.target,
+      entry.fields.published,
+    ]),
+    [['long', '127.0.0.1', '3000', '${API_PORT:-3000}']],
+  );
+  expect(
+    'readPortMappings 识别短语法条目（没有 host_ip 字段可声明）',
+    readPortMappings(portsBlock(['      - "${API_PORT:-3000}:3000"'])).map((entry) => [
+      entry.kind,
+      entry.value,
+      Object.keys(entry.fields).length,
+    ]),
+    [['short', '${API_PORT:-3000}:3000', 0]],
+  );
+  expect(
+    'readPortMappings 把连续条目拆成两条（长 + 短混排）',
+    readPortMappings(
+      portsBlock([
+        '      - host_ip: 127.0.0.1',
+        '        target: 3000',
+        '      - 127.0.0.1:3001:3001',
+      ]),
+    ).map((entry) => [entry.kind, entry.kind === 'short' ? entry.value : entry.fields.target]),
+    [
+      ['long', '3000'],
+      ['short', '127.0.0.1:3001:3001'],
+    ],
+  );
+  expect(
+    'readPortMappings 未声明 ports 返回 null、声明但无条目返回 []',
+    [readPortMappings('    image: rm-api:prod\n'), readPortMappings(portsBlock([]))],
+    [null, []],
+  );
+  expect(
+    'isWildcardHostIp 覆盖 IPv4/IPv6 通配与全零展开式',
+    ['0.0.0.0', '::', '[::]', '::0', '0:0:0:0:0:0:0:0', '127.0.0.1', 'localhost'].map(
+      isWildcardHostIp,
+    ),
+    [true, true, true, true, true, false, false],
+  );
+  expect(
+    'findApiPortExposureIssues 接受合规声明（长语法 + 精确回环 + 三项显式）',
+    portIssueKinds(compliantPort),
+    [],
+  );
+  expect(
+    'findApiPortExposureIssues 拒绝 IPv4/IPv6 通配 host_ip',
+    [
+      portIssueKinds(
+        compliantPort.map((line) => line.replace('host_ip: 127.0.0.1', 'host_ip: 0.0.0.0')),
+      ),
+      portIssueKinds(
+        compliantPort.map((line) => line.replace('host_ip: 127.0.0.1', 'host_ip: "::"')),
+      ),
+    ],
+    [['wildcard-host-ip'], ['wildcard-host-ip']],
+  );
+  expect(
+    'findApiPortExposureIssues 拒绝空 host_ip 与缺 host_ip',
+    [
+      portIssueKinds(
+        compliantPort.map((line) => line.replace('host_ip: 127.0.0.1', 'host_ip: ""')),
+      ),
+      // 条目以 target 开头：host_ip 整个缺失（而不是「有键但空值」）
+      portIssueKinds([
+        '      - target: 3000',
+        '        published: "${API_PORT:-3000}"',
+        '        protocol: tcp',
+      ]),
+    ],
+    [['empty-host-ip'], ['missing-host-ip']],
+  );
+  expect(
+    'findApiPortExposureIssues 拒绝非回环 host_ip',
+    portIssueKinds(compliantPort.map((line) => line.replace('127.0.0.1', '10.0.0.5'))),
+    ['non-loopback-host-ip'],
+  );
+  expect(
+    'findApiPortExposureIssues 拒绝短语法（缺省 host_ip 就是绑所有网卡）',
+    portIssueKinds(['      - "${API_PORT:-3000}:3000"']),
+    ['short-syntax'],
+  );
+  expect(
+    'findApiPortExposureIssues 检测 target/published/protocol 的缺失与不匹配',
+    [
+      portIssueKinds(compliantPort.map((line) => line.replace('target: 3000', 'target: 8080'))),
+      portIssueKinds(compliantPort.filter((line) => !line.includes('published'))),
+      portIssueKinds(compliantPort.filter((line) => !line.includes('protocol'))),
+      portIssueKinds(
+        compliantPort.map((line) =>
+          line.replace('published: "${API_PORT:-3000}"', 'published: 3000'),
+        ),
+      ),
+    ],
+    [['wrong-target'], ['missing-published'], ['missing-protocol'], ['wrong-published']],
+  );
+  expect(
+    'findApiPortExposureIssues 逐条判定（一条合规 + 一条通配：数量与通配各报一条）',
+    findApiPortExposureIssues(
+      readPortMappings(
+        portsBlock([
+          ...compliantPort,
+          '      - host_ip: 0.0.0.0',
+          '        target: 3000',
+          '        published: "${API_PORT:-3000}"',
+          '        protocol: tcp',
+        ]),
+      ),
+    ).map((issue) => [issue.index, issue.kind]),
+    [
+      [1, 'too-many-entries'],
+      [1, 'wildcard-host-ip'],
+    ],
+  );
+  // 「第二条完全合规」的反例：第二个映射逐项都满足回环 + 3000/tcp（只是写法上换了引号），
+  // 逐条字段规则一条都不违反，因此**只有**数量断言能拦住它。
+  expect(
+    'findApiPortExposureIssues 拒绝第二条完全合规的回环映射（恰好一条）',
+    portIssueKinds([
+      ...compliantPort,
+      '      - host_ip: "127.0.0.1"',
+      "        target: '3000'",
+      "        published: '${API_PORT:-3000}'",
+      '        protocol: "tcp"',
+    ]),
+    ['too-many-entries'],
+  );
+  expect(
+    'findApiPortExposureIssues 接受恰好一条时不受数量断言影响（含引号等价写法）',
+    portIssueKinds([
+      '      - host_ip: "127.0.0.1"',
+      "        target: '3000'",
+      "        published: '${API_PORT:-3000}'",
+      '        protocol: "tcp"',
+    ]),
+    [],
+  );
+  expect(
+    'findApiPortExposureIssues 把未声明/空 ports 判为 missing',
+    [
+      findApiPortExposureIssues(null).map((issue) => issue.kind),
+      findApiPortExposureIssues([]).map((issue) => issue.kind),
+    ],
+    [['missing'], ['missing']],
+  );
+
   // 端到端合成反例：用一份其余加固项全部合规的服务块驱动真实门禁函数，
-  // 只改 tmpfs 一个变量，确认「多一个 tmpfs 就必然失败」——防止门禁自己坏掉却报通过。
-  const hardeningProbe = (tmpfsEntries) => {
+  // 只改一个变量（tmpfs 或 api 端口声明），确认「违规就必然失败」——防止门禁自己坏掉却报通过。
+  const compliantApiPortLines = [
+    '    ports:',
+    '      - host_ip: 127.0.0.1',
+    '        target: 3000',
+    '        published: "${API_PORT:-3000}"',
+    '        protocol: tcp',
+  ];
+  const hardeningProbe = (tmpfsEntries, apiPortLines = compliantApiPortLines) => {
     const postgresBlock = [
       '    image: postgres:16-alpine',
       '    read_only: true',
@@ -1156,6 +1561,7 @@ function selfTest() {
       '      - ALL',
       '    security_opt:',
       '      - no-new-privileges:true',
+      ...apiPortLines,
       '    restart: always',
       '',
     ].join('\n');
@@ -1208,6 +1614,73 @@ function selfTest() {
       rootTmpfsProbe.messages.filter((message) => message.includes('不得覆盖')).length,
     ],
     [3, 2],
+  );
+
+  // api 端口暴露面的端到端合成反例：其余加固项全合规，只改端口声明一个变量
+  const wildcardPortProbe = hardeningProbe(
+    ['/run/postgresql', '/tmp'],
+    [
+      '    ports:',
+      '      - host_ip: 0.0.0.0',
+      '        target: 3000',
+      '        published: "${API_PORT:-3000}"',
+      '        protocol: tcp',
+    ],
+  );
+  expect(
+    'checkProductionHardening 失败：api 端口绑到 0.0.0.0（端到端合成反例）',
+    [
+      wildcardPortProbe.count,
+      wildcardPortProbe.messages.some((message) => message.includes('通配/所有网卡地址')),
+    ],
+    [1, true],
+  );
+  expect(
+    'checkProductionHardening 失败：api 端口用短语法（端到端合成反例）',
+    hardeningProbe(['/run/postgresql', '/tmp'], ['    ports:', '      - "${API_PORT:-3000}:3000"'])
+      .count,
+    1,
+  );
+  expect(
+    'checkProductionHardening 失败：api 完全没有声明 ports（端到端合成反例）',
+    hardeningProbe(['/run/postgresql', '/tmp'], []).count,
+    1,
+  );
+  expect(
+    'checkProductionHardening 失败：api host_ip 为空值（端到端合成反例）',
+    hardeningProbe(
+      ['/run/postgresql', '/tmp'],
+      [
+        '    ports:',
+        '      - host_ip: ""',
+        '        target: 3000',
+        '        published: "${API_PORT:-3000}"',
+        '        protocol: tcp',
+      ],
+    ).count,
+    1,
+  );
+  // 关键反例：第二条映射**逐项合规**（回环 + 3000/tcp，只是换了引号写法），
+  // 逐条字段断言全都通过，必须由「恰好一条」的数量断言把它拦下。
+  const secondCompliantPortProbe = hardeningProbe(
+    ['/run/postgresql', '/tmp'],
+    [
+      ...compliantApiPortLines,
+      '      - host_ip: "127.0.0.1"',
+      "        target: '3000'",
+      "        published: '${API_PORT:-3000}'",
+      '        protocol: "tcp"',
+    ],
+  );
+  expect(
+    'checkProductionHardening 失败：api 第二条发布映射完全合规（端到端合成反例）',
+    [
+      secondCompliantPortProbe.count,
+      secondCompliantPortProbe.messages.some((message) =>
+        message.includes('必须恰好 1 条，当前 2 条'),
+      ),
+    ],
+    [1, true],
   );
 
   const failed = cases.filter((item) => !item.ok);

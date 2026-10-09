@@ -46,6 +46,13 @@
 #   - 证书目录 ${RM_TLS_DIR} 始终**只读挂载**（/etc/rm-tls:ro），绝不改成 tmpfs：
 #     它是身份与机密材料，不是临时目录；数据卷同理，改成 tmpfs 就是丢数据。
 #
+# 【端口暴露面】只有 api 的 3000 端口发布到宿主机，且必须**只绑回环**：
+#   - 声明方式固定为 ports 长语法，每项显式写全 host_ip / target / published / protocol；
+#   - host_ip 精确等于 127.0.0.1（禁止 0.0.0.0、:: 这类通配地址，也禁止空值与缺省——
+#     Compose 对缺省 host_ip 的处理就是绑所有网卡，等于把 API 直接放上公网）；
+#   - postgres **不发布任何宿主端口**，只在编排网络内 expose 5432。
+#   该断言由 `pnpm verify:docker` 逐项复核（含通配/空/缺失反例，见 --self-test）。
+#
 # 【运行身份没有变化，只是写显式了】加固前：api 已在 Dockerfile 里 `USER node`（uid 1000），
 # postgres 以 root 进入官方 entrypoint 后立刻 `exec gosu postgres`（uid 70）。加固后两者都以
 # 同一个 uid 直接启动，**有效运行身份不变**，因此证书可读性要求（DOCKER.md「证书准备」：
@@ -179,8 +186,19 @@ services:
       AI_MODEL: "${AI_MODEL:-}"
     networks:
       - rm-internal
+    # 【端口暴露面（生产审计口径）】只绑宿主机回环，且必须用**长语法**逐项显式声明：
+    #   - host_ip: 127.0.0.1 —— 端口只发布到本机回环，局域网/公网都不可直达；对外暴露交给
+    #     宿主机上的反向代理/防火墙决定，而不是让容器直接监听所有网卡。
+    #   - 禁止 0.0.0.0 / :: / 空 host / 缺省 host_ip：短语法 `${API_PORT:-3000}:3000` 等价于
+    #     绑 0.0.0.0（Compose 的缺省即所有网卡），一旦宿主机有公网地址就是未授权暴露面。
+    #   - target/published/protocol 三项也必须显式写全：容器端口 3000、宿主端口由
+    #     `${API_PORT:-3000}` 决定、协议 tcp，避免靠缺省值推断实际暴露行为。
+    # pnpm verify:docker 会逐项复核 host_ip/target/published/protocol（含通配/空/缺失反例）。
     ports:
-      - "${API_PORT:-3000}:3000"
+      - host_ip: 127.0.0.1
+        target: 3000
+        published: "${API_PORT:-3000}"
+        protocol: tcp
     volumes:
       # 只读挂载证书：内容绝不写入镜像/仓库，只登记路径
       - "${RM_TLS_DIR:?生产必须通过 RM_TLS_DIR 提供证书目录（绝对路径）}:/etc/rm-tls:ro"

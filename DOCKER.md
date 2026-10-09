@@ -159,6 +159,12 @@ docker compose -f docker-compose.prod.yml --env-file .env.docker.prod up -d
 这类序列字段是追加而不是替换，`config` 输出容易看错。生产档的特点：
 
 - **数据库不发布端口**到宿主机，只在编排网络 `rm-internal` 内通过 `expose` 暴露；
+- **API 端口只绑宿主机回环**：`api` 的 `ports` 必须用长语法逐项声明
+  `host_ip: 127.0.0.1` / `target: 3000` / `published: "${API_PORT:-3000}"` / `protocol: tcp`。
+  禁止 `0.0.0.0`、`::` 这类通配地址，也禁止空 `host_ip`、缺 `host_ip` 与短语法
+  （`"${API_PORT:-3000}:3000"`）——Compose 对缺省 host 的处理就是绑**所有网卡**，
+  宿主机只要有公网/局域网地址，API 就被直接暴露。需要对外提供服务时，在宿主机上用
+  反向代理或防火墙把流量转发到回环端口，而不是让容器监听所有网卡；
 - 不挂载 `db/docker/init`（它会在生产库里创建 `*_test` 数据库）；
 - **TLS 两端都开**：postgres `ssl=on` + 服务端证书，并用 `db/docker/prod/pg_hba.conf`
   （`hba_file=`）**只接受 `hostssl`**、显式 `reject` 明文连接；api 用 `verify-full` 校验
@@ -251,7 +257,9 @@ docker compose --env-file .env.docker.example config >/dev/null && echo OK
 `pnpm verify:docker` 断言的内容（都不需要 Docker 守护进程）：镜像的多阶段与工作区构建顺序、
 容器启动入口与 `services/api/package.json` 的 `main` 一致、健康检查复用同一份跟随 `API_PREFIX`
 的探针、两档编排的服务/网络/卷/依赖顺序/健康检查、凭据无内置默认值、生产档 `verify-full` 与
-证书只读挂载、`pg_hba.conf` 拒绝明文、模板里机密字段仍是占位符、忽略规则正确排除证书与真实 `.env`。
+证书只读挂载、`pg_hba.conf` 拒绝明文、模板里机密字段仍是占位符、忽略规则正确排除证书与真实 `.env`；
+生产档 `api` 的宿主端口还会**逐项**核对长语法的 `host_ip`（必须精确等于 `127.0.0.1`，通配 / 空 /
+缺失一律失败）与 `target` / `published` / `protocol` 三项显式声明，短语法直接判失败。
 
 **如实声明**：本仓库的构建环境**没有可用的 Docker 守护进程**，因此本文档描述的容器**运行**行为
 （真正 `up` 起来、`healthy`、连通性）没有在本次交付中做端到端验证；已完成的验证是
