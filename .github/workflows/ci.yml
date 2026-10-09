@@ -7,6 +7,19 @@ on:
     branches: ["**"]
   pull_request:
 
+# 最小权限：本工作流只读取仓库内容做校验（lint / 类型检查 / 构建 / 测试 / 骨架自检），
+# 不需要写入任何仓库资源。顶层声明后，未列出的权限一律为 none，
+# 即使工作流内出现意外步骤也无法获得写权限。
+permissions:
+  contents: read
+
+# 同一 ref 上只保留最新一次运行：新提交触发时取消该 ref 上仍在进行的旧运行，
+# 避免排队堆积。取消不会被记为通过，最终结论始终由该 ref 的最新一次运行给出，
+# 因此不削弱校验强度（不同 ref 之间互不影响）。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   verify:
     runs-on: ubuntu-latest
