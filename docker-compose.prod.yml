@@ -29,8 +29,51 @@
 #   - api：`DATABASE_SSL_MODE=verify-full`（校验证书链与主机名），CA 来自同一挂载。
 #   证书文件必须对容器内的 postgres/node 用户可读（见 DOCKER.md「证书准备」）。
 #
-# 【未做的验证，如实声明】本文件只通过 `docker compose ... config` 做了静态渲染校验；
-# 本构建环境没有可用的 Docker 守护进程，因此**没有**做真实启动/连通性验证。
+# 【容器加固（生产审计口径）】两个服务都按同一组声明收紧，每条都由 `pnpm verify:docker`
+# 的静态断言逐条复核（断言实现见 scripts/docker-packaging-check.mjs）：
+#   - read_only: true                       根文件系统只读，进程无法改写镜像内容；
+#   - cap_drop: [ALL]                       去掉全部 Linux capability；
+#   - security_opt: no-new-privileges:true  禁止通过 setuid / 文件能力提权；
+#   - user: <显式非 root>                   不依赖镜像默认身份（镜像默认是 root）；
+#   - tmpfs                                 只读根下**真正需要写**的目录才用 tmpfs 提供。
+#
+# 【可写路径清单（有意为之，其余位置都不允许写）】
+#   - api      ：**没有**可写路径。@rm/api 运行时代码只读文件（迁移 SQL、契约夹具），日志只
+#                写 stdout；健康探针不写文件、不打印环境变量取值。因此 api **不**声明
+#                tmpfs / 可写卷：每多一个可写路径就多一个可被写入的攻击面。
+#   - postgres ：数据卷 rm-postgres-data（**必须可写**，且不允许是 tmpfs）
+#                + tmpfs /run/postgresql（Unix socket 目录）、tmpfs /tmp（TMPDIR）。
+#   - 证书目录 ${RM_TLS_DIR} 始终**只读挂载**（/etc/rm-tls:ro），绝不改成 tmpfs：
+#     它是身份与机密材料，不是临时目录；数据卷同理，改成 tmpfs 就是丢数据。
+#
+# 【运行身份没有变化，只是写显式了】加固前：api 已在 Dockerfile 里 `USER node`（uid 1000），
+# postgres 以 root 进入官方 entrypoint 后立刻 `exec gosu postgres`（uid 70）。加固后两者都以
+# 同一个 uid 直接启动，**有效运行身份不变**，因此证书可读性要求（DOCKER.md「证书准备」：
+# 证书文件须对容器内 node/postgres 用户可读）与 TLS 行为都不受影响。
+#
+# 【postgres 为什么可以 cap_drop: [ALL] 且不需要任何 cap_add】
+# 依据官方 postgres:16-alpine 的 docker-entrypoint.sh（docker-library/postgres 16/alpine*）：
+#   - chown / gosu 提权分支只在 `id -u` = 0 时执行（需要 CHOWN/DAC_OVERRIDE/FOWNER/SETUID/SETGID）；
+#     本文件用 user: "postgres" 直接以非 root 启动，这些分支根本不会执行；
+#   - 非 root 分支只做 mkdir/chmod，且 `chmod 03775 /var/run/postgresql` 的失败被 `|| :` 吞掉
+#     （上游 docker-library/postgres#853 记为可忽略）；
+#   - initdb / postgres 服务端本身不使用任何 Linux capability（上游 docker-library/postgres#649
+#     中两个独立用户在 postgres:16 + 非 root + cap_drop ALL + read_only 下实测启动成功）。
+# 代价是**运维前提**（不是能力需求）：数据卷必须归 postgres 用户所有。本编排的具名卷首次创建时
+# 会继承镜像内 /var/lib/postgresql/data 的所有权（构建期 chown postgres:postgres、chmod 1777），
+# 天然满足；若该卷曾经被 root 写过，需先：
+#   docker run --rm -v researcher-manager-prod_rm-postgres-data:/v alpine chown -R 70:70 /v
+#
+# 【禁止机密进日志】command / entrypoint / healthcheck 里不得出现任何机密类变量引用——这些内容
+# 会出现在 `docker inspect`、`docker ps` 与容器日志里；机密只允许经 environment 注入（该通道
+# 本身不进日志）。探针脚本只输出状态码与路径，绝不打印环境变量取值。
+#
+# 【未做的验证，如实声明】本构建环境没有可用的 Docker 守护进程：早期的编排版本做过
+# `docker compose ... config` 静态渲染校验，但**本次加固修订没有重跑** `config`，也**没有**做过
+# 真实启动/连通性验证。本修订可复核的证据只有：`pnpm verify:docker` 的逐条静态断言
+# （含 --self-test 与合成反例）、prettier 的 YAML 解析通过、以及上游 entrypoint 源码与
+# docker-library/postgres#649 / #853 的能力与可写路径分析（见上）。真实启动必须在有 Docker
+# 守护进程的机器上另行验证，尤其是：postgres 以非 root + cap_drop ALL 首次初始化数据卷。
 # ============================================================================
 
 name: researcher-manager-prod
@@ -79,6 +122,21 @@ services:
       start_period: 30s
     security_opt:
       - no-new-privileges:true
+    # 【容器加固】只读根 + 去能力 + 显式非 root（见文件头「postgres 为什么可以 cap_drop: [ALL]」）。
+    # user 用镜像内的 postgres 用户（postgres:16-alpine 解析为 uid 70:gid 70）：非 root 启动时官方
+    # entrypoint 不执行 chown/gosu 分支，所以不需要任何 cap_add；数据卷必须已归该 uid 所有。
+    user: "postgres"
+    read_only: true
+    cap_drop:
+      - ALL
+    # 只读根下**仅**这两个目录需要可写，且都不能留在根文件系统上：
+    #   - /run/postgresql：postgres 启动时必须在此创建 Unix socket（alpine 里 /var/run → /run）；
+    #   - /tmp：TMPDIR（官方 entrypoint 的 mktemp 分支、psql/initdb 工具链的临时文件）。
+    # 数据目录 /var/lib/postgresql/data **不在此列**：它必须在可写的具名卷上（见上面 volumes），
+    # PostgreSQL 自己的排序/临时文件也写在数据卷内，不依赖 /tmp。
+    tmpfs:
+      - /run/postgresql
+      - /tmp
     restart: always
 
   api:
@@ -137,4 +195,12 @@ services:
       start_period: 30s
     security_opt:
       - no-new-privileges:true
+    # 【容器加固】只读根 + 去能力 + 显式非 root（与 Dockerfile 里的 `USER node` 一致，两处都要有：
+    # 镜像默认身份 + 编排里的显式声明互相印证，缺一处就会被 pnpm verify:docker 拦下）。
+    user: "node"
+    read_only: true
+    cap_drop:
+      - ALL
+    # 刻意**不**声明 tmpfs / 可写卷：运行时代码只读文件、只写 stdout，探针不写文件也不打印
+    # 环境变量取值，所以这里没有任何必要可写路径；多声明一个就是白送一个可写面。
     restart: always

@@ -10,7 +10,15 @@
  *   - 健康检查路径必须跟随 `API_PREFIX`，不能硬编码（历史缺陷：先 init 再 setGlobalPrefix，
  *     构建产物只服务无前缀路径，容器永远不健康）；
  *   - 凭据不得有内置默认值、机密字段必须保持占位符形态、证书只挂载路径；
- *   - 生产档必须 `verify-full` + 只读挂载证书 + 显式拒绝明文连接。
+ *   - 生产档必须 `verify-full` + 只读挂载证书 + 显式拒绝明文连接；
+ *   - 生产档容器加固必须逐条显式声明：`read_only: true`、`cap_drop: [ALL]`、
+ *     `security_opt: no-new-privileges:true`、显式非 root 的 `user`、只读根下**必要**的 tmpfs
+ *     （api 没有可写路径，因此不许声明 tmpfs；postgres 只许**恰好** /run/postgresql 与 /tmp：
+ *     缺失、额外路径、重复项、以及带 mount 覆盖的等价写法（如 `/tmp:ro`）一律判失败，且
+ *     持久数据卷与证书目录绝不能被 tmpfs 覆盖或只读化）；
+ *   - 「禁止机密进日志」：`command` / `entrypoint` / `healthcheck` 不得引用任何机密类变量
+ *     （它们会出现在 `docker inspect` / `docker ps` / 容器日志里），生产档不得开 DEBUG 类变量、
+ *     `LOG_LEVEL` 默认值不得是 debug/trace，健康探针不得输出或序列化 `process.env`。
  *
  * 判定：全部通过 → 退出码 0；任一断言失败 → 退出码 1（逐条打印失败原因）。
  * `--self-test`：只用内存中的合成样本验证解析器与判定规则本身（不读磁盘），
@@ -154,6 +162,111 @@ export function looksLikeRealSecret(text) {
     return `包含疑似高熵令牌（${longToken[0].slice(0, 12)}…）`;
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// 服务块字段解析（缩进式 YAML 子集；用于容器加固与「禁止机密进日志」断言）
+// ---------------------------------------------------------------------------
+
+/**
+ * 取服务块内某个键的**整个子块文本**：键行本身 + 其后所有缩进更深的行。
+ * 未声明该键时返回 `null`。用于 `healthcheck:` / `command:` 这类嵌套结构。
+ */
+export function readBlockField(block, key) {
+  const lines = block.split(/\r?\n/u);
+  const head = new RegExp(`^(\\s*)${key}:\\s*(.*)$`, 'u');
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = head.exec(lines[index]);
+    if (match === null) {
+      continue;
+    }
+    const indent = match[1].length;
+    const collected = [lines[index]];
+    for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+      const line = lines[cursor];
+      if (line.trim() === '') {
+        collected.push(line);
+        continue;
+      }
+      if ((/^(\s*)/u.exec(line)?.[1] ?? '').length <= indent) {
+        break;
+      }
+      collected.push(line);
+    }
+    return collected.join('\n');
+  }
+  return null;
+}
+
+/** 取服务块内某个**标量**键的值（去掉包裹引号）；未声明返回 `null` */
+export function readScalarField(block, key) {
+  const match = new RegExp(`^\\s*${key}:\\s*(\\S.*)$`, 'mu').exec(block);
+  if (match === null) {
+    return null;
+  }
+  let value = match[1].trim();
+  if (
+    (value.startsWith('"') && value.endsWith('"') && value.length >= 2) ||
+    (value.startsWith("'") && value.endsWith("'") && value.length >= 2)
+  ) {
+    value = value.slice(1, -1);
+  }
+  return value;
+}
+
+/**
+ * 取服务块内某个列表键的条目（`key:` 之后缩进更深的 `- item` 行）。
+ * 未声明该键返回 `null`；声明了但没有条目返回 `[]`。
+ */
+export function readListField(block, key) {
+  const section = readBlockField(block, key);
+  if (section === null) {
+    return null;
+  }
+  const items = [];
+  for (const line of section.split(/\r?\n/u).slice(1)) {
+    const match = /^\s*-\s*(\S.*)$/u.exec(line);
+    if (match !== null) {
+      let item = match[1].trim();
+      if (
+        (item.startsWith('"') && item.endsWith('"')) ||
+        (item.startsWith("'") && item.endsWith("'"))
+      ) {
+        item = item.slice(1, -1);
+      }
+      items.push(item);
+    }
+  }
+  return items;
+}
+
+/** 是否等价于「以 root 运行」：未声明、`root`、uid 0（任意 gid）都算 */
+export function isRootUser(value) {
+  if (value === null || value.trim() === '') {
+    return true;
+  }
+  const [uid] = value.split(':');
+  return uid.trim() === '0' || uid.trim().toLowerCase() === 'root';
+}
+
+/**
+ * 找出文本里对**机密类**变量的引用：`$VAR` / `${VAR}` / `$$VAR` / `$${VAR}` / `${VAR:?...}`
+ * （`$$` 是 Compose 的转义，容器里仍会展开成同一个变量，所以必须一起查）。
+ * 返回去重排序后的变量名数组。
+ */
+export function findSecretReferences(text) {
+  const found = new Set();
+  for (const match of text.matchAll(/\$\$?\{?([A-Za-z_][A-Za-z0-9_]*)/gu)) {
+    if (isSecretKey(match[1])) {
+      found.add(match[1]);
+    }
+  }
+  for (const item of parseInterpolations(text)) {
+    if (isSecretKey(item.name)) {
+      found.add(item.name);
+    }
+  }
+  return [...found].sort();
 }
 
 // ---------------------------------------------------------------------------
@@ -378,7 +491,207 @@ function checkCompose(fileName, mode) {
       /ssl_cert_file=|\/etc\/rm-tls\/server\.crt/u.test(postgres),
       `${fileName}: postgres 必须登记服务端证书路径`,
     );
+
+    checkProductionHardening(fileName, api, postgres);
   }
+}
+
+/** postgres 在只读根下**仅允许**存在的 tmpfs 目标：一个不能少，一个不能多 */
+export const POSTGRES_TMPFS_TARGETS = ['/run/postgresql', '/tmp'];
+
+/**
+ * 拆分一条 tmpfs 声明（沿用本文件既有的解析语义）：
+ * `target` 取第一个 `:` 之前的部分、去空白、去尾部 `/`，空串视为 `/`；
+ * `override` 是 `:` 之后的 mount 选项（无覆盖时是空串）。
+ */
+function splitTmpfsEntry(entry) {
+  const [rawTarget, ...rest] = String(entry).split(':');
+  return {
+    target: rawTarget.trim().replace(/\/+$/u, '') || '/',
+    override: rest.join(':').trim(),
+  };
+}
+
+/**
+ * 计算 postgres tmpfs 声明的违规项（纯函数，供门禁与 --self-test 共用，不读磁盘）。
+ * 判定「恰好 POSTGRES_TMPFS_TARGETS」的四种失败：
+ *   - `missing`：必需目录没声明（保留原有的必需目录检查）；
+ *   - `extraneous`：额外路径（归一化后不在白名单，含 `/` 这类覆盖全部写路径的声明）；
+ *   - `duplicate`：重复项（归一化后同一个目标出现多次）；
+ *   - `override`：带覆盖的等价项（目标合法，但多带了 `:ro` / `:size=…` 这类 mount 选项，
+ *     例如 `:ro` 会让 postgres 需要的可写目录变成只读）。
+ * 归一化沿用既有语义，因此 `/run/postgresql/` 这种等价的尾斜杠写法仍被接受。
+ */
+export function findPostgresTmpfsIssues(entries) {
+  const issues = [];
+  const seen = new Map();
+  const present = new Set();
+  entries.forEach((entry, index) => {
+    const { target, override } = splitTmpfsEntry(entry);
+    if (!POSTGRES_TMPFS_TARGETS.includes(target)) {
+      issues.push({ kind: 'extraneous', index, entry, target });
+      return;
+    }
+    present.add(target);
+    if (override !== '') {
+      issues.push({ kind: 'override', index, entry, target, override });
+    }
+    const firstIndex = seen.get(target);
+    if (firstIndex === undefined) {
+      seen.set(target, index);
+    } else {
+      issues.push({ kind: 'duplicate', index, entry, target, firstIndex });
+    }
+  });
+  for (const target of POSTGRES_TMPFS_TARGETS) {
+    if (!present.has(target)) {
+      issues.push({ kind: 'missing', target });
+    }
+  }
+  return issues;
+}
+
+/** 把 tmpfs 违规项渲染成一条人类可读的失败原因（文件名由调用方补上） */
+function describePostgresTmpfsIssue(fileName, issue) {
+  const allowed = POSTGRES_TMPFS_TARGETS.join(' 与 ');
+  switch (issue.kind) {
+    case 'missing':
+      return `${fileName}: postgres 在只读根下必须在 ${issue.target} 提供 tmpfs（postgres 启动所需的最小可写目录）`;
+    case 'extraneous':
+      return `${fileName}: postgres 只允许 tmpfs 覆盖 ${allowed}，不得声明额外路径 ${issue.entry}（每多一个可写路径就多一个可写面）`;
+    case 'duplicate':
+      return `${fileName}: postgres 的 tmpfs ${issue.target} 重复声明（${issue.entry} 与第 ${issue.firstIndex + 1} 条重复）；每个目录必须恰好声明一次`;
+    case 'override':
+      return `${fileName}: postgres 的 tmpfs ${issue.entry} 是 ${issue.target} 的等价项，但携带了非法 mount 覆盖 ":${issue.override}"（如 :ro 会让 postgres 需要的可写目录变成只读）；只允许裸路径`;
+    default:
+      return `${fileName}: postgres tmpfs 声明非法（${issue.entry ?? issue.target ?? '未知'}）`;
+  }
+}
+
+/**
+ * 生产档容器加固 + 「禁止机密进日志」断言（本地开发档不受影响）。
+ *
+ * 加固基线（两个服务都必须显式声明，不接受「靠镜像默认」）：
+ *   read_only: true / cap_drop: [ALL] / security_opt: no-new-privileges:true / user: 非 root。
+ * 可写路径必须是最小集：
+ *   - api：运行时代码只读文件、只写 stdout，探针也不写文件 → **不许**声明 tmpfs；
+ *   - postgres：只读根下仅 /run/postgresql（Unix socket 目录）与 /tmp（TMPDIR）需要可写；
+ *     持久数据卷必须保持可写、证书目录必须保持只读，二者都不得被 tmpfs 覆盖。
+ * postgres 的 cap_add：非 root 启动时官方 entrypoint 不走 chown/gosu 分支，因此不需要任何能力；
+ * 若将来确需添加，必须同时改这里与 docker-compose.prod.yml 文件头的能力说明（失败文案里写了）。
+ */
+function checkProductionHardening(fileName, api, postgres) {
+  for (const [name, block] of [
+    ['api', api],
+    ['postgres', postgres],
+  ]) {
+    check(
+      readScalarField(block, 'read_only') === 'true',
+      `${fileName}: ${name} 必须显式 read_only: true（只读根文件系统）`,
+    );
+    const capDrop = readListField(block, 'cap_drop');
+    check(
+      capDrop !== null && capDrop.includes('ALL'),
+      `${fileName}: ${name} 必须 cap_drop: [ALL]（去掉全部 Linux capability）`,
+    );
+    const securityOpt = readListField(block, 'security_opt') ?? [];
+    check(
+      securityOpt.includes('no-new-privileges:true'),
+      `${fileName}: ${name} 必须声明 security_opt: no-new-privileges:true（禁止 setuid/文件能力提权）`,
+    );
+    const user = readScalarField(block, 'user');
+    check(user !== null, `${fileName}: ${name} 必须显式声明 user（不许回落到镜像默认 root）`);
+    check(
+      !isRootUser(user),
+      `${fileName}: ${name} 的 user 必须是非 root 且可解析的身份（当前: ${user ?? '未声明'}）`,
+    );
+    check(
+      user === null || /^[A-Za-z_][A-Za-z0-9_-]*(?::[A-Za-z0-9_-]+)?$/u.test(user),
+      `${fileName}: ${name} 的 user 必须是镜像内可解析的用户名（或 uid[:gid]），当前: ${user ?? '未声明'}`,
+    );
+    const restart = readScalarField(block, 'restart');
+    check(
+      restart !== null && restart !== 'no',
+      `${fileName}: ${name} 必须保留重启策略（restart 缺失或为 no 会在故障后留下停摆容器）`,
+    );
+  }
+
+  // api：没有可写路径，多声明一个 tmpfs 就多一个可写面
+  const apiTmpfs = readListField(api, 'tmpfs');
+  check(
+    apiTmpfs === null || apiTmpfs.length === 0,
+    `${fileName}: api 运行期不需要可写目录（只读文件 + 只写 stdout），不得声明 tmpfs（当前: ${(apiTmpfs ?? []).join(', ') || '无'}）`,
+  );
+
+  // postgres：只读根下必要的可写目录，**恰好** POSTGRES_TMPFS_TARGETS：
+  // 一个不能少、一个不能多，也不接受重复项或带 mount 覆盖的等价写法（如 `/tmp:ro`）。
+  const postgresTmpfs = readListField(postgres, 'tmpfs') ?? [];
+  for (const issue of findPostgresTmpfsIssues(postgresTmpfs)) {
+    failures.push(describePostgresTmpfsIssue(fileName, issue));
+  }
+  for (const entry of postgresTmpfs) {
+    const { target } = splitTmpfsEntry(entry);
+    for (const protectedPath of ['/var/lib/postgresql/data', '/etc/rm-tls']) {
+      const shadows =
+        target === '/' || target === protectedPath || protectedPath.startsWith(`${target}/`);
+      check(
+        !shadows,
+        `${fileName}: tmpfs ${entry} 不得覆盖 ${protectedPath}（持久数据/证书必须是卷或只读挂载，不能是 tmpfs）`,
+      );
+    }
+  }
+
+  // 数据卷必须仍然可写：postgres 的数据不允许只读
+  const dataMount = /rm-postgres-data:\S*/u.exec(postgres);
+  check(dataMount !== null, `${fileName}: postgres 数据卷 rm-postgres-data 必须仍然挂载`);
+  check(
+    dataMount === null || !/:ro\b/u.test(dataMount[0]),
+    `${fileName}: postgres 数据卷必须可写（不得挂成 :ro）`,
+  );
+
+  // 非 root 启动时官方 entrypoint 不需要任何能力：不给 cap_add 留模糊空间
+  const capAdd = readListField(postgres, 'cap_add');
+  check(
+    capAdd === null || capAdd.length === 0,
+    `${fileName}: postgres 以非 root 启动时不需要 cap_add（当前: ${(capAdd ?? []).join(', ')}）；如确需添加，必须同时更新本门禁与 docker-compose.prod.yml 文件头的能力说明`,
+  );
+
+  // ---- 禁止机密进日志 ----
+  // command / entrypoint / healthcheck 的内容会出现在 docker inspect、docker ps 与容器日志里
+  for (const [name, block] of [
+    ['api', api],
+    ['postgres', postgres],
+  ]) {
+    for (const field of ['command', 'entrypoint', 'healthcheck']) {
+      const section = readBlockField(block, field);
+      if (section === null) {
+        continue;
+      }
+      const leaked = findSecretReferences(section);
+      check(
+        leaked.length === 0,
+        `${fileName}: ${name} 的 ${field} 不得引用机密类变量 ${leaked.join(', ')}（会出现在 docker inspect / docker ps / 容器日志里；机密只允许经 environment 注入）`,
+      );
+    }
+  }
+
+  // 调试类环境变量会把内部细节（含库连接串等）写进日志；LOG_LEVEL 的默认档位不得是调试档
+  for (const key of ['DEBUG', 'NODE_DEBUG', 'NODE_OPTIONS', 'DEBUG_FD', 'DEBUG_COLORS']) {
+    const declared = readScalarField(api, key) ?? readScalarField(postgres, key);
+    check(
+      declared === null,
+      `${fileName}: 生产档不得声明 ${key}（会开启内部/调试输出，可能把机密写进日志）`,
+    );
+  }
+  const logLevel = parseInterpolations(stripYamlComments(api)).find(
+    (item) => item.name === 'LOG_LEVEL',
+  );
+  const logLevelDefault =
+    logLevel?.operator === 'defaulted' ? logLevel.defaultValue.trim().toLowerCase() : '';
+  check(
+    !/^(?:debug|trace|verbose|silly)$/u.test(logLevelDefault),
+    `${fileName}: LOG_LEVEL 的默认值不得是 debug/trace/verbose（调试档会把内部细节写进日志），当前: ${logLevelDefault === '' ? '(非默认档)' : logLevelDefault}`,
+  );
 }
 
 /** 检查 Dockerfile（构建顺序、入口、健康检查、非 root、无内置机密） */
@@ -400,6 +713,21 @@ function checkDockerfile() {
     'Dockerfile 必须用 --frozen-lockfile 安装（锁文件可复现）',
   );
   check(/USER\s+node\b/u.test(text), 'Dockerfile 运行阶段必须以非 root 用户启动（USER node）');
+  // 运行阶段不得再切回 root（后出现的 USER root/0 会覆盖前面的非 root 声明）
+  check(
+    !/^USER\s+(?:root|0)\s*$/mu.test(text),
+    'Dockerfile 不得把运行用户设回 root（USER root/0）',
+  );
+  // 「禁止机密进日志」：本地 .env 不得进镜像，也不得被打印到构建日志里
+  // `(?<![\w.-])` 保证命中的是 `.env` 这个文件名本身，而不是 `foo.env` 这类同名后缀
+  check(
+    !/^\s*(?:COPY|ADD)\s+[^\n]*(?<![\w.-])\.env\b/mu.test(text),
+    'Dockerfile 不得把 .env 拷进镜像（机密只允许运行时注入）',
+  );
+  check(
+    !/^RUN[^\n]*(?<![\w.-])\.env\b/mu.test(text),
+    'Dockerfile 的 RUN 不得触碰 .env（内容会留在构建日志/镜像层里）',
+  );
   check(
     /HEALTHCHECK[\s\S]*scripts\/docker-healthcheck\.mjs/u.test(text),
     'Dockerfile 的 HEALTHCHECK 必须复用 scripts/docker-healthcheck.mjs',
@@ -491,6 +819,25 @@ function checkHealthcheckScript() {
   check(
     !/\/api\/v1\/health/u.test(code),
     'scripts/docker-healthcheck.mjs 不得在代码里硬编码 /api/v1/health 路径（注释里的缺陷说明不算）',
+  );
+  // 「禁止机密进日志」：探针的输出会直接进入容器日志，因此不得整体输出环境、
+  // 也不得读取任何机密类环境变量（探针只需要路径与端口）。
+  check(
+    !/JSON\.stringify\(\s*process\.env|Object\.(?:entries|keys|values)\(\s*process\.env|console\.\w+\(\s*process\.env/u.test(
+      code,
+    ),
+    'scripts/docker-healthcheck.mjs 不得整体输出 process.env（会把环境细节/机密写进容器日志）',
+  );
+  const secretEnvReads = [
+    ...new Set(
+      [...code.matchAll(/\benv(?:ironment)?\.([A-Z_][A-Z0-9_]*)/gu)]
+        .map((match) => match[1])
+        .filter((name) => isSecretKey(name)),
+    ),
+  ];
+  check(
+    secretEnvReads.length === 0,
+    `scripts/docker-healthcheck.mjs 不得读取机密类环境变量 ${secretEnvReads.join(', ')}（探针无需任何凭据）`,
   );
 }
 
@@ -679,6 +1026,188 @@ function selfTest() {
       looksLikeRealSecret('POSTGRES_PASSWORD=change-me'),
     ],
     ['包含 PEM 私钥块', '包含疑似高熵令牌（ABCDEFGHIJKL…）', null],
+  );
+
+  const hardeningSample = [
+    '    read_only: true',
+    '    user: "postgres"',
+    '    cap_drop:',
+    '      - ALL',
+    '    security_opt:',
+    '      - no-new-privileges:true',
+    '    tmpfs:',
+    '      - /run/postgresql',
+    '      - /tmp',
+    '    restart: always',
+    '',
+  ].join('\n');
+  expect(
+    'readScalarField 取标量、去引号、未声明返回 null',
+    [
+      readScalarField(hardeningSample, 'read_only'),
+      readScalarField(hardeningSample, 'user'),
+      readScalarField(hardeningSample, 'restart'),
+      readScalarField(hardeningSample, 'cap_add'),
+    ],
+    ['true', 'postgres', 'always', null],
+  );
+  expect(
+    'readListField 取列表条目并停在下一个键',
+    [
+      readListField(hardeningSample, 'cap_drop'),
+      readListField(hardeningSample, 'tmpfs'),
+      readListField(hardeningSample, 'entrypoint'),
+    ],
+    [['ALL'], ['/run/postgresql', '/tmp'], null],
+  );
+  expect(
+    'readBlockField 取整个子块（含嵌套行，遇到同级键即停）',
+    readBlockField(
+      '    healthcheck:\n      test: ["CMD","node","x"]\n      interval: 20s\n    restart: always\n',
+      'healthcheck',
+    ),
+    '    healthcheck:\n      test: ["CMD","node","x"]\n      interval: 20s',
+  );
+  expect(
+    'isRootUser：未声明/root/0 都算 root',
+    [
+      isRootUser(null),
+      isRootUser(''),
+      isRootUser('root'),
+      isRootUser('0'),
+      isRootUser('0:0'),
+      isRootUser('node'),
+      isRootUser('70:70'),
+    ],
+    [true, true, true, true, true, false, false],
+  );
+  expect(
+    'findSecretReferences 捕获 $VAR / $$VAR / $${VAR} / ${VAR:?...}',
+    findSecretReferences(
+      'echo "$POSTGRES_USER"\npg_isready -U "$$POSTGRES_USER"\nprintf %s $${POSTGRES_PASSWORD}\n"${SESSION_SECRET:?x}"\n-DATABASE_URL=$DATABASE_URL',
+    ),
+    ['DATABASE_URL', 'POSTGRES_PASSWORD', 'SESSION_SECRET'],
+  );
+  expect(
+    'findSecretReferences 不误报非机密变量',
+    findSecretReferences('pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"'),
+    [],
+  );
+
+  // ---- postgres tmpfs 白名单：恰好 /run/postgresql 与 /tmp ----
+  const tmpfsKinds = (entries) => findPostgresTmpfsIssues(entries).map((issue) => issue.kind);
+  expect(
+    'findPostgresTmpfsIssues 接受恰好两个裸路径（顺序无关）',
+    [tmpfsKinds(['/run/postgresql', '/tmp']), tmpfsKinds(['/tmp', '/run/postgresql'])],
+    [[], []],
+  );
+  expect(
+    'findPostgresTmpfsIssues 按既有语义接受尾斜杠等价写法',
+    tmpfsKinds(['/run/postgresql/', '/tmp']),
+    [],
+  );
+  expect(
+    'findPostgresTmpfsIssues 拒绝额外路径（含覆盖全部写路径的 /）',
+    [
+      tmpfsKinds(['/run/postgresql', '/tmp', '/var/tmp']),
+      tmpfsKinds(['/run/postgresql', '/tmp', '/']),
+    ],
+    [['extraneous'], ['extraneous']],
+  );
+  expect(
+    'findPostgresTmpfsIssues 拒绝重复项',
+    [tmpfsKinds(['/run/postgresql', '/tmp', '/tmp']), tmpfsKinds(['/tmp', '/tmp'])],
+    [['duplicate'], ['duplicate', 'missing']],
+  );
+  expect(
+    'findPostgresTmpfsIssues 拒绝带 mount 覆盖的等价项',
+    [tmpfsKinds(['/run/postgresql', '/tmp:ro']), tmpfsKinds(['/run/postgresql', '/tmp:size=64m'])],
+    [['override'], ['override']],
+  );
+  expect(
+    'findPostgresTmpfsIssues 检测缺失的必需目录',
+    [tmpfsKinds(['/run/postgresql']), tmpfsKinds([])],
+    [['missing'], ['missing', 'missing']],
+  );
+
+  // 端到端合成反例：用一份其余加固项全部合规的服务块驱动真实门禁函数，
+  // 只改 tmpfs 一个变量，确认「多一个 tmpfs 就必然失败」——防止门禁自己坏掉却报通过。
+  const hardeningProbe = (tmpfsEntries) => {
+    const postgresBlock = [
+      '    image: postgres:16-alpine',
+      '    read_only: true',
+      '    user: "postgres"',
+      '    cap_drop:',
+      '      - ALL',
+      '    security_opt:',
+      '      - no-new-privileges:true',
+      '    volumes:',
+      '      - rm-postgres-data:/var/lib/postgresql/data',
+      '    tmpfs:',
+      ...tmpfsEntries.map((entry) => `      - ${entry}`),
+      '    restart: always',
+      '',
+    ].join('\n');
+    const apiBlock = [
+      '    image: rm-api:prod',
+      '    read_only: true',
+      '    user: "node"',
+      '    cap_drop:',
+      '      - ALL',
+      '    security_opt:',
+      '      - no-new-privileges:true',
+      '    restart: always',
+      '',
+    ].join('\n');
+    const savedFailures = failures.splice(0, failures.length);
+    const savedWarnings = warnings.splice(0, warnings.length);
+    try {
+      checkProductionHardening('合成样本', apiBlock, postgresBlock);
+      return { count: failures.length, messages: [...failures] };
+    } finally {
+      failures.length = 0;
+      warnings.length = 0;
+      failures.push(...savedFailures);
+      warnings.push(...savedWarnings);
+    }
+  };
+  expect(
+    'checkProductionHardening 通过：postgres tmpfs 恰好两个必需目录',
+    hardeningProbe(['/run/postgresql', '/tmp']).count,
+    0,
+  );
+  const extraTmpfsProbe = hardeningProbe(['/run/postgresql', '/tmp', '/var/tmp']);
+  expect(
+    'checkProductionHardening 失败：postgres 多声明一个 tmpfs（合成反例）',
+    [
+      extraTmpfsProbe.count,
+      extraTmpfsProbe.messages.some((message) => message.includes('额外路径 /var/tmp')),
+    ],
+    [1, true],
+  );
+  expect(
+    'checkProductionHardening 失败：postgres tmpfs 重复项',
+    hardeningProbe(['/run/postgresql', '/tmp', '/tmp']).count,
+    1,
+  );
+  expect(
+    'checkProductionHardening 失败：postgres tmpfs 带非法覆盖的等价项',
+    hardeningProbe(['/run/postgresql', '/tmp:ro']).count,
+    1,
+  );
+  expect(
+    'checkProductionHardening 失败：postgres 缺少必需 tmpfs',
+    hardeningProbe(['/run/postgresql']).count,
+    1,
+  );
+  const rootTmpfsProbe = hardeningProbe(['/run/postgresql', '/tmp', '/']);
+  expect(
+    'checkProductionHardening 失败：postgres 用通配 / 作为 tmpfs（额外路径 + 覆盖数据卷与证书目录）',
+    [
+      rootTmpfsProbe.count,
+      rootTmpfsProbe.messages.filter((message) => message.includes('不得覆盖')).length,
+    ],
+    [3, 2],
   );
 
   const failed = cases.filter((item) => !item.ok);
