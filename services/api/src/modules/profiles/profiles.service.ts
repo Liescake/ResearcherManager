@@ -60,14 +60,14 @@ export class ProfilesService {
   ) {}
 
   /** 本人画像：先按服务端主体做 SELF 授权，再取数并校验存储归属一致性 */
-  getMyProfile(subject: AuthorizationSubject): StudentProfileView {
-    return this.toView(this.requireOwnProfile(subject, PermissionPoint.ProfileSelfRead));
+  async getMyProfile(subject: AuthorizationSubject): Promise<StudentProfileView> {
+    return this.toView(await this.requireOwnProfile(subject, PermissionPoint.ProfileSelfRead));
   }
 
   /** 更新本人画像：闭集 + 共享 schema 校验后，按服务端归属合并写回 */
-  updateMyProfile(subject: AuthorizationSubject, body: unknown): StudentProfileView {
+  async updateMyProfile(subject: AuthorizationSubject, body: unknown): Promise<StudentProfileView> {
     // 1. 授权 + 读取 + 归属校验（403 / 404 / 500 都在这一步产生，先于请求体校验）
-    const existing = this.requireOwnProfile(subject, PermissionPoint.ProfileSelfUpdate);
+    const existing = await this.requireOwnProfile(subject, PermissionPoint.ProfileSelfUpdate);
 
     // 2. 输入闭集 → 字段级校验（共享 zod schema）：未知字段、身份/权限字段、未登记枚举、
     //    越界数值、控制字符、「未同意隐私政策」等一律抛 ZodError，由统一异常过滤器映射为 400。
@@ -77,7 +77,7 @@ export class ProfilesService {
     // 3. 合并（归属/创建时间 immutable）→ 写前校验 → 写回 → 输出前校验
     const now = new Date().toISOString();
     const next = mergeStoredProfile(existing, input, now);
-    const persisted = this.repository.save(this.assertStoredProfile(next));
+    const persisted = await this.repository.save(this.assertStoredProfile(next));
     return this.toView(persisted);
   }
 
@@ -97,14 +97,22 @@ export class ProfilesService {
   private requireOwnProfile(
     subject: AuthorizationSubject,
     permission: PermissionPoint,
-  ): StoredStudentProfile {
+  ): Promise<StoredStudentProfile> {
     this.guard.assertAuthorized(subject, {
       permission,
       scope: DataScope.Self,
       resourceUserId: subject.userId,
     });
 
-    const record = this.repository.findByUserId(subject.userId);
+    return this.readOwnProfile(subject, permission);
+  }
+
+  /** 取数 + 归属二次授权：与 `requireOwnProfile` 拆开只为让「先授权」这一步保持同步、不被 await 掩盖 */
+  private async readOwnProfile(
+    subject: AuthorizationSubject,
+    permission: PermissionPoint,
+  ): Promise<StoredStudentProfile> {
+    const record = await this.repository.findByUserId(subject.userId);
     if (!record) {
       throw new NotFoundException('本人画像不存在');
     }

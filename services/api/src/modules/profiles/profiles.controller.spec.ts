@@ -19,6 +19,7 @@ import { ConfigModule } from '../../config/config.module';
 import { loadEnv } from '../../config/env';
 import { AuthModule } from '../auth/auth.module';
 import { InMemorySessionStore } from '../auth/session-store.in-memory';
+import { SESSION_STORE } from '../auth/session-subject.port';
 import { AuthorizationGuard } from '../access-control/authorization-guard';
 import { RUOYI_AUTHZ_ADAPTER } from '../ruoyi-adapter/ruoyi-adapter.port';
 import type { AuthorizationDecision, RuoYiAuthzAdapter } from '../ruoyi-adapter/ruoyi-adapter.port';
@@ -141,11 +142,11 @@ class ForeignOwnerProfileRepository implements ProfileRepository {
 
   constructor(private readonly foreign: StudentProfile) {}
 
-  findByUserId(_userId: string): StudentProfile | undefined {
+  async findByUserId(_userId: string): Promise<StudentProfile | undefined> {
     return { ...this.foreign };
   }
 
-  save(_profile: StudentProfile): StudentProfile {
+  async save(_profile: StudentProfile): Promise<StudentProfile> {
     this.saveCalls += 1;
     throw new Error('归属不符时不得写入');
   }
@@ -232,7 +233,7 @@ async function startProfilesApp(): Promise<{
   await app.listen(0, '127.0.0.1');
   startedApps.push(app);
 
-  const sessions = app.get(InMemorySessionStore);
+  const sessions = app.get<InMemorySessionStore>(SESSION_STORE);
   sessions.seed({
     sessionId: SESSION_STUDENT_1,
     subject: { userId: 'u-student-1', roles: [Role.Student] },
@@ -255,7 +256,8 @@ async function startProfilesApp(): Promise<{
     app,
     baseUrl: `${await app.getUrl()}/api/v1`,
     sessions,
-    repository: app.get(InMemoryProfileRepository),
+    // 绑定点是端口：内存基线不再是独立 provider（避免「容器里那个实例」与「端口上那个实例」两份状态）
+    repository: app.get<InMemoryProfileRepository>(PROFILE_REPOSITORY),
   };
 }
 
@@ -269,7 +271,7 @@ async function startForeignOwnerApp(): Promise<{
   await app.listen(0, '127.0.0.1');
   startedApps.push(app);
 
-  const sessions = app.get(InMemorySessionStore);
+  const sessions = app.get<InMemorySessionStore>(SESSION_STORE);
   sessions.seed({
     sessionId: SESSION_STUDENT_1,
     subject: { userId: 'u-student-1', roles: [Role.Student] },
@@ -362,7 +364,7 @@ describe('画像：成功路径（真实 HTTP + 统一响应信封）', () => {
       createdAt: FIXTURE_NOW,
     });
 
-    const stored = repository.findByUserId('u-student-1');
+    const stored = await repository.findByUserId('u-student-1');
     expect(stored?.userId).toBe('u-student-1');
     expect(stored?.createdAt).toBe(FIXTURE_NOW);
     expect(stored?.updatedAt).toBe(data.updatedAt);
@@ -388,7 +390,7 @@ describe('画像：成功路径（真实 HTTP + 统一响应信封）', () => {
     const data = res.body.data as Record<string, unknown>;
     expect(Object.keys(data)).not.toContain('researchExperience');
     expect(Object.keys(data)).not.toContain('strengths');
-    const stored = repository.findByUserId('u-student-1');
+    const stored = await repository.findByUserId('u-student-1');
     expect(stored?.researchExperience).toBeUndefined();
     expect(stored?.strengths).toBeUndefined();
   });
@@ -406,7 +408,7 @@ describe('画像：成功路径（真实 HTTP + 统一响应信封）', () => {
     expect(Object.keys(providedData)).not.toContain('privacyConsent');
     expect(provided.text).not.toContain('policyVersion');
 
-    const consent = repository.findByUserId('u-student-1')?.privacyConsent;
+    const consent = (await repository.findByUserId('u-student-1'))?.privacyConsent;
     expect(consent?.policyVersion).toBe('v1.1');
     expect(consent?.consentedAt).toBeTruthy();
     expect(new Date(String(consent?.consentedAt)).toISOString()).toBe(consent?.consentedAt);
@@ -418,7 +420,9 @@ describe('画像：成功路径（真实 HTTP + 统一响应信封）', () => {
     expect(kept.status).toBe(200);
     expect(kept.text).not.toContain('policyVersion');
     // 未提交隐私同意时沿用原快照（存储值不变）
-    expect(repository.findByUserId('u-student-1')?.privacyConsent.policyVersion).toBe('v1.1');
+    expect((await repository.findByUserId('u-student-1'))?.privacyConsent.policyVersion).toBe(
+      'v1.1',
+    );
   });
 
   it('两个用户各自读取与更新：只作用于本人记录，他人记录完全不变', async () => {
@@ -449,9 +453,9 @@ describe('画像：成功路径（真实 HTTP + 统一响应信封）', () => {
       body: validPatchBody,
     });
     expect(patched.status).toBe(200);
-    expect(repository.findByUserId('u-student-1')?.college).toBe('数学学院');
+    expect((await repository.findByUserId('u-student-1'))?.college).toBe('数学学院');
     // 他人记录连时间戳都不变
-    const untouched = repository.findByUserId('u-student-2');
+    const untouched = await repository.findByUserId('u-student-2');
     expect(untouched?.college).toBe('他人学院');
     expect(untouched?.updatedAt).toBe(FIXTURE_NOW);
   });
@@ -490,7 +494,7 @@ describe('画像：输入拒绝（400 VALIDATION_FAILED，不落库）', () => {
     expect(res.body.error?.requestId).toBeTruthy();
     expect(issuesOf(res.body).length).toBeGreaterThan(0);
     // 存储记录保持原样（连 updatedAt 都不变）
-    const stored = repository.findByUserId('u-student-1');
+    const stored = await repository.findByUserId('u-student-1');
     expect(stored?.updatedAt).toBe(FIXTURE_NOW);
     expect(stored?.college).toBe('计算机学院');
     // 拒绝响应同样不泄露高敏感明文
@@ -545,9 +549,9 @@ describe('画像：输入拒绝（400 VALIDATION_FAILED，不落库）', () => {
     }
 
     // 伪造的归属没有被采纳为写入目标，本人记录也未被改动
-    expect(repository.findByUserId('u-victim-1')).toBeUndefined();
-    expect(repository.findByUserId('u-student-1')?.updatedAt).toBe(FIXTURE_NOW);
-    expect(repository.findByUserId('u-student-1')?.userId).toBe('u-student-1');
+    expect(await repository.findByUserId('u-victim-1')).toBeUndefined();
+    expect((await repository.findByUserId('u-student-1'))?.updatedAt).toBe(FIXTURE_NOW);
+    expect((await repository.findByUserId('u-student-1'))?.userId).toBe('u-student-1');
   });
 
   it('无画像时更新 404、读取 404；非法画像 ID 之类的外部输入无从注入', async () => {
@@ -598,7 +602,7 @@ describe('画像：认证边界 401（fail-closed）', () => {
     });
     expect(write.status).toBe(401);
     expect(write.body.error?.code).toBe('UNAUTHENTICATED');
-    expect(repository.findByUserId('u-student-1')?.college).toBe('计算机学院');
+    expect((await repository.findByUserId('u-student-1'))?.college).toBe('计算机学院');
   });
 
   it('未认证 + 非法请求体 → 仍是 401（认证先于字段校验）', async () => {
@@ -611,7 +615,7 @@ describe('画像：认证边界 401（fail-closed）', () => {
 
     expect(res.status).toBe(401);
     expect(res.body.error?.code).toBe('UNAUTHENTICATED');
-    expect(repository.findByUserId('u-student-1')?.updatedAt).toBe(FIXTURE_NOW);
+    expect((await repository.findByUserId('u-student-1'))?.updatedAt).toBe(FIXTURE_NOW);
   });
 });
 
@@ -688,7 +692,7 @@ describe('画像：越权 403（AuthorizationGuard + RUOYI_AUTHZ_ADAPTER）', ()
       allowed: false,
       reason: 'policy-denied',
     });
-    const collegeBefore = repository.findByUserId('u-student-1')?.college;
+    const collegeBefore = (await repository.findByUserId('u-student-1'))?.college;
     const findByUserId = vi.spyOn(repository, 'findByUserId');
 
     const read = await call(baseUrl, 'GET', '/me/profile', { headers: bearer(SESSION_STUDENT_1) });
@@ -729,7 +733,7 @@ describe('画像：越权 403（AuthorizationGuard + RUOYI_AUTHZ_ADAPTER）', ()
     expect(issuesOf(res.body)).toHaveLength(0);
     // 授权拒绝排在取数与字段校验之前
     expect(findByUserId).not.toHaveBeenCalled();
-    expect(repository.findByUserId('u-student-1')?.updatedAt).toBe(FIXTURE_NOW);
+    expect((await repository.findByUserId('u-student-1'))?.updatedAt).toBe(FIXTURE_NOW);
   });
 
   it('端口抛出的拒绝决策不携带内部原因，403 文案固定', async () => {
@@ -792,17 +796,18 @@ describe('画像：存储异常 fail-closed（不得当正常输出）', () => {
 });
 
 describe('切片装配与既有路由不变', () => {
-  it('ProfilesModule 只注册本切片的路由与服务，并把仓储端口显式绑到内存基线', () => {
+  it('ProfilesModule 只注册本切片的路由与服务，并把仓储端口绑到「按是否配置数据库分流」的工厂', () => {
     const providers = (Reflect.getMetadata('providers', ProfilesModule) ?? []) as unknown[];
     const controllers = (Reflect.getMetadata('controllers', ProfilesModule) ?? []) as unknown[];
     const imports = (Reflect.getMetadata('imports', ProfilesModule) ?? []) as unknown[];
 
     expect(controllers).toEqual([ProfilesController]);
     expect(providers).toContain(ProfilesService);
-    expect(providers).toContainEqual({
-      provide: PROFILE_REPOSITORY,
-      useExisting: InMemoryProfileRepository,
-    });
+    // 绑定点是端口 + 工厂：不再有「内存基线 provider」这第二个实例（避免两份状态）
+    expect(providers).not.toContain(InMemoryProfileRepository);
+    expect(providers).toContainEqual(
+      expect.objectContaining({ provide: PROFILE_REPOSITORY, useFactory: expect.any(Function) }),
+    );
     // 依赖方向：认证（auth）与授权（access-control）各自只经端口/服务暴露
     expect(imports).toContain(AuthModule);
   });
@@ -845,6 +850,7 @@ describe('切片装配与既有路由不变', () => {
       'apiPort',
       'apiPrefix',
       'databaseConfigured',
+      'dependencyGate',
       'nodeEnv',
     ]);
 
@@ -863,6 +869,6 @@ describe('切片装配与既有路由不变', () => {
 
   it('默认装配不预置任何画像：内存基线初始为空', async () => {
     const { repository } = await startProfilesApp();
-    expect(repository.findByUserId('u-student-1')).toBeUndefined();
+    expect(await repository.findByUserId('u-student-1')).toBeUndefined();
   });
 });

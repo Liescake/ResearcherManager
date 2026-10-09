@@ -11,6 +11,7 @@ import { parseStoredStudentProfile, storedStudentProfileSchema } from './student
 import {
   PROFILE_REPOSITORY_BACKEND_POSTGRES,
   type AsyncProfileRepository,
+  type ProfileRepository,
   type ProfileRepositoryCapabilities,
   type StudentProfile,
   type StoredAvailableTime,
@@ -18,24 +19,19 @@ import {
 } from './student-profile.port';
 
 /**
- * 学生画像的 **PostgreSQL 仓储 adapter（首个可验证实现，未接入运行时）**。
+ * 学生画像的 **PostgreSQL 仓储 adapter**（`DATABASE_URL` 已配置时的运行时实现）。
  *
- * ## 交付边界（本切片刻意不做的事）
- * - **不绑定**到 `ProfilesModule`：模块仍然只绑定内存基线 `InMemoryProfileRepository`，
- *   运行时行为与本切片之前逐字节一致（有回归断言，见同名 spec）；
+ * ## 交付边界
+ * - **绑定点只有一个**：`profiles.module.ts` 的 `createProfileRepository()` 按「是否配置数据库」
+ *   分流 —— 未配置时内存基线，配置时本文件的 `createLazyPostgresStudentProfileRepository`
+ *   （延迟建连）；配置了数据库却拿不到 `SQL_CONNECTION_FACTORY` 时**抛错**，绝不静默退回内存。
+ *   本文件本身不带 Nest 装饰器：装配只发生在 Module 的工厂里；
  * - **不引入** `pg` / Prisma / TypeORM 等驱动或 ORM 依赖：本文件只依赖驱动无关的
- *   `SqlExecutor` 端口（`db/ports/sql-executor.port.ts`），真实执行器由消费方在「启用数据库」
- *   那一步显式提供；
+ *   `SqlExecutor` 端口（`db/ports/sql-executor.port.ts`），驱动只允许出现在 `db/postgres/`；
  * - **不声称生产可用**：能力声明固定为 `backend = postgres`、`persistent = true`、
- *   `productionReady = false`。在引入经评估的驱动、完成对真实 PostgreSQL 的集成验证、
- *   并解决下方「PII 落地形态」之前，生产启动会被 `PersistenceBoundaryService` 拒绝
- *   （`productionReady !== true` 即违规）。
- *
- * ## 为什么先有异步契约
- * 现有 `ProfileRepository`（`student-profile.port.ts`）是同步接口；把运行时端口改成 Promise 是
- * 跨模块契约变更（service / controller / 既有 spec 必须一起改），必须与真实驱动引入在同一片
- * 切片完成。因此本文件实现 `AsyncProfileRepository`（Promise 版，语义与内存基线完全一致），
- * 让「SQL 与映射是否正确」可以在**没有驱动、也没有数据库**的情况下被离线验证。
+ *   `productionReady = false`。在解决下方「PII 落地形态」、把会话主体标识收敛为 UUID
+ *   并补齐验证证据之前，启动期依赖就绪门禁会把「数据库已配置」的装配判为
+ *   `PROFILE_REPOSITORY[DEPENDENCY_NOT_VERIFIED]` 并 fail-closed（`productionReady !== true` 即违规）。
  *
  * ## 安全边界（本文件的四条硬约束）
  * 1. **参数化 SQL**：所有客户端可控的值一律走 `$1…$n` 占位符绑定；进入 SQL 文本的只有模块
@@ -626,7 +622,8 @@ function writeParameters(record: StudentProfile): readonly unknown[] {
  *
  * 构造与每次调用都会重新校验执行器（`assertUsableExecutor`）与自身能力声明，
  * 因此「执行器被换掉 / 被降级」或「能力声明被改写」都会 fail-closed，而不是静默继续。
- * 本类**不是** Nest provider，也未在任何模块中注册。
+ * 本类**不是** Nest provider：它不由容器实例化，只由 Module 的工厂
+ * （`createProfileRepository` → `createLazyPostgresStudentProfileRepository`）显式构造。
  */
 export class PostgresStudentProfileRepository implements AsyncProfileRepository {
   readonly capabilities: ProfileRepositoryCapabilities =
@@ -730,4 +727,63 @@ export class PostgresStudentProfileRepository implements AsyncProfileRepository 
     }
     return stored;
   }
+}
+
+/** DI 工厂：把驱动无关的 `SqlExecutor` 装成画像仓储端口实现（本切片**唯一**的换绑点） */
+export function createPostgresStudentProfileRepository(executor: SqlExecutor): ProfileRepository {
+  return new PostgresStudentProfileRepository(executor);
+}
+
+/** 把「主体必须在存储 ID 域内」变成可先于建连执行的断言（供分流点与测试复用） */
+export function assertPostgresStudentProfileSubject(userId: unknown): string {
+  return requireStorageOwnerId(
+    userId,
+    'INVALID_SUBJECT',
+    '取数主体必须落在存储 ID 域内（合法且非空的 UUID）：非 UUID 的 userId 属于服务端缺陷，不得进入 SQL',
+  );
+}
+
+/**
+ * 延迟建连的画像仓储：**模块装配阶段不碰数据库**。
+ *
+ * 为什么必须延迟：`SQL_CONNECTION_FACTORY.connect()` 在数据库已配置但执行器未通过 attest 契约时
+ * 会抛错。如果在这里急切建连，启动失败会表现为「模块工厂抛了数据库错」，而不是启动期持久化边界
+ * 给出的**结构化违规**（`SQL_EXECUTOR_VERIFICATION_REQUIRED` / `DECLARATION_NOT_SEALED` 等）；
+ * 依赖就绪门禁也必须能在**任何连接之前**给出 `PROFILE_REPOSITORY[DEPENDENCY_NOT_VERIFIED]`。
+ * 延迟后，判定顺序保持为「配置 → 持久化边界 / 依赖就绪 → 首次真正读库」。
+ *
+ * 连接只在首次读写时建立并被复用；建立失败不缓存失败结果（下一次调用会重试）。
+ * 主体域先判、再建连：非存储 ID 域（非 UUID）的主体不会触发任何数据库连接。
+ */
+export function createLazyPostgresStudentProfileRepository(
+  resolveExecutor: () => Promise<SqlExecutor>,
+  capabilities: ProfileRepositoryCapabilities = POSTGRES_STUDENT_PROFILE_REPOSITORY_CAPABILITIES,
+): ProfileRepository {
+  assertPostgresStudentProfileRepositoryCapabilities(capabilities);
+
+  let pending: Promise<SqlExecutor> | undefined;
+  const executor = (): Promise<SqlExecutor> => {
+    if (pending === undefined) {
+      pending = resolveExecutor().catch((error: unknown) => {
+        pending = undefined;
+        throw error;
+      });
+    }
+    return pending;
+  };
+
+  return {
+    capabilities,
+    async findByUserId(userId: string): Promise<StudentProfile | undefined> {
+      const ownerId = assertPostgresStudentProfileSubject(userId);
+      const resolved = await executor();
+      return new PostgresStudentProfileRepository(resolved).findByUserId(ownerId);
+    },
+    async save(profile: StudentProfile): Promise<StudentProfile> {
+      // 主体域先判、再建连：非存储 ID 域的写记录不应该触发任何数据库连接
+      assertPostgresStudentProfileSubject(profile.userId);
+      const resolved = await executor();
+      return new PostgresStudentProfileRepository(resolved).save(profile);
+    },
+  };
 }

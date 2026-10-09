@@ -33,7 +33,7 @@ import {
  *
  * 覆盖五类要求：
  * - **repository 契约**：能力声明（persistent=true / productionReady=false）、列 ↔ 读取契约字段
- *   一一对应、未被装配到 `ProfilesModule`、不引驱动/ORM、未转为迁移；
+ *   一一对应、已按登记表的令牌名 + 工厂导出名绑定到 `ProfilesModule`、不引驱动/ORM、与迁移对齐；
  * - **参数化 SQL**：客户端可控值只出现在参数里，SQL 文本只由模块常量构成；
  * - **SQL 注入**：名称/标签/归属等所有入口的注入载荷要么只进参数、要么在进入 SQL 之前被拒绝；
  * - **未知列 / 非法状态**：未登记列、未知 jsonb 键、非法枚举、坏时间戳、坏形状一律 fail-closed；
@@ -64,7 +64,15 @@ const ADAPTER_PATH = resolve(
   'profiles',
   'student-profile.postgres-repository.ts',
 );
-const ADAPTER_CLASS = 'PostgresStudentProfileRepository';
+/**
+ * 类名的**词边界**匹配。
+ *
+ * 为什么不能用 `toContain('PostgresStudentProfileRepository')`：工厂名
+ * `createLazyPostgresStudentProfileRepository` 以类名结尾，子串匹配会把「模块引用了工厂」
+ * 误判成「模块把 adapter 类当 provider 绑定了」—— 那正是**已绑定**切片应当做的事。词边界
+ * 只认独立的类名，因此「类名出现在模块里」仍然是一个可判定的违规。
+ */
+const ADAPTER_CLASS_PATTERN = /\bPostgresStudentProfileRepository\b/u;
 const ADAPTER_MODULE = 'student-profile.postgres-repository';
 
 interface RecordedCall {
@@ -308,7 +316,7 @@ describe('PostgreSQL 画像仓储：repository 契约与能力声明', () => {
     expect([...POSTGRES_STUDENT_PROFILE_IMMUTABLE_COLUMNS]).toEqual(['user_id', 'created_at']);
   });
 
-  it('实现的是异步仓储契约（Promise 语义），未被绑定为同步端口', async () => {
+  it('实现的就是运行时端口（异步契约）：Promise 语义，可直接换绑', async () => {
     const executor = new RecordingExecutor([{ rows: [rowFromProfile()], rowCount: 1 }]);
     const repository: AsyncProfileRepository = new PostgresStudentProfileRepository(executor);
 
@@ -1075,20 +1083,29 @@ describe('PostgreSQL 画像仓储：PII 边界（只写不投影）', () => {
   });
 });
 
-describe('PostgreSQL 画像仓储：未装配、无驱动依赖、与 schema 边界对齐', () => {
-  it('ProfilesModule 仍只绑定内存基线（本 adapter 未被装配）', () => {
+describe('PostgreSQL 画像仓储：已按配置分流绑定、无驱动依赖、与 schema 边界对齐', () => {
+  it('ProfilesModule 经工厂绑定本 adapter（登记表要求的令牌名 + 工厂导出名都在模块里）', () => {
     const moduleFile = resolve(process.cwd(), 'src', 'modules', 'profiles', 'profiles.module.ts');
     const content = readFileSync(moduleFile, 'utf8');
 
-    expect(content).not.toContain(ADAPTER_CLASS);
-    expect(content).not.toContain(ADAPTER_MODULE);
-    expect(content).toContain('InMemoryProfileRepository');
-    expect(content).toContain(
-      '{ provide: PROFILE_REPOSITORY, useExisting: InMemoryProfileRepository }',
-    );
+    // 已绑定切片：模块必须引用工厂导出名与端口令牌（否则「绑定事实」不成立）
+    expect(content).toContain('createLazyPostgresStudentProfileRepository');
+    expect(content).toContain('PROFILE_REPOSITORY');
+    // 工厂来自本 adapter 文件（模块只引用实现，不重写一份 SQL / 映射）
+    expect(content).toContain(`'./${ADAPTER_MODULE}'`);
+    // 装配点仍然只有工厂一处：adapter 类名不得直接出现在 Module 里
+    expect(content).not.toMatch(ADAPTER_CLASS_PATTERN);
+    // 内存基线只在「未配置数据库」的分支里被构造，不再是独立 provider（避免两份状态）
+    expect(content).toContain('new InMemoryProfileRepository(env)');
+    expect(content).not.toContain('providers: [ProfilesService, InMemoryProfileRepository');
   });
 
-  it('持久化登记与数据库模块都不引用本 adapter（端口登记表仍按令牌判定）', () => {
+  it('持久化登记表把本 adapter 登记为「已绑定」且工厂导出名一致（登记与装配必须同时更新）', () => {
+    const registry = readApiFile(join('src', 'db', 'persistence', 'postgres-adapter-registry.ts'));
+    expect(registry).toContain('student-profile.postgres-repository');
+    expect(registry).toContain('createLazyPostgresStudentProfileRepository');
+
+    // 数据库模块与端口文件仍然只按令牌判定，不 import adapter 的实现文件
     for (const relative of [
       join('src', 'db', 'persistence-bindings.ts'),
       join('src', 'db', 'database.module.ts'),
@@ -1096,9 +1113,7 @@ describe('PostgreSQL 画像仓储：未装配、无驱动依赖、与 schema 边
       join('src', 'modules', 'profiles', 'student-profile.port.ts'),
     ]) {
       const content = readApiFile(relative);
-      // 端口文件只在注释里以「示例路径」提到 adapter，这不构成装配；任何 import / provider
-      // 引用（类名或模块路径）都必须为零
-      expect(content).not.toContain(ADAPTER_CLASS);
+      expect(content).not.toMatch(ADAPTER_CLASS_PATTERN);
       expect(content).not.toMatch(
         /(?:from\s+['"][^'"]*student-profile\.postgres-repository['"]|require\(\s*['"][^'"]*student-profile\.postgres-repository['"]\s*\))/u,
       );
@@ -1141,7 +1156,7 @@ describe('PostgreSQL 画像仓储：未装配、无驱动依赖、与 schema 边
     );
   });
 
-  it('工作区依赖里没有 pg / ORM 包', () => {
+  it('工作区依赖里没有未授权的 pg 族 / ORM 包（官方 pg 驱动已授权，仅限驱动层）', () => {
     for (const relative of [join('services', 'api', 'package.json'), 'package.json']) {
       const manifest = JSON.parse(readFileSync(join(REPO_ROOT, relative), 'utf8')) as {
         dependencies?: Record<string, string>;
@@ -1153,7 +1168,7 @@ describe('PostgreSQL 画像仓储：未装配、无驱动依赖、与 schema 边
       ];
       for (const name of names) {
         expect(
-          /^(?:pg|pg-pool|pg-promise|postgres|prisma|@prisma\/client|typeorm|kysely|drizzle-orm|sequelize|@mikro-orm\/core)$/u.test(
+          /^(?:pg-pool|pg-native|pg-promise|postgres|slonik|prisma|@prisma\/client|typeorm|kysely|drizzle-orm|drizzle-kit|sequelize|@mikro-orm\/core)$/u.test(
             name,
           ),
         ).toBe(false);
@@ -1161,22 +1176,34 @@ describe('PostgreSQL 画像仓储：未装配、无驱动依赖、与 schema 边
     }
   });
 
-  it('学生画像表尚未转为迁移（配对 productionReady=false 与验证清单的第 3 项）', () => {
+  it('学生画像表已由迁移建出（配对 productionReady=false 与验证清单的第 3 项已落地）', () => {
     const migrations = readdirSync(join(REPO_ROOT, 'db', 'migrations'));
-    expect(migrations.some((file) => file.includes('student_profiles'))).toBe(false);
+    const profileMigration = migrations.find((file) => file.includes('student_profiles'));
+    expect(profileMigration).toBeDefined();
+
+    // 表名与列清单必须与 adapter 的常量一致（迁移漏列 / 改名都会在这里被拦住）
+    const sql = readFileSync(join(REPO_ROOT, 'db', 'migrations', profileMigration ?? ''), 'utf8');
+    expect(sql).toMatch(/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+student_profiles\s*\(/u);
+    for (const column of POSTGRES_STUDENT_PROFILE_COLUMNS) {
+      expect(sql).toContain(column);
+    }
+    expect(POSTGRES_STUDENT_PROFILE_TABLE).toBe('student_profiles');
+    // 建表不等于生产可用：能力声明仍然必须是「持久但未验证」
     expect(POSTGRES_STUDENT_PROFILE_REPOSITORY_CAPABILITIES.productionReady).toBe(false);
     expect(POSTGRES_STUDENT_PROFILE_REPOSITORY_VERIFICATION_STEPS).toContain(
       'student-profiles-schema-draft-created-and-promoted-to-migration',
     );
   });
 
-  it('内存基线仍是同步契约的实现者（本切片不改动它）', () => {
+  it('内存基线实现的是同一个异步端口（本切片把它一起改成 Promise，两条路径同语义）', () => {
     const source = readApiFile(
       join('src', 'modules', 'profiles', 'student-profile.in-memory-repository.ts'),
     );
     expect(source).toContain('implements ProfileRepository');
-    expect(source).not.toContain(ADAPTER_CLASS);
+    expect(source).not.toMatch(ADAPTER_CLASS_PATTERN);
     expect(source).toContain('persistent: false');
     expect(source).toContain('productionReady: false');
+    expect(source).toContain('async findByUserId');
+    expect(source).toContain('async save');
   });
 });

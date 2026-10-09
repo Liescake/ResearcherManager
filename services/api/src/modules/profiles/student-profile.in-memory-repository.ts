@@ -35,7 +35,9 @@ function cloneProfile(profile: StudentProfile): StudentProfile {
  * - `NODE_ENV=production` 下直接拒绝构造，迫使生产把 `PROFILE_REPOSITORY` 换绑到数据库实现
  *   （见 `student-profile.port.ts` 的替换说明），而不是让「重启即丢数据」的内存结构
  *   悄悄承担生产存储职责；
- * - 不做授权判定、不生成归属信息：`userId` 由 service 从服务端主体写入。
+ * - 不做授权判定、不生成归属信息：`userId` 由 service 从服务端主体写入；
+ * - 读写按端口的**异步契约**返回 Promise（与 PostgreSQL adapter 逐字段同语义），
+ *   因此「无数据库」与「有数据库」两条路径可以被同一组 service/controller 用例覆盖。
  */
 @Injectable()
 export class InMemoryProfileRepository implements ProfileRepository {
@@ -55,18 +57,21 @@ export class InMemoryProfileRepository implements ProfileRepository {
     }
   }
 
-  findByUserId(userId: string): StudentProfile | undefined {
+  async findByUserId(userId: string): Promise<StudentProfile | undefined> {
     const profile = this.profiles.get(userId);
     return profile ? cloneProfile(profile) : undefined;
   }
 
-  save(profile: StudentProfile): StudentProfile {
+  async save(profile: StudentProfile): Promise<StudentProfile> {
     this.profiles.set(profile.userId, cloneProfile(profile));
     return cloneProfile(profile);
   }
 
-  /** 仅供开发/测试装配：显式写入一条画像，不接受任何隐式全局状态（等价 `save`） */
-  seed(profile: StudentProfile): StudentProfile {
-    return this.save(profile);
+  /**
+   * 仅供开发/测试装配：显式写入一条画像（同步，等价 `save` 的写入部分）。
+   * 测试夹具需要「先落一条记录再发请求」，与端口契约无关，因此保持同步以免夹具代码变成异步。
+   */
+  seed(profile: StudentProfile): void {
+    this.profiles.set(profile.userId, cloneProfile(profile));
   }
 }

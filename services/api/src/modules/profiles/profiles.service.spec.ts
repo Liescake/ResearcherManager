@@ -23,12 +23,16 @@ import { ProfilesService } from './profiles.service';
  * 服务层回归（不启 HTTP）：把「判定入参来自服务端」「**授权先于取数**」「未知字段与身份/权限字段
  * fail-closed」「存储异常不当作正常输出」「输出不含高敏感字段与隐私同意快照」五条约束固定在
  * service 这一层，避免它们只靠 HTTP 用例间接覆盖。
+ *
+ * 端口是**异步契约**（内存基线与 PostgreSQL adapter 同语义），因此 service 的读写都是 Promise：
+ * 断言统一用 `await captureRejection(...)`。注意「授权先于取数」这条性质在异步下同样成立 ——
+ * `assertAuthorized` 在第一个 `await` 之前同步执行，被拒绝的请求不会触达仓储。
  */
 
 const policy = new AuthorizationPolicy();
 const guard = new AuthorizationGuard(new BaselineRuoYiAuthzAdapter(policy));
 
-/** 画像仓储替身：只实现端口语义，不引入第二套授权或校验规则 */
+/** 画像仓储替身：只实现端口语义（异步契约），不引入第二套授权或校验规则 */
 class StubProfileRepository implements ProfileRepository {
   readonly capabilities = {
     backend: 'stub',
@@ -49,13 +53,13 @@ class StubProfileRepository implements ProfileRepository {
     for (const profile of seed) this.profiles.set(profile.userId, profile);
   }
 
-  findByUserId(userId: string): StudentProfile | undefined {
+  async findByUserId(userId: string): Promise<StudentProfile | undefined> {
     const overridden = this.lookupOverride?.(userId);
     if (overridden) return overridden;
     return this.profiles.get(userId);
   }
 
-  save(profile: StudentProfile): StudentProfile {
+  async save(profile: StudentProfile): Promise<StudentProfile> {
     this.saved.push(profile);
     this.profiles.set(profile.userId, profile);
     return profile;
@@ -64,8 +68,9 @@ class StubProfileRepository implements ProfileRepository {
 
 /** 仓储替身：写回时把记录改坏，用于验证「输出/写回前再校验一次」不依赖仓储的自觉 */
 class TamperingProfileRepository extends StubProfileRepository {
-  override save(profile: StudentProfile): StudentProfile {
-    return { ...super.save(profile), grade: 'tampered' as Grade };
+  override async save(profile: StudentProfile): Promise<StudentProfile> {
+    const stored = await super.save(profile);
+    return { ...stored, grade: 'tampered' as Grade };
   }
 }
 
@@ -102,9 +107,10 @@ function serviceWith(repository: ProfileRepository): ProfilesService {
   return new ProfilesService(guard, repository);
 }
 
-function captureError(run: () => unknown): unknown {
+/** 等待「被拒绝的 Promise」：裁决于 then/catch 之上，与同步 try/catch 只差 await 一次 */
+async function captureRejection(run: () => Promise<unknown>): Promise<unknown> {
   try {
-    run();
+    await run();
   } catch (error) {
     return error;
   }
@@ -112,11 +118,11 @@ function captureError(run: () => unknown): unknown {
 }
 
 describe('ProfilesService：判定入参只来自服务端', () => {
-  it('更新：只改提交字段，归属与创建时间 immutable，updatedAt 由服务端时间决定', () => {
+  it('更新：只改提交字段，归属与创建时间 immutable，updatedAt 由服务端时间决定', async () => {
     const repository = new StubProfileRepository([profileFixture()]);
     const service = serviceWith(repository);
 
-    const view = service.updateMyProfile(student, { college: '数学学院', skills: ['Rust'] });
+    const view = await service.updateMyProfile(student, { college: '数学学院', skills: ['Rust'] });
 
     expect(repository.saved).toHaveLength(1);
     const saved = repository.saved[0];
@@ -133,7 +139,7 @@ describe('ProfilesService：判定入参只来自服务端', () => {
     expect(view.updatedAt).toBe(saved?.updatedAt);
   });
 
-  it('取数与判定都走服务端：先行判定取会话主体，取数后按存储归属二次判定，不符即 403', () => {
+  it('取数与判定都走服务端：先行判定取会话主体，取数后按存储归属二次判定，不符即 403', async () => {
     const repository = new StubProfileRepository([profileFixture()]);
     repository.lookupOverride = () => profileFixture({ userId: 'u-student-2', name: '李四' });
     const realAdapter = new BaselineRuoYiAuthzAdapter(policy);
@@ -152,7 +158,7 @@ describe('ProfilesService：判定入参只来自服务端', () => {
       () => service.getMyProfile(student),
       () => service.updateMyProfile(student, { college: '数学学院' }),
     ]) {
-      const error = captureError(run);
+      const error = await captureRejection(run);
       expect(error).toBeInstanceOf(ForbiddenException);
       expect((error as ForbiddenException).getStatus()).toBe(403);
       // 归属不符与授权拒绝共用同一文案：调用方无法区分原因
@@ -173,7 +179,7 @@ describe('ProfilesService：判定入参只来自服务端', () => {
     expect(repository.saved).toHaveLength(0);
   });
 
-  it('存储归属不可读（空归属）时二次 SELF 授权拒绝并判 403，不退化成放行', () => {
+  it('存储归属不可读（空归属）时二次 SELF 授权拒绝并判 403，不退化成放行', async () => {
     const repository = new StubProfileRepository();
     repository.lookupOverride = () => profileFixture({ userId: '' });
     const realAdapter = new BaselineRuoYiAuthzAdapter(policy);
@@ -188,7 +194,9 @@ describe('ProfilesService：判定入参只来自服务端', () => {
     };
     const service = new ProfilesService(new AuthorizationGuard(recording), repository);
 
-    expect(captureError(() => service.getMyProfile(student))).toBeInstanceOf(ForbiddenException);
+    expect(await captureRejection(() => service.getMyProfile(student))).toBeInstanceOf(
+      ForbiddenException,
+    );
     // 归属缺失同样只经 AuthorizationGuard：第二次 SELF 判定的 resourceUserId 为空 → 拒绝
     expect(requests).toEqual([
       { permission: 'profile:self:read', scope: 'SELF', resourceUserId: 'u-student-1' },
@@ -196,7 +204,7 @@ describe('ProfilesService：判定入参只来自服务端', () => {
     ]);
   });
 
-  it('经端口判定：端口拒绝时即使仓储有数据也 403，且不写入；拒绝发生在取数之前', () => {
+  it('经端口判定：端口拒绝时即使仓储有数据也 403，且不写入；拒绝发生在取数之前', async () => {
     const denying: RuoYiAuthzAdapter = {
       capabilities: new BaselineRuoYiAuthzAdapter(policy).capabilities,
       checkAuthorization: (): AuthorizationDecision => ({
@@ -209,53 +217,59 @@ describe('ProfilesService：判定入参只来自服务端', () => {
     const findByUserId = vi.spyOn(repository, 'findByUserId');
     const service = new ProfilesService(new AuthorizationGuard(denying), repository);
 
-    expect(captureError(() => service.getMyProfile(student))).toBeInstanceOf(ForbiddenException);
+    expect(await captureRejection(() => service.getMyProfile(student))).toBeInstanceOf(
+      ForbiddenException,
+    );
     expect(
-      captureError(() => service.updateMyProfile(student, { college: '数学学院' })),
+      await captureRejection(() => service.updateMyProfile(student, { college: '数学学院' })),
     ).toBeInstanceOf(ForbiddenException);
     expect(repository.saved).toHaveLength(0);
     // 授权先行：拒绝时不得访问仓储（调用方连资源是否存在都观察不到）
     expect(findByUserId).not.toHaveBeenCalled();
   });
 
-  it('未登记角色 / 空 userId 的主体一律 403（fail-closed），且排在 404 之前', () => {
+  it('未登记角色 / 空 userId 的主体一律 403（fail-closed），且排在 404 之前', async () => {
     // 存储里没有任何画像：若先取数就会得到 404，这里必须是 403，证明授权先于取数
     const repository = new StubProfileRepository();
     const findByUserId = vi.spyOn(repository, 'findByUserId');
     const service = serviceWith(repository);
 
     expect(
-      captureError(() => service.getMyProfile({ userId: 'u-x', roles: ['guest' as Role] })),
+      await captureRejection(() =>
+        service.getMyProfile({ userId: 'u-x', roles: ['guest' as Role] }),
+      ),
     ).toBeInstanceOf(ForbiddenException);
     expect(
-      captureError(() =>
+      await captureRejection(() =>
         service.getMyProfile({ userId: 'u-x', roles: [Role.Student, 'guest' as Role] }),
       ),
     ).toBeInstanceOf(ForbiddenException);
     expect(
-      captureError(() => service.getMyProfile({ userId: '', roles: [Role.Student] })),
+      await captureRejection(() => service.getMyProfile({ userId: '', roles: [Role.Student] })),
     ).toBeInstanceOf(ForbiddenException);
     expect(findByUserId).not.toHaveBeenCalled();
   });
 
-  it('尚无画像 → 404（读取与更新一致），且不触发写入', () => {
+  it('尚无画像 → 404（读取与更新一致），且不触发写入', async () => {
     const repository = new StubProfileRepository();
     const service = serviceWith(repository);
 
-    expect(captureError(() => service.getMyProfile(student))).toBeInstanceOf(NotFoundException);
+    expect(await captureRejection(() => service.getMyProfile(student))).toBeInstanceOf(
+      NotFoundException,
+    );
     expect(
-      captureError(() => service.updateMyProfile(student, { college: '数学学院' })),
+      await captureRejection(() => service.updateMyProfile(student, { college: '数学学院' })),
     ).toBeInstanceOf(NotFoundException);
     expect(repository.saved).toHaveLength(0);
   });
 });
 
 describe('ProfilesService：输入闭集与字段校验（fail-closed）', () => {
-  it('未声明字段（roles/scope/groupId/userId/reviewStatus）→ ZodError，且不写库', () => {
+  it('未声明字段（roles/scope/groupId/userId/reviewStatus）→ ZodError，且不写库', async () => {
     const repository = new StubProfileRepository([profileFixture()]);
     const service = serviceWith(repository);
 
-    const error = captureError(() =>
+    const error = await captureRejection(() =>
       service.updateMyProfile(student, {
         college: '数学学院',
         roles: [Role.SuperAdmin],
@@ -279,7 +293,7 @@ describe('ProfilesService：输入闭集与字段校验（fail-closed）', () =>
     expect(repository.saved).toHaveLength(0);
   });
 
-  it('非法字段值：未知枚举、越界、未同意隐私政策、空对象、非对象请求体 → ZodError', () => {
+  it('非法字段值：未知枚举、越界、未同意隐私政策、空对象、非对象请求体 → ZodError', async () => {
     const repository = new StubProfileRepository([profileFixture()]);
     const service = serviceWith(repository);
 
@@ -299,12 +313,14 @@ describe('ProfilesService：输入闭集与字段校验（fail-closed）', () =>
     ];
 
     for (const body of cases) {
-      expect(captureError(() => service.updateMyProfile(student, body))).toBeInstanceOf(ZodError);
+      expect(await captureRejection(() => service.updateMyProfile(student, body))).toBeInstanceOf(
+        ZodError,
+      );
     }
     expect(repository.saved).toHaveLength(0);
   });
 
-  it('授权先于字段校验：无权主体得到 403，而不是拿到校验结果', () => {
+  it('授权先于字段校验：无权主体得到 403，而不是拿到校验结果', async () => {
     const denying: RuoYiAuthzAdapter = {
       capabilities: new BaselineRuoYiAuthzAdapter(policy).capabilities,
       checkAuthorization: (): AuthorizationDecision => ({
@@ -316,7 +332,7 @@ describe('ProfilesService：输入闭集与字段校验（fail-closed）', () =>
     const repository = new StubProfileRepository([profileFixture()]);
     const service = new ProfilesService(new AuthorizationGuard(denying), repository);
 
-    const error = captureError(() =>
+    const error = await captureRejection(() =>
       service.updateMyProfile(student, { grade: 'unknown_grade', roles: [Role.SuperAdmin] }),
     );
 
@@ -326,14 +342,14 @@ describe('ProfilesService：输入闭集与字段校验（fail-closed）', () =>
 });
 
 describe('ProfilesService：存储异常与输出边界 fail-closed', () => {
-  it('存储枚举未登记 → 500，且异常不携带原始取值，也不写回', () => {
+  it('存储枚举未登记 → 500，且异常不携带原始取值，也不写回', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const repository = new StubProfileRepository([
       profileFixture({ grade: 'unknown_grade' as Grade, college: '受损记录学院' }),
     ]);
     const service = serviceWith(repository);
 
-    const error = captureError(() => service.getMyProfile(student));
+    const error = await captureRejection(() => service.getMyProfile(student));
 
     expect(error).toBeInstanceOf(InternalServerErrorException);
     expect((error as InternalServerErrorException).getStatus()).toBe(500);
@@ -344,29 +360,29 @@ describe('ProfilesService：存储异常与输出边界 fail-closed', () => {
     expect(Logger.prototype.error).toHaveBeenCalled();
 
     expect(
-      captureError(() => service.updateMyProfile(student, { college: '数学学院' })),
+      await captureRejection(() => service.updateMyProfile(student, { college: '数学学院' })),
     ).toBeInstanceOf(InternalServerErrorException);
     expect(repository.saved).toHaveLength(0);
   });
 
-  it('仓储写回时改坏记录 → 500（输出前再校验一次，不依赖仓储的自觉）', () => {
+  it('仓储写回时改坏记录 → 500（输出前再校验一次，不依赖仓储的自觉）', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const repository = new TamperingProfileRepository([profileFixture()]);
     const service = serviceWith(repository);
 
     expect(
-      captureError(() => service.updateMyProfile(student, { college: '数学学院' })),
+      await captureRejection(() => service.updateMyProfile(student, { college: '数学学院' })),
     ).toBeInstanceOf(InternalServerErrorException);
   });
 
-  it('存储的隐私同意快照违反读取契约 → 500（移出对外视图不等于不再校验）', () => {
+  it('存储的隐私同意快照违反读取契约 → 500（移出对外视图不等于不再校验）', async () => {
     const logError = vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const repository = new StubProfileRepository([
       profileFixture({ privacyConsent: { policyVersion: '', consentedAt: 'not-a-datetime' } }),
     ]);
     const service = serviceWith(repository);
 
-    const error = captureError(() => service.getMyProfile(student));
+    const error = await captureRejection(() => service.getMyProfile(student));
 
     expect(error).toBeInstanceOf(InternalServerErrorException);
     expect((error as InternalServerErrorException).getStatus()).toBe(500);
@@ -377,11 +393,11 @@ describe('ProfilesService：存储异常与输出边界 fail-closed', () => {
     expect(JSON.stringify(error)).not.toContain('not-a-datetime');
   });
 
-  it('对外视图不含归属、高敏感字段与隐私同意快照：序列化结果里没有 userId/学号/联系方式/同意记录', () => {
+  it('对外视图不含归属、高敏感字段与隐私同意快照：序列化结果里没有 userId/学号/联系方式/同意记录', async () => {
     const repository = new StubProfileRepository([profileFixture()]);
     const service = serviceWith(repository);
 
-    const view = service.getMyProfile(student);
+    const view = await service.getMyProfile(student);
     const serialized = JSON.stringify(view);
 
     expect(Object.keys(view).sort()).toEqual([
@@ -409,21 +425,21 @@ describe('ProfilesService：存储异常与输出边界 fail-closed', () => {
     expect(serialized).not.toContain('v1.0');
   });
 
-  it('空串清空可选文本，隐私同意时间由服务端决定（只写入存储，不进入视图）', () => {
+  it('空串清空可选文本，隐私同意时间由服务端决定（只写入存储，不进入视图）', async () => {
     const repository = new StubProfileRepository([profileFixture()]);
     const service = serviceWith(repository);
 
-    const cleared = service.updateMyProfile(student, { researchExperience: '' });
+    const cleared = await service.updateMyProfile(student, { researchExperience: '' });
     expect(cleared.researchExperience).toBeUndefined();
     expect(Object.keys(cleared)).not.toContain('researchExperience');
-    expect(repository.findByUserId('u-student-1')?.researchExperience).toBeUndefined();
+    expect((await repository.findByUserId('u-student-1'))?.researchExperience).toBeUndefined();
 
-    const consented = service.updateMyProfile(student, {
+    const consented = await service.updateMyProfile(student, {
       privacyConsent: { policyVersion: 'v1.2', agreed: true },
     });
     expect(Object.keys(consented)).not.toContain('privacyConsent');
 
-    const stored = repository.findByUserId('u-student-1');
+    const stored = await repository.findByUserId('u-student-1');
     expect(stored?.privacyConsent.policyVersion).toBe('v1.2');
     const consentedAt = stored?.privacyConsent.consentedAt ?? '';
     expect(new Date(consentedAt).toISOString()).toBe(consentedAt);

@@ -31,15 +31,17 @@ export class ProfilesController {
   ) {}
 
   @Get()
-  getMyProfile(@Headers('authorization') authorization: string | undefined): StudentProfileView {
-    return this.profiles.getMyProfile(requireSubject(this.sessions, authorization));
+  async getMyProfile(
+    @Headers('authorization') authorization: string | undefined,
+  ): Promise<StudentProfileView> {
+    return this.profiles.getMyProfile(await requireSubject(this.sessions, authorization));
   }
 
   @Patch()
-  updateMyProfile(
+  async updateMyProfile(
     @Headers('authorization') authorization: string | undefined,
     @Body() body: unknown,
-  ): StudentProfileView {
-    return this.profiles.updateMyProfile(requireSubject(this.sessions, authorization), body);
+  ): Promise<StudentProfileView> {
+    return this.profiles.updateMyProfile(await requireSubject(this.sessions, authorization), body);
   }
 }
