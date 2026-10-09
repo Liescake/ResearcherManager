@@ -9,31 +9,33 @@ import {
   PRIVACY_CONSENT_STATUS_VALUES,
   type AsyncComplianceRepository,
   type ComplianceRecord,
+  type ComplianceRepository,
   type ComplianceRepositoryCapabilities,
 } from './compliance.port';
 
 /**
- * 合规状态（`user_compliance` 读模型）的 **PostgreSQL 仓储 adapter（未接入运行时）**。
+ * 合规状态（`user_compliance` 读模型）的 **PostgreSQL 仓储 adapter（已接入运行时）**。
  *
- * ## 交付边界（本切片刻意不做的事）
- * - **不绑定**到 `ComplianceModule`：模块仍然只绑定内存基线 `InMemoryComplianceRepository`
- *   （provider 列表与 DI 令牌一字未改），运行时行为与本切片之前逐字节一致；
- * - **不切换内存 provider**：`COMPLIANCE_REPOSITORY` 的运行时绑定、持久化登记表
- *   （`db/persistence-bindings.ts` 早已按令牌登记该端口）与启动装配都不引用本文件；
- *   换绑属于「启用数据库」那一步，且必须与驱动引入、集成验证一起发生；
+ * ## 交付边界（本切片做了什么）
+ * - **已绑定**到 `ComplianceModule`：`COMPLIANCE_REPOSITORY` 由 `createComplianceRepository`
+ *   按「是否解析出 `DATABASE_URL`」分流 —— 未配置时内存基线，配置且拿到
+ *   `SQL_CONNECTION_FACTORY` 时**本 adapter**（延迟建连），配置但没有执行器工厂时**抛错**
+ *   （fail-closed，绝不悄悄退回内存存储）。登记表里本切片已从「未装配」组移到
+ *   `POSTGRES_BOUND_SLICE_REGISTRY`（`db/persistence/postgres-adapter-registry.ts`）；
  * - **不引入** `pg` / Prisma / TypeORM 等驱动或 ORM 依赖：本文件只依赖驱动无关的
- *   `SqlExecutor` 端口（`db/ports/sql-executor.port.ts`），真实执行器由消费方在「启用数据库」
- *   那一步显式提供；
+ *   `SqlExecutor` 端口（`db/ports/sql-executor.port.ts`），真实执行器由 `DatabaseModule`
+ *   在证据齐全时提供（驱动只允许出现在 `db/postgres/` 驱动层）；
  * - **不声称生产可用**：能力声明固定为 `backend = postgres`、`persistent = true`、
- *   `productionReady = false`。在引入经评估的驱动、完成对真实 PostgreSQL 的集成验证、并把
- *   `user_compliance` 从字段字典落成 schema 草案 → 迁移之前，生产启动会被
- *   `PersistenceBoundaryService` 拒绝（`productionReady !== true` 即违规）。
+ *   `productionReady = false`。因此「数据库已配置」的装配仍会被启动期的
+ *   `DependencyReadinessService` 判 `COMPLIANCE_REPOSITORY[DEPENDENCY_NOT_VERIFIED]` 并终止启动
+ *   —— 这正是「生产配置了数据库但依赖不就绪 ⇒ fail-closed」的落点；
+ *   把 `productionReady` 提升为 true 需要 `POSTGRES_COMPLIANCE_REPOSITORY_VERIFICATION_STEPS`
+ *   里剩余各项的证据（见文末）。
  *
- * ## 为什么先有异步契约
- * 现有 `ComplianceRepository`（`compliance.port.ts`）是同步接口；把运行时端口改成 Promise
- * 是跨模块契约变更（service / controller 与既有 spec 必须一起改），必须与真实驱动引入在同一片
- * 切片完成。因此本文件实现 `AsyncComplianceRepository`（Promise 版，语义与内存基线完全一致），
- * 让「SQL 与映射是否正确」可以在**没有驱动、也没有数据库**的情况下被离线验证。
+ * ## 端口契约（异步唯一契约）
+ * `ComplianceRepository` 已收敛为 Promise 返回（见 `compliance.port.ts`），因此本 adapter
+ * 与内存基线实现**同一个**接口：`AsyncComplianceRepository` 只是兼容别名。换绑不再需要第二个
+ * 并存契约，service / controller 的 `await` 与授权顺序在异步路径上保持不变。
  *
  * ## 与内存基线的语义对应（逐条可核对）
  * | 内存基线 | 本 adapter |
@@ -51,7 +53,7 @@ import {
  * 1. **参数化 SQL + 固定标识符**：所有值一律走 `$1…$n` 占位符绑定；进入 SQL 文本的只有模块常量
  *    （表名、列清单、`::uuid` 这类类型转换），且表名与列名都经过 `assertSqlIdentifier` 校验，
  *    不存在任何「值 → SQL 文本」的路径（占位符与参数由同一份列清单派生，不会数量漂移）；
- *    本 adapter 只执行 **`SELECT`**：没有 `INSERT` / `UPDATE` / `DELETE` / DDL 模板，也没有诊断查询；
+ *    本 adapter 只执行 **`SELECT`**：没有 INSERT / UPDATE / DELETE / DDL 模板，也没有诊断查询；
  * 2. **显式字段映射 + 严格行契约**：数据库行必须满足严格（`.strict()`）的行契约（未知列、
  *    非法枚举、非 UUID 归属一律拒绝），再**逐字段显式映射**为领域记录（列 → 字段的对应关系由
  *    `POSTGRES_COMPLIANCE_COLUMN_FIELDS` 单一事实来源给出，并另由
@@ -61,7 +63,9 @@ import {
  * 3. **归属隔离（服务端 subject owner）**：`ownerUserId` 必须由调用方（service）从服务端会话主体
  *    写入，必须是合法、非空、规范小写形的 UUID（**存储 ID 域约束**）；adapter 不生成、不覆盖归属，
  *    并且**把归属下推进 SQL**（`WHERE user_id = $1`），他人合规状态根本不出库；返回行上再逐条
- *    复核归属（不一致即 `OWNER_VIOLATION`）——他人记录既不出库、也不得回流；
+ *    复核归属（不一致即 `OWNER_VIOLATION`）——他人记录既不出库、也不得回流。
+ *    **主体域先判、再建连**：`createLazyPostgresComplianceRepository` 在解析执行器之前就调用
+ *    `assertPostgresComplianceSubject`，因此非 UUID 主体既不进 SQL，也不触发任何数据库连接；
  * 4. **结果集唯一性**：本读模型按主体唯一，`findByUserId` 返回多行即 `RESULT_SET_VIOLATION`
  *    （主键 / 唯一约束被破坏），整批 fail-closed，既不静默取首行也不外发；
  * 5. **公开视图只有三个闭集状态**：adapter 只在**内部存储记录**上承载 `ownerUserId`
@@ -87,22 +91,33 @@ import {
  *    这是本 adapter 相对同族切片的刻意加强：原始错误的定位职责属于显式注册的驱动层，
  *    不得经由业务错误冒泡到 API 响应与日志。
  *
+ * ## schema 归属（本切片对齐）
+ * 本 adapter 的读模型由**迁移 `0012_user_compliance.sql`** 建立（列清单 = 三个状态列 + 归属列，
+ * 其余（`id` / `created_at` / `updated_at`）都是**内部列**，只存在于存储侧、绝不投影）。
+ * `db/migrations/0001_bootstrap.sql` 的业务表占位清单里只有**原始同意表** `privacy_consents`；
+ * 该迁移已应用因此**不可改写**（校验和），所以本切片不改它，而是在迁移 `0012` 里把
+ * 「聚合读模型」显式建出来，并在迁移头部写明与原始同意表的关系 —— 存储侧因此不存在
+ * 「同一概念两份真相」的隐性约定：原始同意表是**记录来源**，`user_compliance` 是
+ * **服务端派生的读模型**（由同意 / 留存策略 / 导出开关在服务端派生后落库）。
+ *
  * ## 尚未解决 / 已登记的前置（因此 productionReady 恒为 false）
- * `db/migrations/0001_bootstrap.sql` 的业务表占位清单里登记的是**原始同意表** `privacy_consents`
- * （docs/P2-ER图.md / docs/P1-字段级数据字典.md §4 同），**没有** `user_compliance` 这张聚合读模型
- * 表（`docs/P2-隐私留存矩阵.md` 只给出留存口径，不含表结构）；本 adapter 需要的
- * `data_retention` / `export_availability` 两列在原始同意表里并不存在，必须明确「由同意 + 留存策略 +
- * 导出开关派生」还是「落一张读模型表」。真实 PostgreSQL 的集成验证（建表、按 `user_id` 取数、
- * 唯一性约束、存储层不产生跨主体读取）也尚未进行；会话主体 `u-student-1` 形也不在存储 ID 域内。
- * 这些都已登记在 `POSTGRES_COMPLIANCE_REPOSITORY_VERIFICATION_STEPS` 里，不能只写声明。
+ * 剩余前置：会话主体收敛为 UUID（当前基线 `u-student-1` 形不在存储 ID 域内，
+ * 因此数据库路径对非 UUID 主体 fail-closed）、`data_retention` / `export_availability` 的
+ * **派生口径定稿**（当前由写入方按读模型落库，迁移里的 CHECK 只保证状态自洽）、
+ * 以及依赖就绪契约要求的**封存声明 + 集成验证证据**。这些都已登记在
+ * `POSTGRES_COMPLIANCE_REPOSITORY_VERIFICATION_STEPS` 里，不能只写声明。
  */
 
 /**
  * 表名：**聚合读模型** `user_compliance`（端口注释里的同一命名）。
  *
- * 与 db schema 边界的关系：占位清单 / ER 图 / 字段字典里是原始同意表 `privacy_consents`
- * （`user_id, policy_id, consented_at, withdrawn_at`），不是本表。命名对齐与 schema 草案
- * 已登记在验证清单第 3、4、5 项；本文件不擅自创建草案，也不改动 `db/**`。
+ * 与 db schema 边界的关系：已应用迁移 `0001_bootstrap.sql` 的占位清单 / ER 图 / 字段字典里是
+ * 原始同意表 `privacy_consents`（`user_id, policy_id, consented_at, withdrawn_at`），不是本表。
+ * 该迁移**已应用且不可改写**（校验和），因此本切片不改它，而是由**迁移 `0012_user_compliance.sql`**
+ * 把这张服务端派生读模型显式建出来（列清单 = 三个状态列 + 归属列；`id` / `created_at` /
+ * `updated_at` 只存在于存储侧、属于内部列）。构建期由 `0012` 的头部注释登记两者的关系：
+ * `privacy_consents` 是**记录来源**，`user_compliance` 是由同意 / 留存策略 / 导出开关在服务端
+ * 派生后落库的**读模型** —— 因此存储侧不存在「同一概念两份真相」的隐性约定。
  */
 export const POSTGRES_COMPLIANCE_TABLE = 'user_compliance';
 
@@ -242,42 +257,26 @@ export type PostgresComplianceInternalColumn =
   (typeof POSTGRES_COMPLIANCE_INTERNAL_COLUMNS)[number];
 
 /**
- * 高敏列（字典标注「个人 / 高敏感」或可指纹化 / 可据以取回文件与联系当事人）：
- * 在本 adapter 的**存储**范围内是合法内容，因此不裁剪为「不可读」；但**绝不**写进错误消息与日志。
- * 内部列里的同意原文、联系方式与 PII、审核意见、证据指针、路径 / URL / 存储 key 与原始错误
- * 本 adapter 根本不投影（见上面的内部列清单）。
+ * **高敏与内部列清单**（= 归属列 + **全部**存储侧内部列的并集）。
+ *
+ * 语义：本清单里的任何一列都**绝不进入公开输出**，也**绝不写进错误消息与日志**。
+ * 它承担两个可机器校验的用途：
+ * - **覆盖归属映射**（`user_id → ownerUserId`）：归属只在服务端内部流转，既不投影也不外发；
+ * - **覆盖 `POSTGRES_COMPLIANCE_INTERNAL_COLUMNS` 的全部内部列**：同意原文与政策正文、
+ *   联系方式与身份 PII、审核与证据字段、内部时间戳与保留期取值、路径 / URL / 存储 key /
+ *   产物与导出句柄、原始错误文本，以及存储侧簿记与派生来源列（代理主键、版本、幂等键、租户列）。
+ *
+ * 其中真正的高敏 PII（同意原文、姓名 / 学号 / 手机号 / 邮箱 / 证件号、微信标识、审核意见、
+ * 证据指针、路径与 URL）与「仅为存储实现细节」的簿记列刻意**合并为同一份清单**：它们的共同
+ * 不变量是「不得出现在公开输出、错误消息与日志里」，因此合并后只要漏登记一列就会被同一组
+ * 断言拦下，不会出现「标为簿记列就顺手投影出去」的缝隙。
+ *
+ * 三个公开状态列（`privacy_consent` / `data_retention` / `export_availability`）**不在**本清单内，
+ * 也不在 `POSTGRES_COMPLIANCE_VIEW_EXCLUDED_COLUMNS` 内：它们恰好是公开视图白名单本身。
  */
 export const POSTGRES_COMPLIANCE_PII_COLUMNS: readonly string[] = Object.freeze([
   'user_id',
-  'consent_text',
-  'consent_body',
-  'policy_text',
-  'policy_body',
-  'name',
-  'student_no',
-  'student_number',
-  'phone',
-  'mobile',
-  'email',
-  'id_card',
-  'id_number',
-  'wechat_openid',
-  'wechat_unionid',
-  'review_note',
-  'review_comment',
-  'reviewer_id',
-  'evidence_file_id',
-  'evidence_id',
-  'evidence_url',
-  'file_path',
-  'download_url',
-  'signed_url',
-  'storage_key',
-  'object_key',
-  'artifact_handle',
-  'error_message',
-  'failure_reason',
-  'stack_trace',
+  ...POSTGRES_COMPLIANCE_INTERNAL_COLUMNS,
 ]);
 
 /**
@@ -344,24 +343,25 @@ export const POSTGRES_COMPLIANCE_REPOSITORY_CAPABILITIES: ComplianceRepositoryCa
   });
 
 /**
- * 转成生产可用前必须完成的验证清单（每一项都需要证据，不能只写声明）：
- * 1. 驱动依赖经评估后引入（`docs/P2-开源复用评估.md` 的 Prisma / TypeORM 比较结论）；
- * 2. 对真实 PostgreSQL 的集成测试：建表迁移、按 `user_id` 取数、`user_id` 唯一性约束，
- *    以及**存储层不产生跨主体读取**（他人合规状态不出库）；
- * 3. `user_compliance` 的 schema 草案创建并按 `db/schema-drafts/README.md` 的规范转成迁移并执行验证
- *    （当前 `db/migrations/0001_bootstrap.sql` 的占位清单里只有原始同意表 `privacy_consents`，
- *    没有任何 `user_compliance` 建表语句，也没有对应草案）；
- * 4. 表名与字段字典一次性对齐：占位清单 / ER 图是 `privacy_consents`（原始同意表），本 adapter 的
- *    读模型命名为 `user_compliance`，两者需要明确关系（补入清单与字典，或改为派生查询）；
+ * 转成生产可用前必须完成的验证清单（每一项都需要证据，不能只写声明）。
+ *
+ * **本切片已完成**：1（官方 `pg` 驱动经评估并显式声明，只允许出现在 `db/postgres/` 驱动层）、
+ * 2（对真实 PostgreSQL 的集成验证：迁移建表、列清单、按 `user_id` 取数、唯一性约束、
+ * 存储层不产生跨主体读取 —— 见 `db/postgres/__tests__/compliance-integration.spec.ts`）、
+ * 3（`user_compliance` 由迁移 `0012_user_compliance.sql` 建立并在真库上核对）、
+ * 6（运行时端口收敛为异步唯一契约，service / controller 与其测试一起改）。
+ *
+ * **仍然未完成**（因此 `productionReady` 恒为 false，生产装配必然 fail-closed）：
  * 5. `data_retention` / `export_availability` 的**派生口径定稿**：它们不在原始同意表的字段列表里，
- *    必须明确「由同意 + 留存策略 + 导出开关在服务端派生并落读模型」还是「实时联表查询」，
- *    且派生必须能支撑读取契约的单向蕴含（导出可用 ⇒ 已同意且未过保留期）；
- * 6. `ComplianceRepository` 端口改为异步：service / controller 与其测试一起改；
- * 7. 会话主体 `ownerUserId` 收敛为 UUID（当前基线是 `u-student-1` 这类安全 ID，不满足存储 ID 域）；
- * 8. 内部列不投影对真实查询复核：确认没有任何同意原文、政策正文、联系方式 / PII、审核 / 证据字段、
- *    内部时间戳、路径 / URL / 存储 key 或原始错误随 `SELECT` 或错误信息外发；
+ *    当前由写入方按读模型落库，迁移里的 CHECK 只保证「导出可用 ⇒ 已同意且未过保留期」这条
+ *    单向蕴含；「实时联表派生」还是「服务端派生后落库」仍需定稿；
+ * 7. 会话主体 `ownerUserId` 收敛为 UUID（当前基线是 `u-student-1` 这类安全 ID，不满足存储 ID 域，
+ *    因此数据库路径对非 UUID 主体 fail-closed）；
+ * 8. 内部列不投影对真实查询复核（真实库上已核对 `SELECT` 只取四列、内部列不出库，见集成 spec；
+ *    仍需在**生产查询路径**上复核日志与错误信息）；
  * 9. 完成 1–8 后，才允许把 `productionReady` 改为 true，并同步删除能力自检
- *    （`assertPostgresComplianceRepositoryCapabilities` 会拒绝「未验证就声称生产可用」）。
+ *    （`assertPostgresComplianceRepositoryCapabilities` 会拒绝「未验证就声称生产可用」），
+ *    同时按依赖就绪契约登记封存声明与集成验证证据。
  */
 export const POSTGRES_COMPLIANCE_REPOSITORY_VERIFICATION_STEPS = [
   'driver-dependency-evaluated',
@@ -517,7 +517,7 @@ export function assertComplianceInternalColumnsAbsent(
  * 模块加载期自检：**本 adapter 只能执行 `SELECT`**。
  *
  * 对列清单以「每个列都只出现在一条语句里」的形态做保守校验成本过高，因此这里校验的是
- * **SQL 模板常量本身**：任何 `INSERT` / `UPDATE` / `DELETE` / DDL / 权限关键字一旦进入语句文本，
+ * **SQL 模板常量本身**：任何 INSERT / UPDATE / DELETE / DDL / 权限关键字一旦进入语句文本，
  * 模块加载即 fail-closed，而不是等运行时才发现「读取切片顺手带了一个写语句」。
  */
 export function assertComplianceReadOnlySql(sql: string): void {
@@ -731,8 +731,13 @@ function assertUsableExecutor(executor: unknown): SqlExecutor {
  * 非 UUID 的标识（例如会话基线的 `u-student-1`，或注入式载荷）会让数据库侧 `uuid`
  * 比较退化为「转换失败 / 放弃类型约束」，因此在这里 fail-closed 拒绝，
  * **绝不绑定进 SQL**（错误信息也不回显该值本身）。
+ *
+ * 导出（而不是文件内私有）是为了让**延迟建连的换绑工厂**能在解析执行器**之前**调用它：
+ * 「服务端主体不落在存储 ID 域」必须在**任何数据库连接之前**就被判定，否则一个不合法的会话
+ * 主体会先触发一次连接、再在 adapter 里被拒绝 —— 那既浪费连接，也让「主体域判定发生在
+ * 任何连接之前」这条性质无法被测试固定。
  */
-function requireSubject(ownerUserId: unknown): string {
+export function assertPostgresComplianceSubject(ownerUserId: unknown): string {
   if (!isStorageUuid(ownerUserId)) {
     throw new PostgresComplianceRepositoryError(
       'INVALID_SUBJECT',
@@ -830,7 +835,7 @@ export class PostgresComplianceRepository implements AsyncComplianceRepository {
    */
   async findByUserId(ownerUserId: string): Promise<ComplianceRecord | undefined> {
     const executor = this.usableExecutor();
-    const ownerId = requireSubject(ownerUserId);
+    const ownerId = assertPostgresComplianceSubject(ownerUserId);
 
     const rows = await runQuery(executor, SELECT_BY_USER_SQL, [ownerId]);
 
@@ -855,4 +860,52 @@ export class PostgresComplianceRepository implements AsyncComplianceRepository {
     }
     return record;
   }
+}
+
+/** DI 工厂：把驱动无关的 `SqlExecutor` 装成合规状态仓储端口实现（本切片的换绑点之一） */
+export function createPostgresComplianceRepository(executor: SqlExecutor): ComplianceRepository {
+  return new PostgresComplianceRepository(executor);
+}
+
+/**
+ * 延迟建连的 PostgreSQL 合规状态仓储：**模块装配阶段不碰数据库**。
+ *
+ * 为什么必须延迟：`SQL_CONNECTION_FACTORY.connect()` 在数据库已配置但执行器未通过 attest 契约时
+ * 会抛错。如果在这里急切建连，启动失败会表现为「模块工厂抛了数据库错」，而不是启动期持久化边界
+ * 给出的**结构化违规**（`SQL_EXECUTOR_VERIFICATION_REQUIRED` / `DECLARATION_NOT_SEALED` 等）；
+ * 依赖就绪门禁也必须能在**任何连接之前**给出 `COMPLIANCE_REPOSITORY[DEPENDENCY_NOT_VERIFIED]`。
+ * 延迟后，判定顺序保持为「配置 → 持久化边界 / 依赖就绪 → 首次真正读库」。
+ *
+ * 连接只在首次读取时建立并被复用；建立失败**不缓存**失败结果（下一次调用会重试）。
+ *
+ * **存储 ID 域先判、再建连**：服务端主体必须落在 UUID 域内，因此非 UUID 的会话主体
+ * （基线的 `u-student-1`）会在解析执行器**之前**被拒绝（`INVALID_SUBJECT`），
+ * 不会触发任何数据库连接。
+ */
+export function createLazyPostgresComplianceRepository(
+  resolveExecutor: () => Promise<SqlExecutor>,
+  capabilities: ComplianceRepositoryCapabilities = POSTGRES_COMPLIANCE_REPOSITORY_CAPABILITIES,
+): ComplianceRepository {
+  assertPostgresComplianceRepositoryCapabilities(capabilities);
+
+  let pending: Promise<SqlExecutor> | undefined;
+  const executor = (): Promise<SqlExecutor> => {
+    if (pending === undefined) {
+      pending = resolveExecutor().catch((error: unknown) => {
+        pending = undefined;
+        throw error;
+      });
+    }
+    return pending;
+  };
+
+  return {
+    capabilities,
+    async findByUserId(ownerUserId: string): Promise<ComplianceRecord | undefined> {
+      // 主体域先判、再建连：非存储 ID 域的主体不应该触发任何数据库连接
+      const ownerId = assertPostgresComplianceSubject(ownerUserId);
+      const resolved = await executor();
+      return new PostgresComplianceRepository(resolved).findByUserId(ownerId);
+    },
+  };
 }

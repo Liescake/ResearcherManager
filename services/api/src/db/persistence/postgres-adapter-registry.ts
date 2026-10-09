@@ -2,10 +2,10 @@
  * 跨 adapter 持久化边界登记表与判定器（**已落地 Postgres 切片的唯一事实来源**）。
  *
  * ## 为什么需要这一层
- * `modules/**\/*.postgres-repository.ts` 的十二个 PostgreSQL adapter 分成两组：三个是「已写好但
+ * `modules/**\/*.postgres-repository.ts` 的十二个 PostgreSQL adapter 分成两组：两个是「已写好但
  * **未装配**」的实现（它们不参与依赖注入、不进入任何业务 Module 的 provider、不引入任何驱动
  * 依赖，能力声明固定为 `backend = postgres` / `persistent = true` / `productionReady = false`），
- * 九个已按「是否配置数据库」绑定到端口（见下 `POSTGRES_BOUND_SLICE_REGISTRY`）。
+ * 十个已按「是否配置数据库」绑定到端口（见下 `POSTGRES_BOUND_SLICE_REGISTRY`）。
  * 每个 adapter 自己的 spec 只能证明「本 adapter 的装配状态」，**无法回答跨 adapter 的问题**：
  * 新增了第十一个 adapter 但忘了登记、两个 adapter 争抢同一个模块、登记表指向了不存在的文件、
  * 有人偷偷把 adapter 写进 provider 或引入 `pg` —— 这些都必须由一道**跨 adapter 的门禁**发现。
@@ -57,22 +57,16 @@ export interface PostgresAdapterDescriptor {
 }
 
 /**
- * 三个未装配 Postgres adapter 的登记表（按模块名字母序，便于人工比对）。
+ * 两个未装配 Postgres adapter 的登记表（按模块名字母序，便于人工比对）。
  *
  * 新增 adapter 时**必须同时**在此登记：门禁会拿磁盘枚举结果与这张表做双向比对，
  * 只加文件不登记（`ADAPTER_FILE_NOT_REGISTERED`）与只登记不加文件（`REGISTERED_FILE_MISSING`）
  * 都会失败。
+ *
+ * 合规切片已从本组移到 `POSTGRES_BOUND_SLICE_REGISTRY`（它的 `COMPLIANCE_REPOSITORY`
+ * 现在按「是否配置 `DATABASE_URL`」换绑），因此这里只剩导出与匹配两个切片。
  */
 export const POSTGRES_ADAPTER_REGISTRY: readonly PostgresAdapterDescriptor[] = [
-  {
-    id: 'compliance',
-    module: 'compliance',
-    file: 'modules/compliance/compliance.postgres-repository.ts',
-    capabilitiesExport: 'POSTGRES_COMPLIANCE_REPOSITORY_CAPABILITIES',
-    assertExport: 'assertPostgresComplianceRepositoryCapabilities',
-    repositoryClass: 'PostgresComplianceRepository',
-    moduleFile: 'modules/compliance/compliance.module.ts',
-  },
   {
     id: 'exports',
     module: 'exports',
@@ -98,10 +92,20 @@ export const POSTGRES_ADAPTER_REGISTRY: readonly PostgresAdapterDescriptor[] = [
  * 「未装配」那一组规则（不得被 Module 引用）对它们**不成立** —— 但必须换成另一组同样可机器
  * 判定的规则，而不是简单地放行。
  *
- * 九个切片：
+ * 十个切片：
  * - `auth`：会话存储（`SESSION_STORE`）。「是否配置数据库」决定绑定哪个实现；未配置时绑定内存基线，
  *   配置时绑定 PostgreSQL 实现（延迟建连，见 `modules/auth/session-store.postgres-repository.ts`）。
  *   因此 `auth.module.ts` 里出现的是**工厂导出名**，而不是 adapter 类名；
+ * - `compliance`：合规状态存储（`COMPLIANCE_REPOSITORY`，本人合规状态的只读取数）。分流口径与
+ *   auth 完全一致：同一份纯函数 `resolveAppDatabaseConfig` + 可选注入的 `SQL_CONNECTION_FACTORY`，
+ *   未配置数据库时内存基线，配置时 PostgreSQL 实现（延迟建连，见
+ *   `modules/compliance/compliance.postgres-repository.ts` 的
+ *   `createLazyPostgresComplianceRepository`，表 `user_compliance` 由迁移 `0012` 建立）。
+ *   授权（`profile:self:read` + `SELF`）在 service 里**先于任何仓储访问与字段校验**；归属只来自
+ *   服务端会话主体（客户端 `userId` / `owner` / `status` 既不进判定也不进 SQL），adapter 把归属
+ *   下推进 SQL（`WHERE user_id = $1::uuid`）并在返回行上复核归属。**已登记前置**：
+ *   `user_compliance.user_id` 是 `uuid`，而会话基线的 `userId` 形如 `u-student-1`，因此数据库路径
+ *   对非 UUID 主体 fail-closed（`INVALID_SUBJECT`，且在**解析执行器之前**判定，不建立任何连接）；
  * - `audit`：审计事件存储（`AUDIT_REPOSITORY`，**只追加**）。分流口径与 auth 完全一致：同一份纯函数
  *   `resolveAppDatabaseConfig` + 可选注入的 `SQL_CONNECTION_FACTORY`，未配置数据库时内存基线，
  *   配置时 PostgreSQL 实现（延迟建连，见 `modules/audit/audit.postgres-repository.ts` 的
@@ -150,7 +154,7 @@ export const POSTGRES_ADAPTER_REGISTRY: readonly PostgresAdapterDescriptor[] = [
  *    只改其中一处即 fail-closed；
  * 5. adapter 源文件不得 import 任何驱动（含已授权的 `pg`）：驱动只允许出现在
  *    `db/postgres/` 驱动层；
- * 6. 其余三个 adapter 继续留在 `POSTGRES_ADAPTER_REGISTRY`（未装配组），两组互斥。
+ * 6. 其余两个 adapter 继续留在 `POSTGRES_ADAPTER_REGISTRY`（未装配组），两组互斥。
  */
 export interface PostgresBoundSliceDescriptor {
   /** 稳定 id */
@@ -180,6 +184,17 @@ export const POSTGRES_BOUND_SLICE_REGISTRY: readonly PostgresBoundSliceDescripto
     moduleFile: 'modules/auth/auth.module.ts',
     token: 'SESSION_STORE',
     factoryExport: 'createLazyPostgresSessionStore',
+  },
+  {
+    id: 'compliance',
+    module: 'compliance',
+    file: 'modules/compliance/compliance.postgres-repository.ts',
+    capabilitiesExport: 'POSTGRES_COMPLIANCE_REPOSITORY_CAPABILITIES',
+    assertExport: 'assertPostgresComplianceRepositoryCapabilities',
+    repositoryClass: 'PostgresComplianceRepository',
+    moduleFile: 'modules/compliance/compliance.module.ts',
+    token: 'COMPLIANCE_REPOSITORY',
+    factoryExport: 'createLazyPostgresComplianceRepository',
   },
   {
     id: 'audit',

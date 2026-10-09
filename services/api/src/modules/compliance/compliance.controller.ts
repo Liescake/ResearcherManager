@@ -32,13 +32,13 @@ export class ComplianceController {
   ) {}
 
   @Get()
-  getMyComplianceStatus(
+  async getMyComplianceStatus(
     @Headers('authorization') authorization: string | undefined,
     @Query() query: unknown,
     @Body() body: unknown,
-  ): ComplianceStatusView {
+  ): Promise<ComplianceStatusView> {
     return this.compliance.getMyComplianceStatus(
-      requireSubject(this.sessions, authorization),
+      await requireSubject(this.sessions, authorization),
       query,
       body,
     );

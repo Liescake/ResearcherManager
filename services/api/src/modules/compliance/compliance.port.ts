@@ -123,16 +123,27 @@ export interface ComplianceRepositoryCapabilities {
 }
 
 /**
- * 合规状态仓储端口（**只读**）。
+ * 合规状态仓储端口（**只读**、**异步**）。
  *
  * - `findByUserId`：只返回该服务端主体名下的记录，没有则返回 `undefined`
  *   （由 service 按 fail-closed 处理：拿不到服务端事实时不得给出「看起来正常」的状态）；
  * - service 仍会逐条复核归属与读取契约（纵深防御：仓储的过滤行为不作为安全边界）；
  * - 端口**没有**写方法：本切片不提供「记录同意」「撤回同意」「执行删除」的能力。
+ *
+ * ## 为什么端口是异步的（本切片的契约收敛）
+ * 内存基线是同步的，而数据库实现必须是 Promise：数据库路径不能靠「同步等待」假装成同步接口。
+ * 本切片把**运行时唯一契约**收敛为 Promise 返回，因此：
+ * - `InMemoryComplianceRepository` 与 `PostgresComplianceRepository` 实现**同一个**接口，
+ *   换绑不再需要第二个并存契约（此前的 `AsyncComplianceRepository` 与之逐字对应）；
+ * - service / controller 一起改成 async（授权判定仍在任何 `await` 之前完成），
+ *   因此「先授权、再校验、最后取数」的顺序在异步路径上保持不变；
+ * - 换绑点（`compliance.module.ts`）只按「是否解析出 `DATABASE_URL`」分流，两种实现的语义
+ *   （按服务端主体取数、无记录返回 `undefined`、返回新副本而不是内部引用）逐条一致，
+ *   因此「切到数据库」与「回退到内存基线」仍是可整步执行 / 整步回退的操作。
  */
 export interface ComplianceRepository {
   readonly capabilities: ComplianceRepositoryCapabilities;
-  findByUserId(ownerUserId: string): ComplianceRecord | undefined;
+  findByUserId(ownerUserId: string): Promise<ComplianceRecord | undefined>;
 }
 
 /**
@@ -157,20 +168,12 @@ export const COMPLIANCE_REPOSITORY_BACKEND_POSTGRES = 'postgres';
 export const COMPLIANCE_REPOSITORY_STORAGE_ID_DOMAIN = 'uuid';
 
 /**
- * **异步仓储契约**（数据库形状的合规状态仓储端口，与 `ComplianceRepository` 同语义）。
+ * **兼容别名**：`AsyncComplianceRepository` 曾是与同步端口并存的「数据库形状」契约。
+ * 端口收敛为异步唯一契约（见上）后，两者是同一个类型；保留该导出名是为了让既有引用
+ * （adapter 的 `implements` 与 spec 的断言）在收敛过程中不需要改名，而不是「第二份契约」。
  *
- * 为什么与同步端口并存、而不是把它直接改成异步：同步端口是当前运行时绑定（内存基线，同步返回）。
- * 把它改成 Promise 是**跨模块契约变更**（service / controller 与既有 spec 必须一起改），
- * 只能与「引入经评估的驱动 + 对真实 PostgreSQL 的集成验证」在同一片切片完成。在那之前，
- * 数据库 adapter 按本契约实现并单独验证，运行时绑定一动不动，因此「切换到数据库」与
- * 「回退到内存基线」都仍是可整步执行 / 整步回退的操作。
- *
- * 方法集与同步端口**逐字对应**，且**只有一个方法**：`findByUserId`。这里刻意没有
- * `findById` / `listByOwnerId` 那种「单条读取」与「列表读取」入口——本切片只交付「本人一条状态」，
- * 入口越少，越不存在「按客户端提交的主体取数」或「未过滤的批量导出」这类越权面。
- *
- * 实现者（当前只有 `compliance.postgres-repository.ts`）必须满足与内存基线**完全相同**的语义
- * （按主体取数、无记录返回 `undefined`、返回副本而不是内部可变引用），并额外守住六条边界：
+ * 实现者（内存基线与 `compliance.postgres-repository.ts`）必须满足与**完全相同**的语义
+ * （按主体取数、无记录返回 `undefined`、返回新构造的记录对象），并额外守住六条边界：
  * 1. **只读**：端口没有写入口，实现同样不得新增 `create` / `save` / `insert` / `update` /
  *    `delete` / `archive` / `purge` / `truncate` / `upsert` 任何一个方法；
  * 2. **归属只来自服务端**：`ownerUserId` 由 service 从服务端会话主体传入，adapter 不生成、
@@ -186,14 +189,7 @@ export const COMPLIANCE_REPOSITORY_STORAGE_ID_DOMAIN = 'uuid';
  *    进入错误消息、日志与公开视图**：公开视图由 `compliance.contract.ts` 的
  *    `toComplianceStatusView` 逐字段裁剪（恰好 `COMPLIANCE_STATUS_VIEW_FIELDS` 三个状态枚举）。
  */
-export interface AsyncComplianceRepository {
-  readonly capabilities: ComplianceRepositoryCapabilities;
-  /**
-   * 只返回该服务端主体名下的合规状态记录，没有则 `undefined`（由 service 按 fail-closed 处理）。
-   * 调用方必须是已授权访问该主体资源的服务端代码；归属必须下推进 SQL（他人记录不出库）。
-   */
-  findByUserId(ownerUserId: string): Promise<ComplianceRecord | undefined>;
-}
+export type AsyncComplianceRepository = ComplianceRepository;
 
 /**
  * DI 令牌：合规状态仓储（真实实现委托 `user_compliance` 表 / 派生读模型）。

@@ -18,10 +18,13 @@ import { AppModule } from '../../app.module';
 import { ApiExceptionFilter } from '../../common/api-exception.filter';
 import { ApiResponseInterceptor } from '../../common/api-response.interceptor';
 import { ConfigModule } from '../../config/config.module';
+import { APP_ENV } from '../../config/config.module';
 import { loadEnv } from '../../config/env';
+import { SQL_CONNECTION_FACTORY } from '../../db/ports/sql-executor.port';
 import { AccessControlModule } from '../access-control/access-control.module';
 import { AuthModule } from '../auth/auth.module';
 import { InMemorySessionStore } from '../auth/session-store.in-memory';
+import { SESSION_STORE } from '../auth/session-subject.port';
 import { RUOYI_AUTHZ_ADAPTER } from '../ruoyi-adapter/ruoyi-adapter.port';
 import type { RuoYiAuthzAdapter } from '../ruoyi-adapter/ruoyi-adapter.port';
 import {
@@ -194,7 +197,7 @@ async function startComplianceApp(options: { readonly seed?: boolean } = {}): Pr
   await app.listen(0, '127.0.0.1');
   startedApps.push(app);
 
-  const store = app.get(InMemorySessionStore);
+  const store = app.get<InMemorySessionStore>(SESSION_STORE);
   store.seed({
     sessionId: SESSION_STUDENT_1,
     subject: { userId: STUDENT_1, roles: [Role.Student] },
@@ -223,7 +226,7 @@ async function startComplianceApp(options: { readonly seed?: boolean } = {}): Pr
     subject: { userId: 'u-unknown-1', roles: ['guest' as Role] },
   });
 
-  const repository = app.get(InMemoryComplianceRepository);
+  const repository = app.get<InMemoryComplianceRepository>(COMPLIANCE_REPOSITORY);
   if (options.seed !== false) {
     repository.seed(fixtureComplianceRecord());
     repository.seed(fixtureComplianceRecord({ ownerUserId: STUDENT_2, ...STUDENT_2_STATUS }));
@@ -610,8 +613,10 @@ describe('合规划片：越权 403（AuthorizationGuard + 服务端常量判定
 
     expect(res.status).toBe(403);
     expect(spies.find).not.toHaveBeenCalled();
-    expect(app.repository.findByUserId(ADMIN_1)).toBeUndefined();
-    expect(app.repository.findByUserId(STUDENT_1)).toEqual(fixtureComplianceRecord());
+    await expect(app.repository.findByUserId(ADMIN_1)).resolves.toBeUndefined();
+    await expect(app.repository.findByUserId(STUDENT_1)).resolves.toEqual(
+      fixtureComplianceRecord(),
+    );
   });
 });
 
@@ -935,7 +940,9 @@ describe('合规划片：claims 伪造（客户端声明不进入判定、归属
     expect(res.status).toBe(400);
     expect(res.body.error?.code).toBe('VALIDATION_FAILED');
     expectNoPortCalls(spies);
-    expect(app.repository.findByUserId(STUDENT_1)).toEqual(fixtureComplianceRecord());
+    await expect(app.repository.findByUserId(STUDENT_1)).resolves.toEqual(
+      fixtureComplianceRecord(),
+    );
   });
 });
 
@@ -987,7 +994,9 @@ describe('合规划片：PII 与非法存储 fail-closed 500', () => {
       const app = await startComplianceApp();
       // 非法记录不能靠 seed 注入（归属形态非法的记录会落到别的键上），
       // 直接让端口返回它：这正是「存储被篡改/损坏」要覆盖的路径。
-      vi.spyOn(app.repository, 'findByUserId').mockImplementation(() => record as ComplianceRecord);
+      vi.spyOn(app.repository, 'findByUserId').mockImplementation(
+        async () => record as ComplianceRecord,
+      );
 
       const res = await call(app.baseUrl, 'GET', '/me/compliance-status', {
         headers: bearer(SESSION_STUDENT_1),
@@ -1095,7 +1104,7 @@ describe('合规划片：PII 与非法存储 fail-closed 500', () => {
   it('仓储返回他人记录（未按主体过滤）→ 500，且他人标识不外发', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const app = await startComplianceApp();
-    vi.spyOn(app.repository, 'findByUserId').mockImplementation(() =>
+    vi.spyOn(app.repository, 'findByUserId').mockImplementation(async () =>
       fixtureComplianceRecord({ ownerUserId: STUDENT_2, ...STUDENT_2_STATUS }),
     );
 
@@ -1114,7 +1123,7 @@ describe('合规划片：PII 与非法存储 fail-closed 500', () => {
   it('仓储抛异常（含敏感原文）→ 500，响应不含错误名/堆栈/原文', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const app = await startComplianceApp();
-    vi.spyOn(app.repository, 'findByUserId').mockImplementation(() => {
+    vi.spyOn(app.repository, 'findByUserId').mockImplementation(async () => {
       throw new Error(
         `connection refused: ownerUserId=${STUDENT_1} phone=${OTHER_PHONE} consentText=${CONSENT_TEXT}`,
       );
@@ -1149,7 +1158,9 @@ describe('合规划片：PII 与非法存储 fail-closed 500', () => {
 
     for (const shape of shapes) {
       const app = await startComplianceApp();
-      vi.spyOn(app.repository, 'findByUserId').mockImplementation(() => shape as ComplianceRecord);
+      vi.spyOn(app.repository, 'findByUserId').mockImplementation(
+        async () => shape as ComplianceRecord,
+      );
 
       const res = await call(app.baseUrl, 'GET', '/me/compliance-status', {
         headers: bearer(SESSION_STUDENT_1),
@@ -1163,30 +1174,35 @@ describe('合规划片：PII 与非法存储 fail-closed 500', () => {
 });
 
 describe('合规划片：装配边界与纯函数门禁', () => {
-  it('ComplianceModule 只注册本切片的路由/服务，并把令牌显式绑到非生产内存基线', () => {
+  it('ComplianceModule 只注册本切片的路由/服务，并按「是否配置数据库」换绑端口（未配置 ⇒ 内存基线）', () => {
     const providers = (Reflect.getMetadata('providers', ComplianceModule) ?? []) as unknown[];
     const controllers = (Reflect.getMetadata('controllers', ComplianceModule) ?? []) as unknown[];
     const imports = (Reflect.getMetadata('imports', ComplianceModule) ?? []) as unknown[];
 
     expect(controllers).toEqual([ComplianceController]);
     expect(providers).toContain(ComplianceService);
-    expect(providers).toContain(InMemoryComplianceRepository);
-    // 换绑持久化实现时只改这一处
+    // 内存基线**不再**是独立 provider：端口是唯一取用点，容器里不会出现两份状态
+    expect(providers).not.toContain(InMemoryComplianceRepository);
+    // 换绑持久化实现时只改这一处（工厂 provider：按 DATABASE_URL 分流，延迟建连）
     expect(providers).toContainEqual({
       provide: COMPLIANCE_REPOSITORY,
-      useExisting: InMemoryComplianceRepository,
+      useFactory: expect.any(Function) as unknown,
+      inject: [APP_ENV, { token: SQL_CONNECTION_FACTORY, optional: true }],
     });
     // 依赖方向：认证（auth）与授权（access-control）各自只经端口/服务暴露
     expect(imports).toContain(AuthModule);
     expect(imports).toContain(AccessControlModule);
   });
 
-  it('令牌在容器里解析到内存基线的同一个实例（useExisting 语义）', async () => {
+  it('未配置数据库时令牌解析到内存基线（同一实例，且服务从端口取数）', async () => {
     const app = await startComplianceApp({ seed: false });
-    expect(app.app.get(COMPLIANCE_REPOSITORY)).toBe(app.app.get(InMemoryComplianceRepository));
+    const bound = app.app.get<InMemoryComplianceRepository>(COMPLIANCE_REPOSITORY);
+    expect(bound).toBeInstanceOf(InMemoryComplianceRepository);
+    // 端口是唯一取用点：容器里不存在第二份内存基线实例
+    expect(app.app.get<InMemoryComplianceRepository>(COMPLIANCE_REPOSITORY)).toBe(bound);
   });
 
-  it('内存基线如实声明非持久化/不可用于生产，并在生产环境拒绝构造', () => {
+  it('内存基线如实声明非持久化/不可用于生产，并在生产环境拒绝构造', async () => {
     const developmentEnv = loadEnv({});
     const productionEnv = loadEnv({ NODE_ENV: 'production' });
 
@@ -1196,33 +1212,36 @@ describe('合规划片：装配边界与纯函数门禁', () => {
       persistent: false,
       productionReady: false,
     });
-    expect(repository.findByUserId('u-nobody')).toBeUndefined();
+    await expect(repository.findByUserId('u-nobody')).resolves.toBeUndefined();
     expect(() => new InMemoryComplianceRepository(productionEnv)).toThrow(
       /生产环境禁止使用内存合规仓储/u,
     );
   });
 
-  it('内存仓储：只读、按主体取数、返回副本、未预置任何主体', () => {
+  it('内存仓储：只读、按主体取数、返回副本、未预置任何主体', async () => {
     const repository = new InMemoryComplianceRepository(loadEnv({}));
 
     // 默认不预置任何账号：未 seed 时任何主体都查不到记录（由 service 按 fail-closed 处理）
-    expect(repository.findByUserId(STUDENT_1)).toBeUndefined();
+    await expect(repository.findByUserId(STUDENT_1)).resolves.toBeUndefined();
 
     const record = fixtureComplianceRecord();
     repository.seed(record);
-    expect(repository.findByUserId(STUDENT_1)).toEqual(record);
-    expect(repository.findByUserId(STUDENT_2)).toBeUndefined();
+    await expect(repository.findByUserId(STUDENT_1)).resolves.toEqual(record);
+    await expect(repository.findByUserId(STUDENT_2)).resolves.toBeUndefined();
 
     // 端口/实例上没有写入口：API 无法经由读取路径改写合规事实
     for (const forbidden of ['create', 'save', 'update', 'upsert', 'delete', 'remove', 'archive']) {
       expect(forbidden in repository).toBe(false);
     }
 
-    // 返回副本：调用方无法就地改写已存储的记录
-    const returned = repository.findByUserId(STUDENT_1);
+    // 返回副本：调用方无法就地改写已存储的记录（每次读取都是新对象）
+    const returned = await repository.findByUserId(STUDENT_1);
     expect(returned).toBeDefined();
     (returned as { privacyConsent: string }).privacyConsent = 'tampered';
-    expect(repository.findByUserId(STUDENT_1)?.privacyConsent).toBe(PrivacyConsentStatus.Granted);
+    await expect(repository.findByUserId(STUDENT_1)).resolves.toMatchObject({
+      privacyConsent: PrivacyConsentStatus.Granted,
+    });
+    expect(await repository.findByUserId(STUDENT_1)).not.toBe(returned);
   });
 
   it('输出白名单是真正的闭集：多出字段、非法枚举与缺字段即违规（门禁非恒真）', () => {
@@ -1453,6 +1472,7 @@ describe('合规划片：装配边界与纯函数门禁', () => {
       'apiPort',
       'apiPrefix',
       'databaseConfigured',
+      'dependencyGate',
       'nodeEnv',
     ]);
 

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type {
@@ -54,9 +54,10 @@ import {
  * （不连数据库、不引驱动）。
  *
  * 覆盖用户要求的补充安全契约测试与交付边界：
- * - **能力与交付边界**：`persistent = true` / `productionReady = false`（未真实驱动验证前严禁
- *   生产）、列清单与读取契约字段双射、`user_compliance` 尚未落草案 / 迁移、adapter 未被装配到
- *   `ComplianceModule`、不引驱动 / ORM、同步端口未被改成异步、内存 provider 未被切换；
+ * - **能力与交付边界**：`persistent = true` / `productionReady = false`（未取得封存声明与验证证据前
+ *   严禁生产）、列清单与读取契约字段双射、`user_compliance` 由迁移 `0012` 建立（且草案已转写）、
+ *   adapter 已装配到 `ComplianceModule`（按「是否配置 DATABASE_URL」分流且延迟建连）、
+ *   不引驱动 / ORM、运行时端口收敛为异步唯一契约、内存 provider 只在未配置数据库时绑定；
  * - **参数化 SQL 与固定标识符**：值只出现在参数里，SQL 文本只由模块常量构成（语句里没有任何
  *   引号 / 分号 / 注释符 / 通配符，因此不存在字面量注入面）；执行过的 SQL 只有 `SELECT`；
  * - **SQL 注入**：主体等入口的注入载荷要么只进参数、要么在进入 SQL 之前被拒绝
@@ -98,7 +99,6 @@ const PORT_PATH = resolve(COMPLIANCE_DIR, 'compliance.port.ts');
 const MODULE_PATH = resolve(COMPLIANCE_DIR, 'compliance.module.ts');
 const IN_MEMORY_PATH = resolve(COMPLIANCE_DIR, 'compliance.in-memory-repository.ts');
 const ADAPTER_CLASS = 'PostgresComplianceRepository';
-const ADAPTER_MODULE = 'compliance.postgres-repository';
 
 interface RecordedCall {
   readonly sql: string;
@@ -511,8 +511,16 @@ describe('PostgreSQL 合规仓储：能力声明与交付边界', () => {
       'user_id',
       ...POSTGRES_COMPLIANCE_INTERNAL_COLUMNS,
     ]);
-    for (const column of ['user_id', ...POSTGRES_COMPLIANCE_INTERNAL_COLUMNS]) {
+    // 归属映射（user_id → ownerUserId）与**全部**内部列都必须同时被裁剪清单与高敏清单覆盖，
+    // 且每列恰好登记一次（重复登记会让「子集」判定出现假象）
+    const covered = ['user_id', ...POSTGRES_COMPLIANCE_INTERNAL_COLUMNS];
+    for (const column of covered) {
       expect(POSTGRES_COMPLIANCE_VIEW_EXCLUDED_COLUMNS).toContain(column);
+      expect(POSTGRES_COMPLIANCE_PII_COLUMNS).toContain(column);
+      expect(
+        POSTGRES_COMPLIANCE_VIEW_EXCLUDED_COLUMNS.filter((item) => item === column),
+      ).toHaveLength(1);
+      expect(POSTGRES_COMPLIANCE_PII_COLUMNS.filter((item) => item === column)).toHaveLength(1);
     }
     // 高敏清单必须覆盖归属、同意原文、联系方式与 PII、审核 / 证据与存储位置
     for (const column of [
@@ -561,52 +569,91 @@ describe('PostgreSQL 合规仓储：能力声明与交付边界', () => {
     }
   });
 
-  it('表名与 db schema 边界一致：占位清单里是原始同意表，user_compliance 既无草案也无迁移', () => {
+  it('表名与 db schema 边界一致：占位清单里仍是原始同意表，读模型由迁移 0012 建立（草案已转写）', () => {
     expect(POSTGRES_COMPLIANCE_TABLE).toBe('user_compliance');
 
     const bootstrap = readFileSync(
       join(REPO_ROOT, 'db', 'migrations', '0001_bootstrap.sql'),
       'utf8',
     );
-    // 边界事实：占位清单登记的是原始同意表 privacy_consents（本 adapter 的聚合读模型不在其中）
+    // 边界事实：占位清单登记的是原始同意表 privacy_consents，且该迁移**已应用、不可改写**
+    // （校验和），因此本切片不改它，而是在迁移 0012 里显式建出派生读模型。
     expect(bootstrap).toContain('privacy_consents');
     expect(bootstrap).not.toContain('user_compliance');
     expect(bootstrap).not.toMatch(/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?user_compliance/iu);
 
-    const draftDir = join(REPO_ROOT, 'db', 'schema-drafts');
-    const drafts = readdirSync(draftDir).filter((entry) => entry.endsWith('.draft.sql'));
-    const draftContents = drafts
-      .map((entry) => readFileSync(join(draftDir, entry), 'utf8'))
-      .join('\n');
-    expect(draftContents).not.toContain('user_compliance');
-
-    const migrationFiles = readdirSync(join(REPO_ROOT, 'db', 'migrations')).filter((entry) =>
-      entry.endsWith('.sql'),
+    // 迁移 0012 必须显式建表，且把「来源（privacy_consents）→ 派生读模型（user_compliance）」
+    // 的关系写在头部/注释里，避免同一概念在存储侧出现两份真相。
+    const migrationPath = join(REPO_ROOT, 'db', 'migrations', '0012_user_compliance.sql');
+    expect(existsSync(migrationPath)).toBe(true);
+    const migration = readFileSync(migrationPath, 'utf8');
+    expect(migration).toMatch(/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+user_compliance\s*\(/iu);
+    expect(migration).toContain('-- migration: 0012_user_compliance');
+    expect(migration).toContain('privacy_consents');
+    // 存储层把「状态自洽」与「归属唯一」下沉为约束/索引，而不是只靠应用层
+    expect(migration).toContain('user_compliance_export_requires_active_consent');
+    expect(migration).toContain('uq_user_compliance_user_id');
+    // 只落三个状态列 + 归属列：建表语句体内不得出现任何 PII / 同意原文 / 审核证据列
+    // （列清单的说明注释里会列举「刻意不建」的列名，因此这里只判定 DDL 本体）
+    const tableDdl = migration.slice(
+      migration.indexOf('CREATE TABLE IF NOT EXISTS user_compliance'),
+      migration.indexOf('COMMENT ON TABLE user_compliance'),
     );
-    const migrationContents = migrationFiles
-      .map((entry) => readFileSync(join(REPO_ROOT, 'db', 'migrations', entry), 'utf8'))
-      .join('\n');
-    expect(migrationContents).not.toMatch(
-      /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?user_compliance/iu,
-    );
+    expect(tableDdl).not.toBe('');
+    for (const column of [
+      'consent_text',
+      'policy_text',
+      'policy_version',
+      'phone',
+      'email',
+      'id_card',
+      'student_no',
+      'reviewer_id',
+      'evidence_url',
+      'storage_key',
+      'download_url',
+    ]) {
+      expect(tableDdl).not.toContain(column);
+    }
+    // 表定义里恰好只有：归属列 + 三个状态列 + 三个内部列（id / created_at / updated_at）
+    for (const column of [
+      'id',
+      'user_id',
+      'privacy_consent',
+      'data_retention',
+      'export_availability',
+      'created_at',
+      'updated_at',
+    ]) {
+      expect(tableDdl).toContain(column);
+    }
 
-    // 命名偏差必须被登记（不能只写声明）：表名对齐与派生口径都在验证清单里
+    // 草案已按 db/schema-drafts/README.md 的规范转写（保留留痕），且草案与迁移是同一张表
+    const draftPath = join(REPO_ROOT, 'db', 'schema-drafts', '0002_user_compliance.draft.sql');
+    expect(existsSync(draftPath)).toBe(true);
+    const draft = readFileSync(draftPath, 'utf8');
+    expect(draft).toContain('-- target-table: user_compliance');
+    expect(draft).toMatch(/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+user_compliance\s*\(/iu);
+
+    // 命名与派生口径的偏差必须被登记（不能只写声明）：本切片后只剩派生口径一项未定稿
     expect([...POSTGRES_COMPLIANCE_REPOSITORY_VERIFICATION_STEPS]).toContain(
-      'user-compliance-table-name-aligned-with-bootstrap-placeholder-list',
+      'user-compliance-schema-draft-created-and-promoted-to-migration',
     );
     expect([...POSTGRES_COMPLIANCE_REPOSITORY_VERIFICATION_STEPS]).toContain(
       'retention-and-export-availability-derivation-defined',
     );
   });
 
-  it('端口已新增并存的异步契约与后端标识，同步端口签名一字未改', () => {
+  it('端口收敛为异步唯一契约并保留后端标识，且端口上不存在任何写入 / 删除 / 覆盖插入入口', () => {
     const source = readFileSync(PORT_PATH, 'utf8');
     expect(source).toContain('export interface ComplianceRepository {');
-    expect(source).toContain('findByUserId(ownerUserId: string): ComplianceRecord | undefined;');
-    expect(source).toContain('export interface AsyncComplianceRepository {');
+    // 运行时唯一契约是 Promise：内存基线与数据库实现实现同一个接口
     expect(source).toContain(
       'findByUserId(ownerUserId: string): Promise<ComplianceRecord | undefined>;',
     );
+    // 兼容别名仍然导出，但它必须真的是「同一个接口」的别名，而不是第二份契约
+    expect(source).toContain('export type AsyncComplianceRepository = ComplianceRepository;');
+    expect(source).not.toContain('export interface AsyncComplianceRepository {');
     expect(source).toContain('export const COMPLIANCE_REPOSITORY_BACKEND_POSTGRES');
     expect(source).toContain('export const COMPLIANCE_REPOSITORY_STORAGE_ID_DOMAIN');
     expect(source).toContain(
@@ -998,19 +1045,28 @@ describe('PostgreSQL 合规仓储：subject owner 隔离与闭集往返', () => 
   });
 
   it('每次调用都返回新对象（不把数据库行或内部可变引用交给调用方）', async () => {
+    // 三次响应刻意复用**同一个行对象**：即便执行器每次返回同一引用，adapter 也必须逐次新构造记录，
+    // 否则调用方改一次返回值就会污染后续读取（同引用 / 契约问题）
+    const sharedRow = rowFromRecord(OWNER_RECORD);
     const { repository } = repoWith(
-      { rows: [rowFromRecord(OWNER_RECORD)], rowCount: 1 },
-      { rows: [rowFromRecord(OWNER_RECORD)], rowCount: 1 },
-      { rows: [rowFromRecord(OWNER_RECORD)], rowCount: 1 },
+      { rows: [sharedRow], rowCount: 1 },
+      { rows: [sharedRow], rowCount: 1 },
+      { rows: [sharedRow], rowCount: 1 },
     );
     const first = await repository.findByUserId(OWNER);
     const second = await repository.findByUserId(OWNER);
     expect(first).toEqual(second);
     expect(first).not.toBe(second);
+    // 返回的不是数据库行本身，也不是被复用的内部引用
+    expect(first).not.toBe(sharedRow);
+    expect(second).not.toBe(sharedRow);
     // 修改返回值不影响后续读取（不是共享引用）
     (first as { privacyConsent: string }).privacyConsent = 'withdrawn';
+    expect(sharedRow.privacy_consent).toBe('granted');
     const third = await repository.findByUserId(OWNER);
     expect(third).toEqual(OWNER_RECORD);
+    expect(third).not.toBe(first);
+    expect(third).not.toBe(sharedRow);
   });
 
   it('三个状态闭集全组合可往返：自洽组合放行、不自洽组合 fail-closed（不臆造额外收紧）', async () => {
@@ -1166,6 +1222,11 @@ describe('PostgreSQL 合规仓储：公开视图与失败路径信息卫生', ()
   it('内部列与列清单零交集：探针一旦重叠即 fail-closed', () => {
     expect(findComplianceInternalColumnOverlaps()).toEqual([]);
     expect(() => assertComplianceInternalColumnsAbsent()).not.toThrow();
+    // 真实列清单必须被同一个探针放行（显式传参，避免「只有默认参数才放行」的假象）
+    expect(findComplianceInternalColumnOverlaps([...POSTGRES_COMPLIANCE_COLUMNS])).toEqual([]);
+    expect(() =>
+      assertComplianceInternalColumnsAbsent([...POSTGRES_COMPLIANCE_COLUMNS]),
+    ).not.toThrow();
 
     for (const internal of POSTGRES_COMPLIANCE_INTERNAL_COLUMNS) {
       const overlapped = [...POSTGRES_COMPLIANCE_COLUMNS, internal];
@@ -1336,40 +1397,49 @@ describe('PostgreSQL 合规仓储：公开视图与失败路径信息卫生', ()
   });
 });
 
-describe('PostgreSQL 合规仓储：未装配、无驱动依赖、与 schema 边界对齐', () => {
-  it('ComplianceModule 仍只绑定内存基线（本 adapter 未被装配）', () => {
+describe('PostgreSQL 合规仓储：已接入运行时、无驱动依赖、与 schema 边界对齐', () => {
+  it('ComplianceModule 按「是否配置数据库」换绑：内存基线不再是独立 provider，adapter 只能经工厂进入', () => {
     const content = readFileSync(MODULE_PATH, 'utf8');
 
-    expect(content).not.toContain(ADAPTER_CLASS);
-    expect(content).not.toContain(ADAPTER_MODULE);
+    // 换绑点：模块必须引用端口令牌与延迟建连工厂（登记表按这两个名字做机器比对）
+    expect(content).toContain('COMPLIANCE_REPOSITORY');
+    expect(content).toContain('createLazyPostgresComplianceRepository');
+    expect(content).toContain('resolveAppDatabaseConfig');
+    expect(content).toContain('SQL_CONNECTION_FACTORY');
     expect(content).toContain('InMemoryComplianceRepository');
-    expect(content).toContain(
-      '{ provide: COMPLIANCE_REPOSITORY, useExisting: InMemoryComplianceRepository }',
-    );
+    // 「未配置数据库」路径仍是内存基线，「配置了但没有执行器工厂」仍是 fail-closed 抛错
+    expect(content).toContain('createComplianceRepository');
+    expect(content).toMatch(/拒绝退回内存合规仓储/u);
+    // 内存基线**不再是**独立 provider（否则容器里会出现两份状态）
+    expect(content).not.toContain('useExisting: InMemoryComplianceRepository');
+    expect(content).not.toMatch(/providers:\s*\[[^\]]*InMemoryComplianceRepository/u);
+    // adapter 类仍然不被直接绑定：进入容器的是工厂返回的端口实现
+    expect(content).not.toContain(`new ${ADAPTER_CLASS}(`);
   });
 
-  it('持久化登记与数据库模块都不引用本 adapter（端口登记表仍按令牌判定）', () => {
-    for (const relative of [
-      join('src', 'db', 'persistence-bindings.ts'),
-      join('src', 'db', 'database.module.ts'),
-      join('src', 'db', 'ports', 'sql-executor.port.ts'),
-      join('src', 'modules', 'compliance', 'compliance.port.ts'),
-      join('src', 'app.module.ts'),
-      join('src', 'startup-assembly.spec.ts'),
-    ]) {
-      const content = readApiFile(relative);
-      expect(content).not.toContain(ADAPTER_CLASS);
-      expect(content).not.toMatch(
-        /(?:from\s+['"][^'"]*compliance\.postgres-repository['"]|require\(\s*['"][^'"]*compliance\.postgres-repository['"]\s*\))/u,
-      );
-    }
-    // 登记表里合规端口仍按令牌登记，且没有把 adapter 类名写进任何绑定
+  it('持久化登记表把本切片登记为「已绑定」，且不再把 adapter 挂在未装配组', () => {
+    const registry = readApiFile(join('src', 'db', 'persistence', 'postgres-adapter-registry.ts'));
+    // 已绑定组必须登记本切片的令牌 + 工厂导出名（换绑与登记表必须同时更新）
+    expect(registry).toContain("id: 'compliance'");
+    expect(registry).toContain("token: 'COMPLIANCE_REPOSITORY'");
+    expect(registry).toContain("factoryExport: 'createLazyPostgresComplianceRepository'");
+    expect(registry).toContain('POSTGRES_COMPLIANCE_REPOSITORY_CAPABILITIES');
+    // 未装配组的**数组内容**里不得再出现合规 adapter（按 `];` 精确切出数组，避免把下面的
+    // 「已绑定」文档注释误纳入判定范围）
+    const unboundStart = registry.indexOf('export const POSTGRES_ADAPTER_REGISTRY');
+    const unboundEnd = registry.indexOf('];', unboundStart);
+    const unboundGroup = registry.slice(unboundStart, unboundEnd);
+    expect(unboundGroup).not.toBe('');
+    expect(unboundGroup).not.toContain(ADAPTER_CLASS);
+    expect(unboundGroup).not.toContain('modules/compliance/');
+
+    // 端口登记表里合规端口仍按令牌登记（持久化职责不变）
     const bindings = readApiFile(join('src', 'db', 'persistence-bindings.ts'));
     expect(bindings).toContain('COMPLIANCE_REPOSITORY');
     expect(bindings).toContain('合规/隐私同意记录存储');
   });
 
-  it('内存基线仍是同步契约的实现者（本切片不改动它，也不切换内存 provider）', () => {
+  it('内存基线实现异步唯一契约、能力如实、且没有任何写入 / 删除入口', async () => {
     const source = readFileSync(IN_MEMORY_PATH, 'utf8');
     expect(source).toContain('implements ComplianceRepository');
     expect(source).not.toContain(ADAPTER_CLASS);
@@ -1379,7 +1449,7 @@ describe('PostgreSQL 合规仓储：未装配、无驱动依赖、与 schema 边
     for (const forbidden of POSTGRES_COMPLIANCE_FORBIDDEN_METHODS) {
       expect(source).not.toMatch(new RegExp(`\\b${forbidden}\\s*\\(`, 'u'));
     }
-    // 同步端口的实现者仍是内存基线（本切片只新增并存的异步契约，不改动它）
+    // 端口收敛后内存基线返回 Promise（与数据库实现同一契约），未 seed 时任何主体都查不到记录
     const memory: ComplianceRepository = new InMemoryComplianceRepository({
       NODE_ENV: 'test',
     } as unknown as ConstructorParameters<typeof InMemoryComplianceRepository>[0]);
@@ -1388,20 +1458,19 @@ describe('PostgreSQL 合规仓储：未装配、无驱动依赖、与 schema 边
       persistent: false,
       productionReady: false,
     });
-    expect(memory.findByUserId(OWNER)).toBeUndefined();
+    await expect(memory.findByUserId(OWNER)).resolves.toBeUndefined();
   });
 
-  it('同步端口契约未被改成异步（本切片只新增并存的异步契约与后端标识）', () => {
-    const source = readFileSync(PORT_PATH, 'utf8');
-    const syncPort = source.slice(
-      source.indexOf('export interface ComplianceRepository {'),
-      source.indexOf('export interface AsyncComplianceRepository {'),
-    );
-    expect(syncPort).not.toMatch(/\bfindByUserId\s*\([^)]*\)\s*:\s*Promise/u);
-    const asyncPort = source.slice(source.indexOf('export interface AsyncComplianceRepository {'));
-    expect(asyncPort).toContain(
-      'findByUserId(ownerUserId: string): Promise<ComplianceRecord | undefined>;',
-    );
+  it('内存基线与数据库实现满足同一个端口类型（换绑不需要第二个并存契约）', () => {
+    const adapter: ComplianceRepository = new PostgresComplianceRepository(new RecordingExecutor());
+    const memory: ComplianceRepository = new InMemoryComplianceRepository({
+      NODE_ENV: 'test',
+    } as unknown as ConstructorParameters<typeof InMemoryComplianceRepository>[0]);
+    // 两者都必须能被同一个端口类型接收（异步唯一契约），且各自如实声明能力
+    expect(adapter.capabilities.persistent).toBe(true);
+    expect(adapter.capabilities.productionReady).toBe(false);
+    expect(memory.capabilities.persistent).toBe(false);
+    expect(memory.capabilities.productionReady).toBe(false);
   });
 
   it('adapter 的公开面覆盖能力、验证清单、列清单、内部列与裁剪事实（供上层与运维机器判定）', () => {
@@ -1431,12 +1500,32 @@ describe('PostgreSQL 合规仓储：未装配、无驱动依赖、与 schema 边
     expect(source).toContain('export function findComplianceInternalColumnOverlaps');
     expect(source).toContain('export function assertComplianceInternalColumnsAbsent');
     expect(source).toContain('export function assertComplianceReadOnlySql');
+    // 换绑面：DI 工厂 + 延迟建连工厂 + 「存储 ID 域先判、再建连」的公开断言
+    expect(source).toContain('export function createPostgresComplianceRepository');
+    expect(source).toContain('export function createLazyPostgresComplianceRepository');
+    expect(source).toContain('export function assertPostgresComplianceSubject');
     expect(source).toContain('export type PostgresComplianceRepositoryErrorCode');
     // 语句模板：有且只有一条取数语句（模板常量名与首个关键字都必须是 SELECT）
     const templates = [...source.matchAll(/const (\w+_SQL) = `(\w+)/gu)].map(
       (match) => `${match[1] ?? ''}:${match[2] ?? ''}`,
     );
     expect(templates).toEqual(['SELECT_BY_USER_SQL:SELECT']);
+    // 源文本里不得出现「反引号 + 被禁写关键字」：注释 / 常量解释也不例外
+    // （只读切片却在源码里用反引号包着 INSERT / UPDATE 之类，会误导后续改动人）
+    for (const keyword of POSTGRES_COMPLIANCE_FORBIDDEN_SQL_KEYWORDS) {
+      expect(source).not.toMatch(new RegExp('`' + keyword + '\\b', 'u'));
+    }
+    // 反引号里的 SQL 文本（真正会被执行的内容）更不得出现任何被禁写关键字
+    const sqlTexts = [...source.matchAll(/const \w+_SQL = `([^`]*)`/gu)].map(
+      (match) => match[1] ?? '',
+    );
+    expect(sqlTexts).toHaveLength(1);
+    for (const sql of sqlTexts) {
+      expect(containsWord(sql, 'SELECT')).toBe(true);
+      for (const keyword of POSTGRES_COMPLIANCE_FORBIDDEN_SQL_KEYWORDS) {
+        expect(containsWord(sql, keyword)).toBe(false);
+      }
+    }
     // 只读切片里没有任何写入 / 冲突覆盖语句
     expect(source).not.toContain('ON CONFLICT');
     expect(source).not.toContain('RETURNING');
@@ -1479,7 +1568,7 @@ describe('PostgreSQL 合规仓储：未装配、无驱动依赖、与 schema 边
     );
   });
 
-  it('工作区依赖里没有 pg / ORM 包', () => {
+  it('工作区依赖里没有未授权的 pg 族 / ORM 包（官方 pg 驱动已授权，仅限驱动层）', () => {
     for (const relative of [join('services', 'api', 'package.json'), 'package.json']) {
       const manifest = JSON.parse(readFileSync(join(REPO_ROOT, relative), 'utf8')) as {
         dependencies?: Record<string, string>;
@@ -1491,7 +1580,7 @@ describe('PostgreSQL 合规仓储：未装配、无驱动依赖、与 schema 边
       ];
       for (const name of names) {
         expect(
-          /^(?:pg|pg-pool|pg-promise|postgres|prisma|@prisma\/client|typeorm|kysely|drizzle-orm|sequelize|@mikro-orm\/core)$/u.test(
+          /^(?:pg-pool|pg-native|pg-promise|postgres|slonik|prisma|@prisma\/client|typeorm|kysely|drizzle-orm|drizzle-kit|sequelize|@mikro-orm\/core)$/u.test(
             name,
           ),
         ).toBe(false);

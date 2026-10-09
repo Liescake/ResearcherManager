@@ -53,8 +53,12 @@ export class InMemoryComplianceRepository implements ComplianceRepository {
   /**
    * 只返回该服务端主体名下的记录，没有则 `undefined`（由 service 按 fail-closed 处理）。
    * 过滤行为**不作为安全边界**：service 仍会复核归属与读取契约（纵深防御）。
+   *
+   * 返回类型是 `Promise`：端口已收敛为异步唯一契约（见 `compliance.port.ts`），
+   * 数据库实现与内存基线因此实现**同一个**接口，换绑不再需要第二个并存契约。
+   * 内存基线的实现体仍是同步查表（`async` 只是契约形状），因此不引入任何真实异步行为。
    */
-  findByUserId(ownerUserId: string): ComplianceRecord | undefined {
+  async findByUserId(ownerUserId: string): Promise<ComplianceRecord | undefined> {
     const record = this.records.get(ownerUserId);
     // 返回副本：仓储不得把内部可变引用交给调用方
     return record ? { ...record } : undefined;

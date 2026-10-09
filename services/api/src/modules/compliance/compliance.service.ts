@@ -71,12 +71,16 @@ export class ComplianceService {
    *
    * `query` / `body` 只是「需要被 fail-closed 拒绝的不应存在之物」：本端点不声明任何输入，
    * 因此它们作为显式参数传入（服务是单例，绝不保存任何请求级状态），且**在授权之后**才检查。
+   *
+   * 异步化不改变判定顺序：`assertAuthorized` 与两个输入闭集断言都是**同步**的，因此在
+   * 第一个 `await`（唯一一次端口取数）之前就已经完成。未授权 / 非法输入的请求
+   * **一次都不会触达仓储**，也不会建立任何数据库连接（数据库路径是延迟建连的）。
    */
-  getMyComplianceStatus(
+  async getMyComplianceStatus(
     subject: AuthorizationSubject,
     query: unknown,
     body: unknown,
-  ): ComplianceStatusView {
+  ): Promise<ComplianceStatusView> {
     // 1. 授权先于输入校验、先于任何端口读取（权限点/范围是服务端常量，归属取会话主体）
     this.authorizeSelf(subject, COMPLIANCE_STATUS_PERMISSION);
 
@@ -86,8 +90,9 @@ export class ComplianceService {
     // 3. 请求体闭集：GET 读取接口不接受任何请求体字段
     assertDeclaredComplianceBodyFields(body);
 
-    // 4. 只按服务端主体取数；随后复核读取契约、归属与出口白名单（fail-closed）
-    return this.toOwnedView(this.repository.findByUserId(subject.userId), subject.userId);
+    // 4. 只按服务端主体取数（这是本方法唯一的 await：内存基线与数据库实现同语义）；
+    //    随后复核读取契约、归属与出口白名单（fail-closed）
+    return this.toOwnedView(await this.repository.findByUserId(subject.userId), subject.userId);
   }
 
   /** 单次判定：权限点为服务端常量，范围恒为 `SELF`，资源归属恒为会话主体 */
