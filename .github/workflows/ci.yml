@@ -1,0 +1,58 @@
+name: CI
+
+# 说明：本工作流只做校验（lint / 类型检查 / 构建 / 测试 / 骨架自检），
+# 不包含部署、不推送镜像、不提交仓库。
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 pnpm（版本取 package.json 的 packageManager）
+        uses: pnpm/action-setup@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 行尾守卫（Prettier 依赖 LF 检出）
+        # 说明：.prettierrc.json 设置了 endOfLine: "lf"。若检出被转成 CRLF
+        # （例如 core.autocrlf=true 且 .gitattributes 未生效），format:check 会把
+        # 全部受检文件报为不合规（实测 360 个），掩盖真实问题；此处显式失败。
+        run: |
+          bad=$(git ls-files --eol | awk '$1=="i/crlf"||$1=="i/mixed"||$2=="w/crlf"||$2=="w/mixed"' | wc -l)
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::检出行尾不是 LF（$bad 个文件），请确认 .gitattributes 已生效"
+            git ls-files --eol | awk '$1=="i/crlf"||$1=="i/mixed"||$2=="w/crlf"||$2=="w/mixed"' | head -5
+            exit 1
+          fi
+          echo "行尾检查通过：index 与工作区文本文件均为 LF"
+
+      - name: 工程骨架自检
+        run: pnpm verify
+
+      - name: 代码规范
+        run: pnpm lint && pnpm format:check
+
+      - name: 类型检查
+        run: pnpm typecheck
+
+      - name: 构建
+        run: pnpm build
+
+      - name: 测试
+        run: pnpm test
+
+      - name: 依赖漏洞扫描
+        run: pnpm audit --audit-level high
