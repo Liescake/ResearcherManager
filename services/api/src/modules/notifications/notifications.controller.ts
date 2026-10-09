@@ -52,26 +52,28 @@ export class NotificationsController {
   ) {}
 
   @Get()
-  listMyNotifications(
+  async listMyNotifications(
     @Headers('authorization') authorization: string | undefined,
     @Query() query: unknown,
-  ): NotificationView[] {
-    return this.notifications.listMyNotifications(
-      requireSubject(this.sessions, authorization),
+  ): Promise<NotificationView[]> {
+    // 认证先于业务：`await requireSubject` 解析完成之后才会碰仓储（无有效会话即 401，
+    // 且此时 service 与仓储一次都没有被调用）
+    return await this.notifications.listMyNotifications(
+      await requireSubject(this.sessions, authorization),
       query,
     );
   }
 
   @Patch(':notificationId/read')
   @HttpCode(HttpStatus.OK)
-  markMyNotificationRead(
+  async markMyNotificationRead(
     @Headers('authorization') authorization: string | undefined,
     @Param('notificationId') notificationId: string,
     @Body() body: unknown,
     @Query() query: unknown,
-  ): NotificationView {
-    return this.notifications.markMyNotificationRead(
-      requireSubject(this.sessions, authorization),
+  ): Promise<NotificationView> {
+    return await this.notifications.markMyNotificationRead(
+      await requireSubject(this.sessions, authorization),
       notificationId,
       body,
       query,

@@ -20,7 +20,9 @@ import type {
  *   `status`/`readAt` 由 service 经纯函数状态机写入；
  * - **不做读取契约校验**：存储层损坏（未知枚举、PII 正文、`read` 缺 `readAt`）必须能被
  *   出口的 fail-closed 门禁看见，因此基线不代替出口做校验，也不静默修正非法记录；
- *   写入只保证「主键唯一」「只更新既有记录」两条存储自身的完整性约束。
+ *   写入只保证「主键唯一」「归属不可变」「只更新既有记录」三条存储自身的完整性约束。
+ * - **异步契约**：与 PostgreSQL 实现同语义（`Promise` 返回），因此「有没有数据库」是同一条
+ *   调用形状下的两种绑定，service / controller 不需要分支。
  */
 @Injectable()
 export class InMemoryNotificationRepository implements NotificationRepository {
@@ -40,7 +42,7 @@ export class InMemoryNotificationRepository implements NotificationRepository {
     }
   }
 
-  create(notification: Notification): Notification {
+  async create(notification: Notification): Promise<Notification> {
     if (this.notifications.has(notification.id)) {
       // 主键冲突属于服务端缺陷（ID 由服务端生成），不得静默覆盖
       throw new Error(`通知 ID 冲突: ${notification.id}`);
@@ -49,21 +51,31 @@ export class InMemoryNotificationRepository implements NotificationRepository {
     return { ...notification };
   }
 
-  findById(notificationId: string): Notification | undefined {
+  async findById(notificationId: string, ownerUserId: string): Promise<Notification | undefined> {
     const record = this.notifications.get(notificationId);
-    return record ? { ...record } : undefined;
+    // 归属同样下推：即使命中主键，非本人所有也一律按「不存在」返回（与数据库实现的
+    // `WHERE id = $1 AND user_id = $2` 同语义），不把归属隔离降级为「上层记得复核」。
+    if (!record || record.userId !== ownerUserId) {
+      return undefined;
+    }
+    return { ...record };
   }
 
-  listByUserId(userId: string): readonly Notification[] {
+  async listByUserId(userId: string): Promise<readonly Notification[]> {
     return [...this.notifications.values()]
       .filter((record) => record.userId === userId)
       .map((record) => ({ ...record }));
   }
 
-  save(notification: Notification): Notification {
-    if (!this.notifications.has(notification.id)) {
+  async save(notification: Notification): Promise<Notification> {
+    const existing = this.notifications.get(notification.id);
+    if (!existing) {
       // 只允许更新既有记录：插入必须走 create 路径，避免绕过创建路径造出记录
       throw new Error(`通知不存在，拒绝写入: ${notification.id}`);
+    }
+    if (existing.userId !== notification.userId) {
+      // 归属不可变：拿他人通知的 ID 改写他人数据在存储层被关闭（与数据库实现同语义）
+      throw new Error(`通知归属不符，拒绝写入: ${notification.id}`);
     }
     this.notifications.set(notification.id, { ...notification });
     return { ...notification };

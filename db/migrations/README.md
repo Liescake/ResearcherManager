@@ -16,7 +16,8 @@ db/migrations/
 ├─ 0006_sessions.sql           服务端会话表（会话存储切片）
 ├─ 0007_student_profiles.sql   学生画像表（PostgreSQL 画像仓储切片）
 ├─ 0008_achievements_constraints.sql  成果表存储层约束补齐（PostgreSQL 成果仓储切片）
-└─ 0009_audit_logs.sql         不可变业务审计表（PostgreSQL 审计仓储切片 · 存储层仅追加）
+├─ 0009_audit_logs.sql         不可变业务审计表（PostgreSQL 审计仓储切片 · 存储层仅追加）
+└─ 0010_notifications.sql       站内通知表（PostgreSQL 通知仓储切片 · 归属隔离 + read 状态机）
 ```
 
 `0002`–`0005` 是第一个真实业务持久化切片（本人统计聚合读）所需的四张来源表：每张表都带
@@ -41,6 +42,15 @@ db/migrations/
 因此「审计不可删除」不再只依赖 adapter 缺方法。表里刻意**不**建高敏内容与快照列
 （`payload` / `before` / `after` / `reason`）、请求与网络元数据（明文 IP / 请求头 / 路径 / URL）
 以及链式完整性字段：它们属于后续切片，adapter 的列清单里也没有它们，建了只会得到没有写入方的空列。
+
+`0010` 建**站内通知表**：列清单与 `notifications.postgres-repository.ts` 的
+`POSTGRES_NOTIFICATION_COLUMNS` 一一对应（9 列），并按 adapter 契约蕴含的规则补上 CHECK
+（类型 / 状态闭集、标题与正文长度上界、存储 ID 域，以及「`read` 必带 `read_at`、`unread` 不得
+携带」这条跨字段不变式 —— 它正是 `markNotificationRead` 状态机在存储层的镜像，因此
+「已读时间不被重复请求改写」不只依赖 service 的幂等分支）。取数索引
+`(user_id, created_at, id)` 覆盖本人列表的「过滤 + 全序排序」。刻意**不**建订阅消息外发列
+（收件标识 / 模板 / 重试次数）与跳转 / 附件 / 软删除 / 幂等键列：它们属于后续切片，adapter 的列
+清单里也没有它们（内部列已单独登记为「不进 SELECT / RETURNING」）。
 
 ## 命名与顺序
 

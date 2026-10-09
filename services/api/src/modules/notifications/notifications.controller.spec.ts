@@ -2,7 +2,7 @@ import 'reflect-metadata';
 import { randomUUID } from 'node:crypto';
 import { request } from 'node:http';
 import { Module, Logger } from '@nestjs/common';
-import type { INestApplication } from '@nestjs/common';
+import type { FactoryProvider, INestApplication } from '@nestjs/common';
 import { APP_FILTER, APP_INTERCEPTOR, NestFactory } from '@nestjs/core';
 import { DataScope, PermissionPoint, Role } from '@rm/shared';
 import type { ApiEnvelope } from '@rm/shared';
@@ -11,11 +11,13 @@ import { ZodError } from 'zod';
 import { AppModule } from '../../app.module';
 import { ApiExceptionFilter } from '../../common/api-exception.filter';
 import { ApiResponseInterceptor } from '../../common/api-response.interceptor';
-import { ConfigModule } from '../../config/config.module';
+import { APP_ENV, ConfigModule } from '../../config/config.module';
 import { loadEnv } from '../../config/env';
+import { SQL_CONNECTION_FACTORY } from '../../db/ports/sql-executor.port';
 import { AccessControlModule } from '../access-control/access-control.module';
 import { AuthModule } from '../auth/auth.module';
 import { InMemorySessionStore } from '../auth/session-store.in-memory';
+import { SESSION_STORE } from '../auth/session-subject.port';
 import { RUOYI_AUTHZ_ADAPTER } from '../ruoyi-adapter/ruoyi-adapter.port';
 import type { RuoYiAuthzAdapter } from '../ruoyi-adapter/ruoyi-adapter.port';
 import {
@@ -173,7 +175,7 @@ async function startNotificationsApp(options: { readonly seed?: boolean } = {}):
   await app.listen(0, '127.0.0.1');
   startedApps.push(app);
 
-  const store = app.get(InMemorySessionStore);
+  const store = app.get<InMemorySessionStore>(SESSION_STORE);
   store.seed({
     sessionId: SESSION_STUDENT_1,
     subject: { userId: STUDENT_1, roles: [Role.Student] },
@@ -194,12 +196,14 @@ async function startNotificationsApp(options: { readonly seed?: boolean } = {}):
     subject: { userId: 'u-unknown-1', roles: ['guest' as Role] },
   });
 
-  const repository = app.get(InMemoryNotificationRepository);
+  // 唯一取用点是端口令牌：内存基线不再是独立 provider（否则会出现「容器实例」与
+  // 「端口实例」两份状态，测试往其中一个写、service 却读另一个）
+  const repository = app.get<InMemoryNotificationRepository>(NOTIFICATION_REPOSITORY);
   const seeded = buildSeededNotifications();
   if (options.seed !== false) {
-    repository.create(seeded.ownUnread);
-    repository.create(seeded.ownRead);
-    repository.create(seeded.otherUnread);
+    await repository.create(seeded.ownUnread);
+    await repository.create(seeded.ownRead);
+    await repository.create(seeded.otherUnread);
   }
 
   return { app, baseUrl: `${await app.getUrl()}/api/v1`, store, repository, seeded };
@@ -397,7 +401,7 @@ describe('站内通知：成功路径（真实 HTTP + 统一响应信封）', ()
     expect(view.updatedAt).not.toBe(seeded.ownUnread.updatedAt);
 
     // 归属仍然只来自服务端会话，且没有出现在响应里
-    const stored = repository.findById(seeded.ownUnread.id);
+    const stored = await repository.findById(seeded.ownUnread.id, STUDENT_1);
     expect(stored?.userId).toBe(STUDENT_1);
     expect(stored?.status).toBe(NotificationStatus.Read);
     expect(stored?.readAt).toBe(view.readAt);
@@ -536,7 +540,9 @@ describe('站内通知：认证边界 401（fail-closed）', () => {
     expect(findById).not.toHaveBeenCalled();
     expect(save).not.toHaveBeenCalled();
     // 未认证不产生任何状态变化
-    expect(repository.findById(seeded.ownUnread.id)?.status).toBe(NotificationStatus.Unread);
+    expect((await repository.findById(seeded.ownUnread.id, STUDENT_1))?.status).toBe(
+      NotificationStatus.Unread,
+    );
   });
 
   it('未认证时即便带了查询串/请求体也是 401（认证先于一切输入）', async () => {
@@ -596,7 +602,9 @@ describe('站内通知：越权 403（AuthorizationGuard + 服务端资源判定
     expect(res.body.error?.code).toBe('FORBIDDEN');
     expect(findById).not.toHaveBeenCalled();
     expect(save).not.toHaveBeenCalled();
-    expect(repository.findById(seeded.otherUnread.id)?.status).toBe(NotificationStatus.Unread);
+    expect((await repository.findById(seeded.otherUnread.id, STUDENT_2))?.status).toBe(
+      NotificationStatus.Unread,
+    );
   });
 });
 
@@ -667,7 +675,9 @@ describe('站内通知：输入拒绝 400（VALIDATION_FAILED，不取数/不落
     expect(res.status).toBe(400);
     expect(res.body.error?.code).toBe('VALIDATION_FAILED');
     expect(findById).not.toHaveBeenCalled();
-    expect(repository.findById(seeded.ownUnread.id)?.status).toBe(NotificationStatus.Unread);
+    expect((await repository.findById(seeded.ownUnread.id, STUDENT_1))?.status).toBe(
+      NotificationStatus.Unread,
+    );
   });
 
   const injectedBodyFields: ReadonlyArray<{ readonly name: string; readonly body: unknown }> = [
@@ -698,7 +708,9 @@ describe('站内通知：输入拒绝 400（VALIDATION_FAILED，不取数/不落
       expect(res.body.error?.code).toBe('VALIDATION_FAILED');
       expect(issuesOf(res.body).length).toBeGreaterThan(0);
       expect(findById).not.toHaveBeenCalled();
-      expect(repository.findById(seeded.ownUnread.id)?.status).toBe(NotificationStatus.Unread);
+      expect((await repository.findById(seeded.ownUnread.id, STUDENT_1))?.status).toBe(
+        NotificationStatus.Unread,
+      );
     },
   );
 
@@ -815,7 +827,9 @@ describe('站内通知：越权与不存在统一安全边界（404，逐字段�
     ]) {
       expect(content).not.toContain(leaked);
     }
-    expect(repository.findById(seeded.otherUnread.id)?.status).toBe(NotificationStatus.Unread);
+    expect((await repository.findById(seeded.otherUnread.id, STUDENT_2))?.status).toBe(
+      NotificationStatus.Unread,
+    );
   });
 
   it('他人的通知：另一个学生同样得到同一个 404（不会变成成功）', async () => {
@@ -827,7 +841,9 @@ describe('站内通知：越权与不存在统一安全边界（404，逐字段�
 
     expect(res.status).toBe(404);
     expect(res.body.error?.code).toBe('NOT_FOUND');
-    expect(repository.findById(seeded.ownUnread.id)?.status).toBe(NotificationStatus.Unread);
+    expect((await repository.findById(seeded.ownUnread.id, STUDENT_1))?.status).toBe(
+      NotificationStatus.Unread,
+    );
   });
 
   it('不可见路径只做一次授权（不按存储归属给出第二个结论），也不触发写入', async () => {
@@ -857,7 +873,7 @@ describe('站内通知：越权与不存在统一安全边界（404，逐字段�
   it('仓储返回归属不可读的记录：并入统一 404（不因存储损坏泄露存在性）', async () => {
     const { baseUrl, repository, seeded } = await startNotificationsApp();
     const broken = fixtureNotification({ id: seeded.ownUnread.id });
-    vi.spyOn(repository, 'findById').mockReturnValue({
+    vi.spyOn(repository, 'findById').mockResolvedValue({
       ...broken,
       userId: 42 as unknown as string,
     });
@@ -873,7 +889,7 @@ describe('站内通知：越权与不存在统一安全边界（404，逐字段�
 
   it('仓储把他人记录当作本人记录返回（单条）：同样统一 404，不是 500、不外发内容', async () => {
     const { baseUrl, repository, seeded } = await startNotificationsApp();
-    vi.spyOn(repository, 'findById').mockReturnValue(seeded.otherUnread);
+    vi.spyOn(repository, 'findById').mockResolvedValue(seeded.otherUnread);
 
     const res = await call(baseUrl, 'PATCH', `/me/notifications/${seeded.otherUnread.id}/read`, {
       headers: bearer(SESSION_STUDENT_1),
@@ -941,7 +957,9 @@ describe('站内通知：claims 伪造（客户端声明不进入判定）', () 
 
     expect(res.status).toBe(404);
     expect(res.body.error?.message).toBe('目标通知不存在或不可见');
-    expect(repository.findById(seeded.otherUnread.id)?.status).toBe(NotificationStatus.Unread);
+    expect((await repository.findById(seeded.otherUnread.id, STUDENT_2))?.status).toBe(
+      NotificationStatus.Unread,
+    );
   });
 
   it('伪造自定义头也不能让本人标记已读失败（声明不影响本人自身能力）', async () => {
@@ -952,8 +970,10 @@ describe('站内通知：claims 伪造（客户端声明不进入判定）', () 
     });
 
     expect(res.status).toBe(200);
-    expect(repository.findById(seeded.ownUnread.id)?.status).toBe(NotificationStatus.Read);
-    expect(repository.findById(seeded.ownUnread.id)?.userId).toBe(STUDENT_1);
+    expect((await repository.findById(seeded.ownUnread.id, STUDENT_1))?.status).toBe(
+      NotificationStatus.Read,
+    );
+    expect((await repository.findById(seeded.ownUnread.id, STUDENT_1))?.userId).toBe(STUDENT_1);
   });
 });
 
@@ -961,7 +981,7 @@ describe('站内通知：PII 与 fail-closed 500', () => {
   it('本人记录含身份证号：整条 fail-closed 500，响应与日志都不含取值', async () => {
     const errorLog = vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository, seeded } = await startNotificationsApp();
-    repository.create(
+    await repository.create(
       fixtureNotification({
         id: '44444444-4444-4444-8444-444444444444',
         title: '身份核验通知',
@@ -992,7 +1012,7 @@ describe('站内通知：PII 与 fail-closed 500', () => {
   it('本人记录含疑似密钥：标记已读同样 fail-closed 500，且不写入状态', async () => {
     const errorLog = vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startNotificationsApp();
-    const poisoned = repository.create(
+    const poisoned = await repository.create(
       fixtureNotification({
         id: '55555555-5555-4555-8555-555555555555',
         title: '系统凭据提醒',
@@ -1009,7 +1029,9 @@ describe('站内通知：PII 与 fail-closed 500', () => {
     expect(contentText(res)).not.toContain(PII_SECRET);
     expect(contentText(res)).not.toContain('系统凭据提醒');
     // 记录没有被当作已读写入
-    expect(repository.findById(poisoned.id)?.status).toBe(NotificationStatus.Unread);
+    expect((await repository.findById(poisoned.id, STUDENT_1))?.status).toBe(
+      NotificationStatus.Unread,
+    );
     const logs = errorLog.mock.calls.flat().join(' ');
     expect(logs).not.toContain(PII_SECRET);
   });
@@ -1027,7 +1049,7 @@ describe('站内通知：PII 与 fail-closed 500', () => {
 
     for (const broken of brokenRecords) {
       const { baseUrl, repository } = await startNotificationsApp({ seed: false });
-      repository.create(broken);
+      await repository.create(broken);
 
       const list = await call(baseUrl, 'GET', '/me/notifications', {
         headers: bearer(SESSION_STUDENT_1),
@@ -1047,7 +1069,7 @@ describe('站内通知：PII 与 fail-closed 500', () => {
   it('仓储返回对象/数组等非记录形态：500，响应不含返回值', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startNotificationsApp();
-    vi.spyOn(repository, 'listByUserId').mockReturnValue([
+    vi.spyOn(repository, 'listByUserId').mockResolvedValue([
       {
         id: 'u-victim-9',
         name: '张三',
@@ -1071,7 +1093,7 @@ describe('站内通知：PII 与 fail-closed 500', () => {
   it('列表返回归属不一致的记录（仓储未按主体过滤）→ 500，不把他人记录发给调用方', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository, seeded } = await startNotificationsApp();
-    vi.spyOn(repository, 'listByUserId').mockReturnValue([seeded.otherUnread]);
+    vi.spyOn(repository, 'listByUserId').mockResolvedValue([seeded.otherUnread]);
 
     const res = await call(baseUrl, 'GET', '/me/notifications', {
       headers: bearer(SESSION_STUDENT_1),
@@ -1088,9 +1110,9 @@ describe('站内通知：存储异常（仓端口抛错 → 500，不泄露内�
   it('列表取数抛异常（含敏感原文）→ 500，响应不含错误名、堆栈与原文', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startNotificationsApp();
-    vi.spyOn(repository, 'listByUserId').mockImplementation(() => {
-      throw new Error(`connection refused: userId=${STUDENT_1} phone=${OTHER_PHONE}`);
-    });
+    vi.spyOn(repository, 'listByUserId').mockRejectedValue(
+      new Error(`connection refused: userId=${STUDENT_1} phone=${OTHER_PHONE}`),
+    );
 
     const res = await call(baseUrl, 'GET', '/me/notifications', {
       headers: bearer(SESSION_STUDENT_1),
@@ -1110,9 +1132,9 @@ describe('站内通知：存储异常（仓端口抛错 → 500，不泄露内�
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository, seeded } = await startNotificationsApp();
     const save = vi.spyOn(repository, 'save');
-    const findById = vi.spyOn(repository, 'findById').mockImplementation(() => {
-      throw new Error(`redis timeout: notificationId=${seeded.ownUnread.id}`);
-    });
+    const findById = vi
+      .spyOn(repository, 'findById')
+      .mockRejectedValue(new Error(`redis timeout: notificationId=${seeded.ownUnread.id}`));
 
     const res = await call(baseUrl, 'PATCH', `/me/notifications/${seeded.ownUnread.id}/read`, {
       headers: bearer(SESSION_STUDENT_1),
@@ -1127,9 +1149,9 @@ describe('站内通知：存储异常（仓端口抛错 → 500，不泄露内�
   it('写回抛异常 → 500，状态变化不成立（记录保持未读、无 readAt）', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository, seeded } = await startNotificationsApp();
-    vi.spyOn(repository, 'save').mockImplementation(() => {
-      throw new Error(`write failed: userId=${STUDENT_1} phone=${OTHER_PHONE}`);
-    });
+    vi.spyOn(repository, 'save').mockRejectedValue(
+      new Error(`write failed: userId=${STUDENT_1} phone=${OTHER_PHONE}`),
+    );
 
     const res = await call(baseUrl, 'PATCH', `/me/notifications/${seeded.ownUnread.id}/read`, {
       headers: bearer(SESSION_STUDENT_1),
@@ -1137,7 +1159,7 @@ describe('站内通知：存储异常（仓端口抛错 → 500，不泄露内�
 
     expect(res.status).toBe(500);
     expect(res.body.error?.code).toBe('INTERNAL_ERROR');
-    const stored = repository.findById(seeded.ownUnread.id);
+    const stored = await repository.findById(seeded.ownUnread.id, STUDENT_1);
     expect(stored?.status).toBe(NotificationStatus.Unread);
     expect(stored).not.toHaveProperty('readAt');
     expect(contentText(res)).not.toContain(OTHER_PHONE);
@@ -1146,7 +1168,7 @@ describe('站内通知：存储异常（仓端口抛错 → 500，不泄露内�
   it('写回返回被替换的记录（归属变成他人）→ 500，不把替换结果交出去', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository, seeded } = await startNotificationsApp();
-    vi.spyOn(repository, 'save').mockReturnValue(seeded.otherUnread);
+    vi.spyOn(repository, 'save').mockResolvedValue(seeded.otherUnread);
 
     const res = await call(baseUrl, 'PATCH', `/me/notifications/${seeded.ownUnread.id}/read`, {
       headers: bearer(SESSION_STUDENT_1),
@@ -1159,7 +1181,7 @@ describe('站内通知：存储异常（仓端口抛错 → 500，不泄露内�
 });
 
 describe('站内通知：装配边界与纯函数门禁', () => {
-  it('NotificationsModule 只注册本切片的路由/服务，并把仓储令牌显式绑到内存基线', () => {
+  it('NotificationsModule 只注册本切片的路由/服务，并把仓储令牌绑到「按是否配置数据库分流」的工厂', () => {
     const providers = (Reflect.getMetadata('providers', NotificationsModule) ?? []) as unknown[];
     const controllers = (Reflect.getMetadata('controllers', NotificationsModule) ??
       []) as unknown[];
@@ -1167,18 +1189,29 @@ describe('站内通知：装配边界与纯函数门禁', () => {
 
     expect(controllers).toEqual([NotificationsController]);
     expect(providers).toContain(NotificationsService);
-    expect(providers).toContain(InMemoryNotificationRepository);
-    // 换绑持久化实现时只改这一处
-    expect(providers).toContainEqual({
+    // 内存基线**不再是独立 provider**：它是实现，不是绑定（否则会有两份状态）
+    expect(providers).not.toContain(InMemoryNotificationRepository);
+    expect(providers).not.toContainEqual({
       provide: NOTIFICATION_REPOSITORY,
       useExisting: InMemoryNotificationRepository,
     });
+    // 换绑只发生在这一个 provider 的工厂里
+    const binding = providers.find(
+      (provider): provider is FactoryProvider =>
+        typeof provider === 'object' &&
+        provider !== null &&
+        (provider as { provide?: unknown }).provide === NOTIFICATION_REPOSITORY,
+    );
+    expect(binding).toBeDefined();
+    expect(typeof binding?.useFactory).toBe('function');
+    // 可选注入执行器工厂：测试装配无需数据库模块
+    expect(binding?.inject).toEqual([APP_ENV, { token: SQL_CONNECTION_FACTORY, optional: true }]);
     // 依赖方向：认证（auth）与授权（access-control）各自只经端口/服务暴露
     expect(imports).toContain(AuthModule);
     expect(imports).toContain(AccessControlModule);
   });
 
-  it('内存基线如实声明非持久化/不可用于生产，并在生产环境拒绝构造', () => {
+  it('内存基线如实声明非持久化/不可用于生产，并在生产环境拒绝构造', async () => {
     const developmentEnv = loadEnv({});
     const productionEnv = loadEnv({ NODE_ENV: 'production' });
 
@@ -1188,30 +1221,36 @@ describe('站内通知：装配边界与纯函数门禁', () => {
       persistent: false,
       productionReady: false,
     });
-    expect(repository.listByUserId('u-nobody')).toEqual([]);
+    await expect(repository.listByUserId('u-nobody')).resolves.toEqual([]);
     // 不用内存冒充生产存储：生产环境直接拒绝构造
     expect(() => new InMemoryNotificationRepository(productionEnv)).toThrow(
       /生产环境禁止使用内存通知仓储/u,
     );
   });
 
-  it('内存基线只做存储自身的完整性约束：主键唯一、只更新既有记录、不按主体以外的维度取数', () => {
+  it('内存基线只做存储自身的完整性约束：主键唯一、归属不可变、只更新既有记录', async () => {
     const repository = new InMemoryNotificationRepository(loadEnv({}));
     const record = fixtureNotification();
-    repository.create(record);
-    repository.create(fixtureNotification({ userId: STUDENT_2 }));
+    await repository.create(record);
+    await repository.create(fixtureNotification({ userId: STUDENT_2 }));
 
-    expect(() => repository.create(record)).toThrow(/通知 ID 冲突/u);
-    expect(() =>
+    await expect(repository.create(record)).rejects.toThrow(/通知 ID 冲突/u);
+    await expect(
       repository.save(fixtureNotification({ id: '66666666-6666-4666-8666-666666666666' })),
-    ).toThrow(/通知不存在/u);
+    ).rejects.toThrow(/通知不存在/u);
+    // 归属不可变：拿他人通知的 ID 改写他人数据在存储层被关闭（与数据库实现同语义）
+    await expect(
+      repository.save(fixtureNotification({ id: record.id, userId: STUDENT_2 })),
+    ).rejects.toThrow(/通知归属不符/u);
 
     // 返回副本：调用方改不动存储内部引用
-    const found = repository.findById(record.id);
+    const found = await repository.findById(record.id, STUDENT_1);
     expect(found?.title).toBe(record.title);
-    expect(repository.listByUserId(STUDENT_1)).toHaveLength(1);
-    expect(repository.listByUserId(STUDENT_2)).toHaveLength(1);
-    expect(repository.listByUserId('u-nobody')).toEqual([]);
+    // 归属下推进取数：非本人主体取不到本人的记录
+    await expect(repository.findById(record.id, STUDENT_2)).resolves.toBeUndefined();
+    await expect(repository.listByUserId(STUDENT_1)).resolves.toHaveLength(1);
+    await expect(repository.listByUserId(STUDENT_2)).resolves.toHaveLength(1);
+    await expect(repository.listByUserId('u-nobody')).resolves.toEqual([]);
   });
 
   it('输出白名单是真正的闭集：多出字段即违规（门禁非恒真）', () => {
@@ -1355,6 +1394,7 @@ describe('站内通知：装配边界与纯函数门禁', () => {
       'apiPort',
       'apiPrefix',
       'databaseConfigured',
+      'dependencyGate',
       'nodeEnv',
     ]);
 

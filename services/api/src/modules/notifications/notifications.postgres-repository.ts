@@ -14,30 +14,32 @@ import {
   NOTIFICATION_TYPE_VALUES,
   NotificationStatus,
   NotificationType,
-  type AsyncNotificationRepository,
   type Notification,
+  type NotificationRepository,
   type NotificationRepositoryCapabilities,
 } from './notifications.port';
 
 /**
- * 站内通知的 **PostgreSQL 仓储 adapter（未接入运行时）**。
+ * 站内通知的 **PostgreSQL 仓储 adapter**。
  *
- * ## 交付边界（本切片刻意不做的事）
- * - **不绑定**到 `NotificationsModule`：模块仍然只绑定内存基线 `InMemoryNotificationRepository`
- *   （provider 列表与 DI 令牌一字未改），运行时行为与本切片之前逐字节一致（有回归断言）；
+ * ## 装配方式（本切片的换绑点）
+ * - **装配由业务模块的工厂决定**：`NotificationsModule` 经 `createNotificationRepository` 按
+ *   「是否解析出 `DATABASE_URL`」分流——未配置时绑定 `InMemoryNotificationRepository`，
+ *   配置时绑定本文件经 `createLazyPostgresNotificationRepository` 构造的**延迟建连**实现
+ *   （表由迁移 `0010` 建立）。装配阶段一次都不碰数据库，因此「数据库已配置但依赖不就绪」
+ *   由启动期门禁给出结构化违规，而不是在这里表现为一个数据库连接错误；
  * - **不引入** `pg` / Prisma / TypeORM 等驱动或 ORM 依赖：本文件只依赖驱动无关的
  *   `SqlExecutor` 端口（`db/ports/sql-executor.port.ts`），真实执行器由消费方在「启用数据库」
  *   那一步显式提供；
  * - **不声称生产可用**：能力声明固定为 `backend = postgres`、`persistent = true`、
- *   `productionReady = false`。在引入经评估的驱动、完成对真实 PostgreSQL 的集成验证、并把
- *   `notifications` 从字段字典落成 schema 草案 → 迁移之前，生产启动会被 `PersistenceBoundaryService`
- *   拒绝（`productionReady !== true` 即违规）。
+ *   `productionReady = false`。在完成会话主体 UUID 收敛、`TRANSITION_REJECTED` 的 409 映射
+ *   与依赖就绪登记（封存声明 + 集成测试证据）之前，`NODE_ENV=production`（或已配置数据库）
+ *   的启动仍会被启动期门禁拒绝（`productionReady !== true` / `DEPENDENCY_NOT_VERIFIED`）。
  *
- * ## 为什么先有异步契约
- * 现有 `NotificationRepository`（`notifications.port.ts`）是同步接口；把运行时端口改成 Promise 是
- * 跨模块契约变更（service / controller / 既有 spec 必须一起改），必须与真实驱动引入在同一片切片
- * 完成。因此本文件实现 `AsyncNotificationRepository`（Promise 版，语义与内存基线完全一致），
- * 让「SQL 与映射是否正确」可以在**没有驱动、也没有数据库**的情况下被离线验证。
+ * ## 为什么端口是异步的
+ * 运行时端口 `NotificationRepository` 已是 Promise 语义（`notifications.port.ts`），service /
+ * controller 与内存基线在同一片切片一起改成异步，因此不存在「同步绑定 + 异步实现混用」。
+ * `AsyncNotificationRepository` 保留为**等价别名**（历史名称）。
  *
  * ## 与内存基线的语义对应（逐条可核对）
  * | 内存基线 | 本 adapter |
@@ -83,10 +85,13 @@ import {
  *    错误消息**只带字段路径与违规类型**，避免把数据内容或注入载荷写进日志与错误响应。
  *
  * ## 尚未解决 / 已登记的前置（因此 productionReady 恒为 false）
- * `db/migrations/0001_bootstrap.sql` 的业务表占位清单里**没有** `notifications`
- * （清单里是 `announcements`），该表既没有 schema 草案也没有迁移；真实 PostgreSQL 的集成验证
- * （建表、`id` 主键冲突、`user_id` 索引、按归属取数与排序、并发重复标记已读）尚未进行；
- * `TRANSITION_REJECTED` 的对外映射（409 而不是 500）也尚未接入 service。这些都已登记在
+ * 已落地：官方 `pg` 驱动引入（只出现在 `db/postgres/` 驱动层）；`notifications` 由迁移 `0010`
+ * 建出（列清单与本文件 `POSTGRES_NOTIFICATION_COLUMNS` 双射）；端口改为异步；
+ * 真实 PostgreSQL 集成验证（建表、主键冲突、按归属取数与排序、条件写入与并发重复标记已读）
+ * 见 `db/postgres/__tests__/notifications-integration.spec.ts`（需 `TEST_DATABASE_URL`，未配置时明确 skip）。
+ * **仍未落地**：会话主体 `userId` 收敛为 UUID（当前基线是 `u-student-1`，绑定数据库实现时被
+ * `assertPostgresNotificationSubject` fail-closed 拒绝）；`TRANSITION_REJECTED` 的对外映射
+ * （409 而不是 500）；依赖就绪登记表里的封存声明与验证证据。这些都已登记在
  * `POSTGRES_NOTIFICATION_REPOSITORY_VERIFICATION_STEPS` 里，不能只写声明。
  */
 
@@ -230,24 +235,28 @@ export const POSTGRES_NOTIFICATION_REPOSITORY_CAPABILITIES: NotificationReposito
   });
 
 /**
- * 转成生产可用前必须完成的验证清单（每一项都需要证据，不能只写声明）：
- * 1. 驱动依赖经评估后引入（`docs/P2-开源复用评估.md` 的 Prisma / TypeORM 比较结论）；
+ * 转成生产可用前必须完成的验证清单（每一项都需要证据，不能只写声明）。
+ *
+ * 状态标注（本切片的进展；`productionReady` 仍为 false，因为**已落地不等于生产准入**）：
+ * 1. 驱动依赖经评估后引入（`docs/P2-开源复用评估.md` 的 Prisma / TypeORM 比较结论）——**已落地**：
+ *    官方 `pg` 已显式声明且只出现在 `db/postgres/` 驱动层；
  * 2. 对真实 PostgreSQL 的集成测试：建表迁移、`id` 主键冲突、按 `user_id` 取数与排序、
- *    **并发重复标记已读**（两个请求只有一个能命中条件写入）；
- * 3. `notifications` 的 schema 草案创建并按 `db/migrations/README.md` 转为迁移并执行验证
- *    （当前 `db/migrations/0001_bootstrap.sql` 的占位清单里登记的是 `announcements`，
- *    没有 `notifications`；内部列清单也要在这一步与字段字典一次性对齐）；
- * 4. `NotificationRepository` 端口改为异步：service / controller 与其测试一起改；
- * 5. 会话主体 `userId` 收敛为 UUID（当前基线是 `u-student-1` 这类安全 ID，不满足存储 ID 域）；
+ *    **并发重复标记已读**（两个请求只有一个能命中条件写入）——**已落地**：
+ *    `db/postgres/__tests__/notifications-integration.spec.ts`（需 `TEST_DATABASE_URL`，未配置时明确 skip）；
+ * 3. `notifications` 由迁移 `0010_notifications.sql` 建出并执行验证（列清单与 `POSTGRES_NOTIFICATION_COLUMNS`
+ *    双射；内部列清单与字段字典一次性对齐）——**已落地**；
+ * 4. `NotificationRepository` 端口改为异步：service / controller 与其测试一起改——**已落地**；
+ * 5. 会话主体 `userId` 收敛为 UUID（当前基线是 `u-student-1` 这类安全 ID，不满足存储 ID 域）
+ *    ——**未落地**：绑定数据库实现时非 UUID 主体被 `assertPostgresNotificationSubject` fail-closed 拒绝；
  * 6. 路径参数 `notificationId` 收敛为**规范小写形**：读取契约只要求「是 UUID」，客户端可提交
  *    大写 UUID，而本 adapter 对域外查询键按「不存在」处理（见 `findById`），未收敛时大写 UUID
- *    会被判 404 而不是 400；
+ *    会被判 404 而不是 400——**未落地**；
  * 7. 标记已读的**幂等**语义在存储层复核：重复请求在 service 侧由 `markNotificationRead`
  *    的 `changed = false` 分支短路，本 adapter 对「已读记录再写一次」按 `TRANSITION_REJECTED`
- *    处理（不产生写入、不改写 `readAt`），两条路径必须一起验证；
+ *    处理（不产生写入、不改写 `readAt`），两条路径必须一起验证——**已落地**（离线 + 真库）；
  * 8. `save` 的 `TRANSITION_REJECTED` 在 service 层映射为 409 `STATE_TRANSITION_INVALID`
- *    （并发重复标记已读是客户端可见冲突，不是服务端缺陷，不得直接冒泡为 500）；
- * 9. 完成 1–8 后，才允许把 `productionReady` 改为 true，并同步删除能力自检
+ *    （并发重复标记已读是客户端可见冲突，不是服务端缺陷，不得直接冒泡为 500）——**未落地**；
+ * 9. 完成 5–8 后，才允许把 `productionReady` 改为 true，并同步删除能力自检
  *    （`assertPostgresNotificationRepositoryCapabilities` 会拒绝「未验证就声称生产可用」）。
  */
 export const POSTGRES_NOTIFICATION_REPOSITORY_VERIFICATION_STEPS = [
@@ -925,7 +934,7 @@ function assertWriteRoundTrip(requested: Notification, stored: Notification): vo
  * 因此「执行器被换掉 / 被降级」或「能力声明被改写」都会 fail-closed，而不是静默继续。
  * 本类**不是** Nest provider（不带任何 Nest 装饰器），也未在任何模块中注册。
  */
-export class PostgresNotificationRepository implements AsyncNotificationRepository {
+export class PostgresNotificationRepository implements NotificationRepository {
   readonly capabilities: NotificationRepositoryCapabilities =
     POSTGRES_NOTIFICATION_REPOSITORY_CAPABILITIES;
 
@@ -1153,4 +1162,82 @@ export class PostgresNotificationRepository implements AsyncNotificationReposito
       ['status'],
     );
   }
+}
+
+/** DI 工厂：把驱动无关的 `SqlExecutor` 装成通知仓储端口实现（本切片的换绑点之一） */
+export function createPostgresNotificationRepository(
+  executor: SqlExecutor,
+): NotificationRepository {
+  return new PostgresNotificationRepository(executor);
+}
+
+/**
+ * 把「主体必须落在存储 ID 域内」变成可**先于建连**执行的断言（供分流点、service 与测试复用）。
+ *
+ * 为什么单独导出：延迟建连的实现必须在解析执行器**之前**判定主体，否则一个非 UUID 的会话主体
+ * （例如会话基线的 `u-student-1`）会先触发一次数据库连接、再在 adapter 里被拒绝 —— 那既浪费连接，
+ * 也让「主体域判定发生在任何连接之前」这条性质无法被测试固定。
+ * 错误信息不带主体取值（见 `requireSubject`）。
+ */
+export function assertPostgresNotificationSubject(ownerUserId: unknown): string {
+  return requireSubject(ownerUserId);
+}
+
+/**
+ * 延迟建连的通知仓储：**模块装配阶段不碰数据库**。
+ *
+ * 为什么必须延迟：`SQL_CONNECTION_FACTORY.connect()` 在数据库已配置但执行器未通过 attest 契约时
+ * 会抛错。如果在这里急切建连，启动失败会表现为「模块工厂抛了数据库错」，而不是启动期持久化边界
+ * 给出的**结构化违规**（`SQL_EXECUTOR_VERIFICATION_REQUIRED` / `DECLARATION_NOT_SEALED` 等）；
+ * 依赖就绪门禁也必须能在**任何连接之前**给出 `NOTIFICATION_REPOSITORY[DEPENDENCY_NOT_VERIFIED]`。
+ * 延迟后，判定顺序保持为「配置 → 持久化边界 / 依赖就绪 → 首次真正读库」。
+ *
+ * 连接只在首次读写时建立并被复用；建立失败不缓存失败结果（下一次调用会重试）。
+ * 主体域先判、再建连：非存储 ID 域（非 UUID）的主体不会触发任何数据库连接。
+ *
+ * 写路径（`create` / `save`）上主体域由本函数先判（`INVALID_SUBJECT`），adapter 内部对**待写记录**
+ * 还有第二道校验（字段闭集与记录形状 → `INVALID_RECORD`）。两者不冲突、也不重复：
+ * 前者回答「这个主体在存储里可能合法吗」，后者回答「这条记录本身合规吗」。
+ */
+export function createLazyPostgresNotificationRepository(
+  resolveExecutor: () => Promise<SqlExecutor>,
+  capabilities: NotificationRepositoryCapabilities = POSTGRES_NOTIFICATION_REPOSITORY_CAPABILITIES,
+): NotificationRepository {
+  assertPostgresNotificationRepositoryCapabilities(capabilities);
+
+  let pending: Promise<SqlExecutor> | undefined;
+  const executor = (): Promise<SqlExecutor> => {
+    if (pending === undefined) {
+      pending = resolveExecutor().catch((error: unknown) => {
+        pending = undefined;
+        throw error;
+      });
+    }
+    return pending;
+  };
+
+  return {
+    capabilities,
+    async create(notification: Notification): Promise<Notification> {
+      // 主体域先判、再建连：非存储 ID 域的写记录不应该触发任何数据库连接
+      assertPostgresNotificationSubject(notification.userId);
+      const resolved = await executor();
+      return new PostgresNotificationRepository(resolved).create(notification);
+    },
+    async findById(notificationId: string, ownerUserId: string): Promise<Notification | undefined> {
+      const ownerId = assertPostgresNotificationSubject(ownerUserId);
+      const resolved = await executor();
+      return new PostgresNotificationRepository(resolved).findById(notificationId, ownerId);
+    },
+    async listByUserId(userId: string): Promise<readonly Notification[]> {
+      const ownerId = assertPostgresNotificationSubject(userId);
+      const resolved = await executor();
+      return new PostgresNotificationRepository(resolved).listByUserId(ownerId);
+    },
+    async save(notification: Notification): Promise<Notification> {
+      assertPostgresNotificationSubject(notification.userId);
+      const resolved = await executor();
+      return new PostgresNotificationRepository(resolved).save(notification);
+    },
+  };
 }

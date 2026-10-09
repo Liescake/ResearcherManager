@@ -43,7 +43,10 @@ import {
   PostgresNotificationRepositoryError,
   assertNotificationViewExclusion,
   assertPostgresNotificationRepositoryCapabilities,
+  assertPostgresNotificationSubject,
   canAdvanceNotificationStatus,
+  createLazyPostgresNotificationRepository,
+  createPostgresNotificationRepository,
   findNotificationViewExclusionLeaks,
   notificationStatusPredecessors,
 } from './notifications.postgres-repository';
@@ -52,9 +55,9 @@ import {
  * 站内通知 PostgreSQL 仓储 adapter 的**离线**验收（不连数据库、不引驱动）。
  *
  * 覆盖用户要求的补充安全契约测试与交付边界：
- * - **能力与交付边界**：`persistent = true` / `productionReady = false`（未真实驱动验证前严禁
- *   生产）、列清单与读取契约字段双射、`notifications` 尚未转为迁移、adapter 未被装配到
- *   `NotificationsModule`、不引驱动/ORM、同步端口未被改成异步；
+ * - **能力与交付边界**：`persistent = true` / `productionReady = false`（未完成依赖就绪登记前严禁
+ *   生产）、列清单与读取契约字段双射、`notifications` 由迁移 `0010` 建出、adapter 经
+ *   `createNotificationRepository` 装配进 `NotificationsModule`、不引驱动/ORM、端口是异步契约；
  * - **参数化 SQL 与固定标识符**：客户端可控值只出现在参数里，SQL 文本只由模块常量构成
  *   （语句里没有任何引号 / 分号 / 注释符，因此不存在字面量注入面）；
  * - **SQL 注入**：标题、正文、主体、资源 ID 等所有入口的注入载荷要么只进参数、要么在进入 SQL
@@ -68,7 +71,8 @@ import {
  *   不可变列不得被改写；
  * - **公开视图不泄露归属与内部信息**：视图恰好是白名单闭集，不含 `userId`、内部 payload、
  *   路径、URL、storage handle 或 PII；所有失败路径的错误信息与 `issues` 只含字段路径与违规
- *   类型，不含任何取值。
+ *   类型，不含任何取值；
+ * - **延迟建连工厂**：主体域先判（非法主体不建连）、连接复用、失败不缓存。
  */
 
 /** 从当前工作目录向上寻找仓库根（含 pnpm-workspace.yaml） */
@@ -93,7 +97,6 @@ const ADAPTER_PATH = resolve(NOTIFICATIONS_DIR, 'notifications.postgres-reposito
 const PORT_PATH = resolve(NOTIFICATIONS_DIR, 'notifications.port.ts');
 const MODULE_PATH = resolve(NOTIFICATIONS_DIR, 'notifications.module.ts');
 const ADAPTER_CLASS = 'PostgresNotificationRepository';
-const ADAPTER_MODULE = 'notifications.postgres-repository';
 
 interface RecordedCall {
   readonly sql: string;
@@ -452,21 +455,40 @@ describe('PostgreSQL 通知仓储：能力声明与交付边界', () => {
     }
   });
 
-  it('表名是 notifications，且尚未登记在迁移与草案目录中（与 productionReady=false 配对）', () => {
+  it('表名是 notifications，且由迁移 0010 建出（列清单与 adapter 常量双射，草案目录仍不登记它）', () => {
     expect(POSTGRES_NOTIFICATION_TABLE).toBe('notifications');
     expect(/^[a-z][a-z0-9_]*$/u.test(POSTGRES_NOTIFICATION_TABLE)).toBe(true);
 
-    for (const file of readdirSync(join(REPO_ROOT, 'db', 'migrations'))) {
-      if (!file.endsWith('.sql')) continue;
-      const sql = readFileSync(join(REPO_ROOT, 'db', 'migrations', file), 'utf8');
-      expect(sql).not.toMatch(/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?notifications\b/iu);
+    // 表必须由**仓库真实迁移**建立，而不是只在 adapter 常量里声明
+    const migrationFiles = readdirSync(join(REPO_ROOT, 'db', 'migrations')).filter((file) =>
+      file.endsWith('.sql'),
+    );
+    const defining = migrationFiles.filter((file) =>
+      new RegExp(
+        `CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?${POSTGRES_NOTIFICATION_TABLE}\\b`,
+        'iu',
+      ).test(readFileSync(join(REPO_ROOT, 'db', 'migrations', file), 'utf8')),
+    );
+    expect(defining).toEqual(['0010_notifications.sql']);
+
+    // 迁移里的列清单与 adapter 常量逐列一致（双向：不多列、不少列）
+    const ddl = readFileSync(join(REPO_ROOT, 'db', 'migrations', '0010_notifications.sql'), 'utf8');
+    for (const column of POSTGRES_NOTIFICATION_COLUMNS) {
+      expect(ddl).toMatch(new RegExp(`^\\s{2}${column}\\s`, 'mu'));
     }
+    const declared = [...ddl.matchAll(/^\s{2}([a-z_]+)\s+\w/gmu)].map((match) => match[1]);
+    expect(declared.sort()).toEqual([...POSTGRES_NOTIFICATION_COLUMNS].sort());
+    // 「read 必带 read_at / unread 不得携带」在存储层也有镜像
+    expect(ddl).toContain('notifications_read_state_consistent');
+
+    // 草案目录仍不得登记它：草案是「未应用」，本表已有正式迁移
     for (const file of readdirSync(join(REPO_ROOT, 'db', 'schema-drafts'))) {
       if (!file.endsWith('.sql')) continue;
       const draft = readFileSync(join(REPO_ROOT, 'db', 'schema-drafts', file), 'utf8');
       expect(draft).not.toMatch(/^--\s*target-table:\s*notifications\s*$/imu);
     }
 
+    // 表已建出但生产可用性仍为 false：schema / 集成证据不等于依赖就绪登记
     expect(POSTGRES_NOTIFICATION_REPOSITORY_CAPABILITIES.productionReady).toBe(false);
     expect(POSTGRES_NOTIFICATION_REPOSITORY_VERIFICATION_STEPS).toContain(
       'notifications-schema-draft-created-and-promoted-to-migration',
@@ -531,15 +553,9 @@ describe('PostgreSQL 通知仓储：能力声明与交付边界', () => {
     expect(source).not.toContain("from '@nestjs/common'");
   });
 
-  it('异步契约与同步端口方法集对应，两处刻意签名差异都写在契约注释里', () => {
+  it('唯一端口契约是异步的：内存基线与 adapter 实现同一方法集（含归属下推的单条读取）', () => {
     const source = readFileSync(PORT_PATH, 'utf8');
     expect(source).toContain('export interface NotificationRepository {');
-    expect(source).toContain('create(notification: Notification): Notification;');
-    expect(source).toContain('findById(notificationId: string): Notification | undefined;');
-    expect(source).toContain('listByUserId(userId: string): readonly Notification[];');
-    expect(source).toContain('save(notification: Notification): Notification;');
-
-    expect(source).toContain('export interface AsyncNotificationRepository {');
     expect(source).toContain('create(notification: Notification): Promise<Notification>;');
     expect(source).toContain(
       'findById(notificationId: string, ownerUserId: string): Promise<Notification | undefined>;',
@@ -547,9 +563,12 @@ describe('PostgreSQL 通知仓储：能力声明与交付边界', () => {
     expect(source).toContain('listByUserId(userId: string): Promise<readonly Notification[]>;');
     expect(source).toContain('save(notification: Notification): Promise<Notification>;');
 
+    // 不再并存同步契约：`AsyncNotificationRepository` 是**等价别名**，不是第二份契约
+    expect(source).toContain('export type AsyncNotificationRepository = NotificationRepository;');
+    expect(source).not.toContain('export interface AsyncNotificationRepository {');
+
     // 两处签名差异必须被文档化（归属隔离强化，不是语义漂移）
-    expect(source).toContain('刻意的签名差异');
-    expect(source).toContain('归属必须**下推进 SQL**');
+    expect(source).toContain('归属下推进 SQL');
     expect(source).toContain('拿他人通知的 ID 改写他人数据');
   });
 
@@ -590,7 +609,7 @@ describe('PostgreSQL 通知仓储：能力声明与交付边界', () => {
     );
   });
 
-  it('工作区依赖里没有 pg / ORM 包', () => {
+  it('工作区依赖里没有未授权的 pg 族 / ORM 包（官方 pg 驱动已授权，仅限驱动层）', () => {
     for (const relative of [join('services', 'api', 'package.json'), 'package.json']) {
       const manifest = JSON.parse(readFileSync(join(REPO_ROOT, relative), 'utf8')) as {
         dependencies?: Record<string, string>;
@@ -602,7 +621,7 @@ describe('PostgreSQL 通知仓储：能力声明与交付边界', () => {
       ];
       for (const name of names) {
         expect(
-          /^(?:pg|pg-pool|pg-promise|postgres|prisma|@prisma\/client|typeorm|kysely|drizzle-orm|sequelize|@mikro-orm\/core)$/u.test(
+          /^(?:pg-pool|pg-native|pg-promise|postgres|slonik|prisma|@prisma\/client|typeorm|kysely|drizzle-orm|drizzle-kit|sequelize|@mikro-orm\/core)$/u.test(
             name,
           ),
         ).toBe(false);
@@ -892,25 +911,44 @@ describe('PostgreSQL 通知仓储：参数化 SQL 与固定标识符', () => {
   });
 
   it('行契约的枚举列不接受大小写漂移 / 未登记 / 注入式取值，且错误信息不回显取值', async () => {
-    for (const status of ['READ', 'Read', 'archived', INJECTION, '', 1]) {
+    // 域外**字符串**取值属于「非法枚举取值」，必须与「形状不对」可区分
+    for (const status of ['READ', 'Read', 'archived', INJECTION, '']) {
       const { repository } = repoWith({
         rows: [rowFromRecord(READ_NOTIFICATION, { status })],
         rowCount: 1,
       });
       const error = await captureRepoError(() => repository.listByUserId(OWNER_ID));
       expect(error.code).toBe('INVALID_ROW');
-      expectIssueOn(error, 'status');
+      expect(error.issues).toContain('status(invalid_enum_value)');
       expectNoValueLeak(error);
     }
-    for (const type of ['MEMBERSHIP_REVIEW', 'unknown', INJECTION, '', 1]) {
+    for (const type of ['MEMBERSHIP_REVIEW', 'unknown', INJECTION, '']) {
       const { repository } = repoWith({
         rows: [rowFromRecord(UNREAD_NOTIFICATION, { type })],
         rowCount: 1,
       });
       const error = await captureRepoError(() => repository.listByUserId(OWNER_ID));
       expect(error.code).toBe('INVALID_ROW');
-      expectIssueOn(error, 'type');
+      expect(error.issues).toContain('type(invalid_enum_value)');
       expectNoValueLeak(error);
+    }
+
+    // 非字符串是**形状**违规而非枚举域违规：仍指向同一列、不回显取值，但不冒充 invalid_enum_value
+    for (const [column, record] of [
+      ['status', READ_NOTIFICATION],
+      ['type', UNREAD_NOTIFICATION],
+    ] as const) {
+      for (const value of [1, true] as const) {
+        const { repository } = repoWith({
+          rows: [rowFromRecord(record, { [column]: value })],
+          rowCount: 1,
+        });
+        const error = await captureRepoError(() => repository.listByUserId(OWNER_ID));
+        expect(error.code).toBe('INVALID_ROW');
+        expectIssueOn(error, column);
+        expect(error.issues).not.toContain(`${column}(invalid_enum_value)`);
+        expectNoValueLeak(error);
+      }
     }
   });
 
@@ -1090,6 +1128,45 @@ describe('PostgreSQL 通知仓储：严格行契约与未知列', () => {
     }
   });
 
+  it('行 → 记录是逐字段显式映射：列未错位、未相邻互换（独立期望表逐一核对）', async () => {
+    // 每个列取互不相同的取值：任一列被错位映射（例如 title 与 body 互换）都会在这里失败
+    const record: Notification = {
+      id: HEX_NOTIFICATION_ID,
+      userId: HEX_OWNER_ID,
+      type: NotificationType.EducationReview,
+      title: '升学记录审核结果',
+      body: '你的升学记录已通过审核，请查看详情',
+      status: NotificationStatus.Read,
+      createdAt: CREATED_AT,
+      readAt: READ_AT,
+      updatedAt: SAVED_AT,
+    };
+    const { repository } = repoWith({ rows: [rowFromRecord(record)], rowCount: 1 });
+    const records = await repository.listByUserId(record.userId);
+    const mapped = records[0];
+    expect(mapped).toBeDefined();
+    if (mapped === undefined) return;
+
+    // 独立期望表（刻意不复用实现的列↔字段映射，否则「同一份错误」会同时骗过实现与断言）
+    const expected: Record<keyof Notification, unknown> = {
+      id: record.id,
+      userId: record.userId,
+      type: record.type,
+      title: record.title,
+      body: record.body,
+      status: record.status,
+      createdAt: record.createdAt,
+      readAt: record.readAt,
+      updatedAt: record.updatedAt,
+    };
+    for (const field of Object.keys(expected) as (keyof Notification)[]) {
+      expect(mapped[field]).toEqual(expected[field]);
+    }
+
+    // 反向：字段集恰好是领域字段（既不多出 snake_case 列名，也不吞掉可选字段）
+    expect(Object.keys(mapped).sort()).toEqual(Object.keys(expected).sort());
+  });
+
   it('控制字符由读取契约兜底拒绝（行契约只管形状与长度）', async () => {
     const { repository } = repoWith({
       rows: [rowFromRecord(UNREAD_NOTIFICATION, { body: 'bad\u0000body' })],
@@ -1232,6 +1309,34 @@ describe('PostgreSQL 通知仓储：read 状态机与幂等', () => {
     expect(unknownError.code).toBe('INVALID_ROW');
     expect(unknownError.issues).toContain('status(invalid_enum_value)');
     expectNoValueLeak(unknownError);
+  });
+
+  it('写回语句返回多行 → RESULT_SET_VIOLATION：主键唯一性被破坏时不得取任一行当成功', async () => {
+    const { repository, executor } = repoWith({
+      rows: [rowFromRecord(READ_NOTIFICATION), rowFromRecord(READ_NOTIFICATION)],
+      rowCount: 2,
+    });
+    const error = await captureRepoError(() => repository.save(READ_NOTIFICATION));
+
+    expect(error.code).toBe('RESULT_SET_VIOLATION');
+    expect(error.issues).toEqual(['id']);
+    expectNoValueLeak(error);
+    // 多行结果直接判违约：不做失败分类、也不回退成「取第一行」
+    expect(executor.calls).toHaveLength(1);
+    expect(executor.calls[0]?.sql).toContain('UPDATE');
+  });
+
+  it('单条读取返回多行 → RESULT_SET_VIOLATION（主键唯一性被破坏，不得静默取首行）', async () => {
+    const { repository, executor } = repoWith({
+      rows: [rowFromRecord(UNREAD_NOTIFICATION), rowFromRecord(UNREAD_NOTIFICATION)],
+      rowCount: 2,
+    });
+    const error = await captureRepoError(() => repository.findById(NOTIFICATION_ID, OWNER_ID));
+
+    expect(error.code).toBe('RESULT_SET_VIOLATION');
+    expect(error.issues).toEqual(['id']);
+    expectNoValueLeak(error);
+    expect(executor.calls).toHaveLength(1);
   });
 
   it('写记录里的未知状态在进入 SQL 之前就被闭集拦下（INVALID_RECORD，不写库）', async () => {
@@ -1614,38 +1719,70 @@ describe('PostgreSQL 通知仓储：公开视图与失败路径信息卫生', ()
   });
 });
 
-describe('PostgreSQL 通知仓储：未装配、无驱动依赖、与 schema 边界对齐', () => {
-  it('NotificationsModule 仍只绑定内存基线（本 adapter 未被装配）', () => {
+describe('PostgreSQL 通知仓储：绑定、装配、无驱动依赖与 schema 边界对齐', () => {
+  it('NotificationsModule 经 createNotificationRepository 绑定端口：只引用工厂导出，不引用 adapter 类名', () => {
     const content = readFileSync(MODULE_PATH, 'utf8');
 
-    expect(content).not.toContain(ADAPTER_CLASS);
-    expect(content).not.toContain(ADAPTER_MODULE);
+    // 装配必须经由「按是否配置数据库分流」的工厂：内存基线不再是独立 provider
     expect(content).toContain('InMemoryNotificationRepository');
-    expect(content).toContain(
-      '{ provide: NOTIFICATION_REPOSITORY, useExisting: InMemoryNotificationRepository }',
+    expect(content).toContain('createLazyPostgresNotificationRepository');
+    expect(content).toContain('export function createNotificationRepository');
+    expect(content).toContain('{ token: SQL_CONNECTION_FACTORY, optional: true }');
+    expect(content).not.toContain('useExisting');
+    // 绑定只经工厂导出名：类名与 adapter 模块名都不出现在 Module 里
+    // （adapter 不得自带依赖注入元数据，装配只允许发生在 Module 的工厂里）。
+    // 注意：工厂导出名 `createLazyPostgresNotificationRepository` **含类名子串**，因此这里必须用
+    // 词边界比对，不能直接 `toContain`（否则会把工厂名误判成类名引用）。
+    expect(content).not.toMatch(/\bPostgresNotificationRepository\b/u);
+    // Module 只从 adapter 模块取**工厂导出**（类本体不经 import 进入容器装配）
+    expect(content).toContain("from './notifications.postgres-repository'");
+    expect(content).toMatch(
+      /import\s*\{[^}]*createLazyPostgresNotificationRepository[^}]*\}\s*from\s*'\.\/notifications\.postgres-repository'/u,
     );
   });
 
-  it('持久化登记与数据库模块都不引用本 adapter（端口登记表仍按令牌判定）', () => {
+  it('持久化登记表把本 adapter 登记为「已绑定切片」（令牌 + 工厂导出名与 Module 一致，两组互斥）', async () => {
+    const registry = await import('../../db/persistence/postgres-adapter-registry');
+    const bound = registry.POSTGRES_BOUND_SLICE_REGISTRY.find(
+      (item) => item.id === 'notifications',
+    );
+    expect(bound).toBeDefined();
+    expect(bound?.file).toBe('modules/notifications/notifications.postgres-repository.ts');
+    expect(bound?.moduleFile).toBe('modules/notifications/notifications.module.ts');
+    expect(bound?.token).toBe('NOTIFICATION_REPOSITORY');
+    expect(bound?.factoryExport).toBe('createLazyPostgresNotificationRepository');
+    expect(bound?.capabilitiesExport).toBe('POSTGRES_NOTIFICATION_REPOSITORY_CAPABILITIES');
+    // 同一个 adapter 不得同时出现在「未装配」与「已绑定」两张登记表里
+    expect(registry.POSTGRES_ADAPTER_REGISTRY.map((item) => item.id)).not.toContain(
+      'notifications',
+    );
+
+    // 登记事实与源文件一致：只改其中一处即 fail-closed（门禁会以
+    // BOUND_SLICE_NOT_REFERENCED_BY_MODULE / BOUND_SLICE_TOKEN_NOT_BOUND_IN_MODULE 拒绝）
+    const moduleSource = readFileSync(MODULE_PATH, 'utf8');
+    expect(moduleSource).toContain(bound?.factoryExport ?? '(missing)');
+    expect(moduleSource).toContain(bound?.token ?? '(missing)');
+  });
+
+  it('换绑只发生在 Module 的工厂里：登记表、数据库模块、端口层与 app 装配都不引用 adapter', () => {
     for (const relative of [
       join('src', 'db', 'persistence-bindings.ts'),
       join('src', 'db', 'database.module.ts'),
       join('src', 'db', 'ports', 'sql-executor.port.ts'),
       join('src', 'modules', 'notifications', 'notifications.port.ts'),
       join('src', 'app.module.ts'),
-      join('src', 'startup-assembly.spec.ts'),
     ]) {
       const content = readApiFile(relative);
-      // 端口文件只在注释里以「示例路径」提到 adapter 模块文件名，这不构成装配；任何 import /
-      // provider 引用（类名或模块路径）都必须为零
-      expect(content).not.toContain(ADAPTER_CLASS);
+      // 端口 / 登记表只在注释里提到 adapter 模块路径与**工厂导出名**，这不构成装配；任何 import /
+      // provider 引用（类名或模块路径）都必须为零。工厂导出名含类名子串，因此用词边界比对。
+      expect(content).not.toMatch(/\bPostgresNotificationRepository\b/u);
       expect(content).not.toMatch(
         /(?:from\s+['"][^'"]*notifications\.postgres-repository['"]|require\(\s*['"][^'"]*notifications\.postgres-repository['"]\s*\))/u,
       );
     }
   });
 
-  it('内存基线仍是同步契约的实现者（本切片不改动它）', () => {
+  it('内存基线实现的是同一异步端口（本切片把端口改成 Promise），且仍无改写他人数据的入口', () => {
     const source = readApiFile(
       join('src', 'modules', 'notifications', 'notifications.in-memory-repository.ts'),
     );
@@ -1653,21 +1790,113 @@ describe('PostgreSQL 通知仓储：未装配、无驱动依赖、与 schema 边
     expect(source).not.toContain(ADAPTER_CLASS);
     expect(source).toContain('persistent: false');
     expect(source).toContain('productionReady: false');
+    // 异步契约：四个方法都返回 Promise（与 adapter 同语义，可互为替换）
+    expect(source).toContain('async create(notification: Notification): Promise<Notification> {');
+    expect(source).toContain('async findById(notificationId: string, ownerUserId: string)');
+    expect(source).toContain('async listByUserId(userId: string): Promise<');
+    expect(source).toContain('async save(notification: Notification): Promise<Notification> {');
   });
 
-  it('同步端口契约未被改成异步（本切片只新增并存的异步契约与后端标识）', () => {
+  it('异步端口是唯一契约：NotificationRepository 为 Promise 语义，AsyncNotificationRepository 是等价别名', () => {
     const source = readFileSync(PORT_PATH, 'utf8');
     expect(source).toContain('export interface NotificationRepository {');
-    expect(source).toContain('findById(notificationId: string): Notification | undefined;');
-    expect(source).toContain('save(notification: Notification): Notification;');
-    expect(source).toContain('export interface AsyncNotificationRepository {');
-    expect(source).toContain('findById(notificationId: string, ownerUserId: string)');
+    // 四个方法都是异步（没有并存的同步契约，因此不存在「同步绑定 + 异步实现混用」）
+    expect(source).toContain('create(notification: Notification): Promise<Notification>;');
+    expect(source).toContain(
+      'findById(notificationId: string, ownerUserId: string): Promise<Notification | undefined>;',
+    );
+    expect(source).toContain('listByUserId(userId: string): Promise<readonly Notification[]>;');
+    expect(source).toContain('save(notification: Notification): Promise<Notification>;');
+    expect(source).toContain('export type AsyncNotificationRepository = NotificationRepository;');
     expect(source).toContain('export const NOTIFICATION_REPOSITORY_BACKEND_POSTGRES');
     expect(source).toContain('export const NOTIFICATION_REPOSITORY_STORAGE_ID_DOMAIN');
-    // 同步端口名与 DI 令牌一字未改
+    // 端口名与 DI 令牌一字未改
     expect(source).toContain(
       "export const NOTIFICATION_REPOSITORY = Symbol('NOTIFICATION_REPOSITORY');",
     );
+  });
+
+  it('延迟建连工厂：主体域先判（非法主体不建连）、连接被复用、失败不缓存', async () => {
+    let connects = 0;
+    const lazy = createLazyPostgresNotificationRepository(async () => {
+      connects += 1;
+      return new RecordingExecutor([
+        { rows: [rowFromRecord(UNREAD_NOTIFICATION)], rowCount: 1 },
+        { rows: [rowFromRecord(UNREAD_NOTIFICATION)], rowCount: 1 },
+        { rows: [rowFromRecord(UNREAD_NOTIFICATION)], rowCount: 1 },
+      ]);
+    });
+
+    expect(lazy.capabilities).toEqual(POSTGRES_NOTIFICATION_REPOSITORY_CAPABILITIES);
+    // 装配（构造工厂）阶段不建连：失败留给启动期门禁给出结构化违规
+    expect(connects).toBe(0);
+
+    // 非存储 ID 域主体在解析执行器**之前**就被拒绝，因此仍然一次都没有建连（四条方法逐条覆盖）
+    await expect(lazy.listByUserId('u-student-1')).rejects.toMatchObject({
+      code: 'INVALID_SUBJECT',
+    });
+    await expect(lazy.findById(NOTIFICATION_ID, 'u-student-1')).rejects.toMatchObject({
+      code: 'INVALID_SUBJECT',
+    });
+    await expect(
+      lazy.create({ ...UNREAD_NOTIFICATION, userId: 'u-student-1' }),
+    ).rejects.toMatchObject({ code: 'INVALID_SUBJECT' });
+    await expect(lazy.save({ ...READ_NOTIFICATION, userId: 'u-student-1' })).rejects.toMatchObject({
+      code: 'INVALID_SUBJECT',
+    });
+    expect(connects).toBe(0);
+
+    // 合法主体：建连一次并被复用（后续调用不再建连），且归属下推进取数（复核由 adapter 负责）
+    await expect(lazy.listByUserId(OWNER_ID)).resolves.toEqual([UNREAD_NOTIFICATION]);
+    await expect(lazy.findById(NOTIFICATION_ID, OWNER_ID)).resolves.toEqual(UNREAD_NOTIFICATION);
+    await expect(lazy.create(UNREAD_NOTIFICATION)).resolves.toEqual(UNREAD_NOTIFICATION);
+    expect(connects).toBe(1);
+
+    // 连接失败不缓存失败结果：下一次调用会重试，而不是永久失败
+    let attempts = 0;
+    const flaky = createLazyPostgresNotificationRepository(async () => {
+      attempts += 1;
+      throw new Error('连接失败');
+    });
+    await expect(flaky.listByUserId(OWNER_ID)).rejects.toThrow(/连接失败/u);
+    await expect(flaky.listByUserId(OWNER_ID)).rejects.toThrow(/连接失败/u);
+    expect(attempts).toBe(2);
+  });
+
+  it('DI 工厂 createPostgresNotificationRepository 把执行器装成同一异步端口', async () => {
+    const executor = new RecordingExecutor([
+      { rows: [rowFromRecord(UNREAD_NOTIFICATION)], rowCount: 1 },
+    ]);
+    const repository = createPostgresNotificationRepository(executor);
+    await expect(repository.listByUserId(OWNER_ID)).resolves.toEqual([UNREAD_NOTIFICATION]);
+    expect(executor.calls).toHaveLength(1);
+  });
+
+  it('主体域断言可先于建连执行（供分流点与 service 复用），且不回显主体取值', () => {
+    expect(assertPostgresNotificationSubject(OWNER_ID)).toBe(OWNER_ID);
+    for (const invalid of ['u-student-1', HEX_OWNER_ID_UPPER, NIL_UUID, '']) {
+      const error = captureSyncError(() => assertPostgresNotificationSubject(invalid));
+      expect(error.code).toBe('INVALID_SUBJECT');
+      expectIssueOn(error, 'userId');
+      expect(error.issues).toEqual(['userId']);
+      if (invalid !== '') {
+        expect(error.message).not.toContain(invalid);
+      }
+    }
+  });
+
+  it('延迟建连工厂的能力声明同样受自检约束（不得用工厂绕过「未验证不得生产可用」）', () => {
+    const resolveExecutor = (): Promise<SqlExecutor> =>
+      Promise.resolve(
+        new RecordingExecutor([{ rows: [rowFromRecord(UNREAD_NOTIFICATION)], rowCount: 1 }]),
+      );
+    expect(() =>
+      createLazyPostgresNotificationRepository(resolveExecutor, {
+        backend: 'postgres',
+        persistent: true,
+        productionReady: true,
+      }),
+    ).toThrow(/不得声称生产可用/u);
   });
 
   it('adapter 的公开面覆盖能力、验证清单、列清单与状态机逆映射（供上层与运维机器判定）', () => {

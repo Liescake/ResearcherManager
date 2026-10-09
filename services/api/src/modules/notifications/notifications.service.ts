@@ -66,6 +66,12 @@ import type { NotificationRepository } from './notifications.port';
  *
  * 尚不包含（明确留给后续切片）：通知的生产侧（审核结果/匹配结果/公告如何入库与去重）、
  * 未读数与批量已读、删除与归档、分页与排序、订阅消息下发与失败重试、导出、审计落库。
+ *
+ * 仓储端口是**异步**的（`Promise`）：未配置数据库时绑定内存基线、配置时绑定 PostgreSQL 实现
+ * （见 `notifications.module.ts` 的 `createNotificationRepository`），service 因此不区分后端。
+ * 已知约束：PostgreSQL 实现的归属主键是 `uuid`，因此绑定到数据库实现时**非 UUID 的会话主体**
+ * 会被 adapter 在进入 SQL 之前 fail-closed 拒绝（`INVALID_SUBJECT`）；会话主体标识收敛为 UUID
+ * 属于后续切片。
  */
 @Injectable()
 export class NotificationsService {
@@ -83,7 +89,10 @@ export class NotificationsService {
    * 因此它作为显式参数传入（服务是单例，绝不保存任何请求级状态），且**在授权之后**才检查，
    * 避免未授权主体通过字段级反馈探测端点内部结构。
    */
-  listMyNotifications(subject: AuthorizationSubject, query: unknown): NotificationView[] {
+  async listMyNotifications(
+    subject: AuthorizationSubject,
+    query: unknown,
+  ): Promise<NotificationView[]> {
     // 1. 授权先于查询串校验、先于任何仓储访问
     this.authorizeSelf(subject, PermissionPoint.ProfileSelfRead);
 
@@ -91,9 +100,8 @@ export class NotificationsService {
     assertDeclaredNotificationQueryFields(query);
 
     // 3. 只按服务端主体取数；逐条复核：读取契约违规或归属不一致一律 500（绝不外发他人记录）
-    return this.repository
-      .listByUserId(subject.userId)
-      .map((record) => this.toOwnedView(record, subject.userId));
+    const records = await this.repository.listByUserId(subject.userId);
+    return records.map((record) => this.toOwnedView(record, subject.userId));
   }
 
   /**
@@ -108,12 +116,12 @@ export class NotificationsService {
    * `body`/`query` 只是需要被 fail-closed 拒绝的「不应存在之物」：标记已读的唯一输入是路径中的
    * 通知 ID，因此它们作为显式参数传入，不参与任何业务判定。
    */
-  markMyNotificationRead(
+  async markMyNotificationRead(
     subject: AuthorizationSubject,
     notificationId: string,
     body: unknown,
     query: unknown,
-  ): NotificationView {
+  ): Promise<NotificationView> {
     // 1. 授权先于输入校验、先于任何仓储访问
     this.authorizeSelf(subject, PermissionPoint.ProfileSelfUpdate);
 
@@ -123,7 +131,8 @@ export class NotificationsService {
     const { notificationId: id } = notificationIdParamsSchema.parse({ notificationId });
 
     // 3. 统一安全边界：不可见的三种成因合并为同一个 404 + 同一文案，且不输出记录的任何字段
-    const record = this.repository.findById(id);
+    //    归属下推进仓储：非本人所有在数据库实现里根本不出库（此处仍复核，纵深防御）
+    const record = await this.repository.findById(id, subject.userId);
     if (!record || readNotificationOwnerId(record) !== subject.userId) {
       if (record) {
         // 只记录「不一致」这一事实，不记录通知 ID、归属或任何内容
@@ -137,7 +146,7 @@ export class NotificationsService {
 
     // 5. 状态机唯一前向边：read 是终态，已读记录原样返回（不写库、不漂移 readAt）
     const mark = markNotificationRead(stored, new Date().toISOString());
-    const saved = mark.changed ? this.repository.save(mark.record) : mark.record;
+    const saved = mark.changed ? await this.repository.save(mark.record) : mark.record;
 
     // 6. 写出后的记录同样要过读取契约与归属复核（异常仓储不得借写回把他人记录交出去）
     return this.toOwnedView(saved, subject.userId);
