@@ -1,0 +1,27 @@
+# 行尾统一策略
+#
+# 背景：.prettierrc.json 设置了 endOfLine: "lf"，而仓库此前没有 .gitattributes，
+# 于是检出时的行尾完全取决于运行环境的 core.autocrlf（本仓库默认 true）。
+# 在 core.autocrlf=true 的 Windows 环境做一次干净的 clone/checkout，全部文本文件
+# 会被转成 CRLF，`pnpm format:check` 就会把 360 个受检文件全部判为不合规
+# （实测：CRLF 检出 360 个告警，LF 检出 0 个告警），并非源码存在格式漂移。
+#
+# 因此这里统一声明：文本文件在仓库内以 LF 存储，并在任何平台以 LF 检出。
+# 该策略与 .editorconfig 的 end_of_line = lf 一致，且不依赖使用者的 Git 配置，
+# 使 format:check 的结果可复现。
+* text=auto eol=lf
+
+# 二进制文件：不做行尾转换、不做文本合并/差异
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
