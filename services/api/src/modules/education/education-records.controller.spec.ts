@@ -22,6 +22,7 @@ import { loadEnv } from '../../config/env';
 import { AccessControlModule } from '../access-control/access-control.module';
 import { AuthModule } from '../auth/auth.module';
 import { InMemorySessionStore } from '../auth/session-store.in-memory';
+import { SESSION_STORE } from '../auth/session-subject.port';
 import type { RuoYiAuthzAdapter } from '../ruoyi-adapter/ruoyi-adapter.port';
 import { RUOYI_AUTHZ_ADAPTER } from '../ruoyi-adapter/ruoyi-adapter.port';
 import { EDUCATION_RECORD_INPUT_FIELDS } from './education-records.contract';
@@ -30,7 +31,7 @@ import { InMemoryEducationRecordRepository } from './education-records.in-memory
 import type { EducationRecord } from './education-records.port';
 import { EDUCATION_RECORD_REPOSITORY } from './education-records.port';
 import { EducationRecordsService } from './education-records.service';
-import { EducationModule } from './education.module';
+import { EducationModule, createEducationRecordRepository } from './education.module';
 
 /**
  * 升学记录切片（`/me/education-records`）的真实 HTTP 回归：
@@ -38,7 +39,8 @@ import { EducationModule } from './education.module';
  * - 成功：本人创建/列表/单条；归属与审核态由服务端决定，响应不含 `userId`；
  * - 输入拒绝 400：未知枚举、越界年份、已录取缺院校、控制字符、未声明字段（roles/scope/groupId/…）；
  * - 认证 401：无凭证、scheme 不对、会话不存在、会话主体含未登记角色（fail-closed）；
- * - 越权 403：读取他人记录、角色无该权限点；并断言判定入参来自**服务端**（存储归属 + 常量范围）；
+ * - 越权 403：角色无该权限点；**他人记录统一 404**（归属下推到取数，「不存在」与「不是你的」
+ *   不可区分，因此资源存在性不可探测）；
  * - fail-closed 500：存储层出现未登记枚举/非法时间戳时不得作为正常输出返回，也不得泄露字段取值；
  * - 既有路由不变：同一 `AppModule` 下 health / runtime-info 行为不变，且默认装配不预置任何会话。
  *
@@ -86,7 +88,7 @@ async function startEducationApp(): Promise<TestApp> {
   await app.listen(0, '127.0.0.1');
   startedApps.push(app);
 
-  const store = app.get(InMemorySessionStore);
+  const store = app.get<InMemorySessionStore>(SESSION_STORE);
   store.seed({
     sessionId: SESSION_STUDENT_1,
     subject: { userId: 'u-student-1', roles: [Role.Student] },
@@ -106,7 +108,7 @@ async function startEducationApp(): Promise<TestApp> {
     app,
     baseUrl: `${await app.getUrl()}/api/v1`,
     store,
-    repository: app.get(InMemoryEducationRecordRepository),
+    repository: app.get<InMemoryEducationRecordRepository>(EDUCATION_RECORD_REPOSITORY),
   };
 }
 
@@ -225,7 +227,7 @@ describe('升学记录：成功路径（真实 HTTP + 统一响应信封）', ()
       reviewStatus: ReviewStatus.Pending,
     });
 
-    const stored = repository.listByUserId('u-student-1');
+    const stored = await repository.listByUserId('u-student-1');
     expect(stored).toHaveLength(1);
     expect(stored[0]?.userId).toBe('u-student-1');
     expect(stored[0]?.id).toBe(data.id);
@@ -233,8 +235,8 @@ describe('升学记录：成功路径（真实 HTTP + 统一响应信封）', ()
 
   it('本人列表与单条读取：只返回本人记录，且不泄露他人记录内容', async () => {
     const { baseUrl, repository } = await startEducationApp();
-    const mine = repository.create(fixtureRecord({ userId: 'u-student-1' }));
-    const others = repository.create(
+    const mine = await repository.create(fixtureRecord({ userId: 'u-student-1' }));
+    const others = await repository.create(
       fixtureRecord({ userId: 'u-student-2', institutionOrDestination: '他人大学' }),
     );
 
@@ -294,7 +296,7 @@ describe('升学记录：输入拒绝（400 VALIDATION_FAILED，不落库）', (
     expect(res.body.error?.requestId).toBeTruthy();
     // 字段级错误（路径 + 消息）；不落库
     expect(issuesOf(res.body).length).toBeGreaterThan(0);
-    expect(repository.listByUserId('u-student-1')).toHaveLength(0);
+    await expect(repository.listByUserId('u-student-1')).resolves.toHaveLength(0);
   });
 
   it('客户端提交 roles/scope/groupId/userId/reviewStatus 一律拒绝，且没有任何记录被写入', async () => {
@@ -324,9 +326,9 @@ describe('升学记录：输入拒绝（400 VALIDATION_FAILED，不落库）', (
     for (const key of unexpectedKeys) {
       expect(messages.some((message) => message.includes(key))).toBe(true);
     }
-    expect(repository.listByUserId('u-student-1')).toHaveLength(0);
+    await expect(repository.listByUserId('u-student-1')).resolves.toHaveLength(0);
     // 伪造的归属没有被采纳为「写入目标」
-    expect(repository.listByUserId('u-victim-1')).toHaveLength(0);
+    await expect(repository.listByUserId('u-victim-1')).resolves.toHaveLength(0);
   });
 });
 
@@ -360,14 +362,14 @@ describe('升学记录：认证边界 401（fail-closed）', () => {
 
     expect(res.status).toBe(401);
     expect(res.body.error?.code).toBe('UNAUTHENTICATED');
-    expect(repository.listByUserId('u-student-1')).toHaveLength(0);
+    await expect(repository.listByUserId('u-student-1')).resolves.toHaveLength(0);
   });
 });
 
-describe('升学记录：越权 403（AuthorizationGuard + 服务端资源判定）', () => {
-  it('读取他人记录：403，判定入参取自存储归属而不是请求体，且不泄露内容', async () => {
+describe('升学记录：越权与归属隔离（AuthorizationGuard + 服务端资源判定）', () => {
+  it('读取他人记录：404（归属下推到取数），不区分「不存在」，也不泄露内容或归属', async () => {
     const { app, baseUrl, repository } = await startEducationApp();
-    const others = repository.create(
+    const others = await repository.create(
       fixtureRecord({ userId: 'u-student-2', institutionOrDestination: '他人大学' }),
     );
     const adapter = app.get<RuoYiAuthzAdapter>(RUOYI_AUTHZ_ADAPTER);
@@ -377,22 +379,46 @@ describe('升学记录：越权 403（AuthorizationGuard + 服务端资源判定
       headers: bearer(SESSION_STUDENT_1),
     });
 
-    expect(res.status).toBe(403);
+    // 「记录不存在」与「记录存在但不属于该主体」在仓储层不可区分 ⇒ 统一 404：
+    // 他人资源的存在性因此不可探测（此前同步实现用 403/404 的差别泄露了存在性）
+    expect(res.status).toBe(404);
     expect(res.body.data).toBeNull();
-    expect(res.body.error?.code).toBe('FORBIDDEN');
+    expect(res.body.error?.code).toBe('NOT_FOUND');
     expect(res.text).not.toContain('u-student-2');
     expect(res.text).not.toContain('他人大学');
 
-    // 判定确实经适配器端口，且 resourceUserId 来自存储记录（服务端解析），
-    // permission / scope 是服务端常量：客户端无法影响这三个入参。
+    // 判定入参是**服务端会话主体**（不是请求体，也不是存储归属）：客户端无法影响它。
     expect(checkAuthorization).toHaveBeenCalledWith(
       { userId: 'u-student-1', roles: [Role.Student] },
       {
         permission: PermissionPoint.EducationSelfRead,
         scope: DataScope.Self,
-        resourceUserId: 'u-student-2',
+        resourceUserId: 'u-student-1',
       },
     );
+  });
+
+  it('归属判定是服务端解析值：请求体里的 userId 不会成为判定入参', async () => {
+    const { app, baseUrl } = await startEducationApp();
+    const adapter = app.get<RuoYiAuthzAdapter>(RUOYI_AUTHZ_ADAPTER);
+    const checkAuthorization = vi.spyOn(adapter, 'checkAuthorization');
+
+    // 带伪造归属的单条读取：路径 ID 由请求给出，归属入参仍然只能是会话主体
+    const res = await call(
+      baseUrl,
+      'GET',
+      `/me/education-records/${randomUUID()}?userId=u-victim-1`,
+      {
+        headers: bearer(SESSION_STUDENT_1),
+      },
+    );
+
+    expect(res.status).toBe(404);
+    expect(checkAuthorization).toHaveBeenCalledWith(
+      { userId: 'u-student-1', roles: [Role.Student] },
+      expect.objectContaining({ resourceUserId: 'u-student-1' }),
+    );
+    expect(JSON.stringify(checkAuthorization.mock.calls)).not.toContain('u-victim-1');
   });
 
   it('角色缺少原子权限点：admin 读写升学记录均 403，且不产生记录', async () => {
@@ -411,7 +437,7 @@ describe('升学记录：越权 403（AuthorizationGuard + 服务端资源判定
     expect(write.status).toBe(403);
     expect(write.body.error?.code).toBe('FORBIDDEN');
     expect(write.body.error?.message).toBe('无权执行该操作');
-    expect(repository.listByUserId('u-admin-1')).toHaveLength(0);
+    await expect(repository.listByUserId('u-admin-1')).resolves.toHaveLength(0);
   });
 
   it('创建请求的判定入参是服务端主体自己，而不是任何客户端字段', async () => {
@@ -435,7 +461,7 @@ describe('升学记录：越权 403（AuthorizationGuard + 服务端资源判定
     );
   });
 
-  it('不存在的记录 404、非法 ID 400：与 403 区分开', async () => {
+  it('不存在的记录 404、非法 ID 400（ID 形状先判，非法 ID 不进仓储）', async () => {
     const { baseUrl } = await startEducationApp();
 
     const missing = await call(baseUrl, 'GET', `/me/education-records/${randomUUID()}`, {
@@ -456,7 +482,7 @@ describe('升学记录：未知枚举 fail-closed（存储层异常不得当正�
   it('存储记录的 status 为未登记枚举 → 500，且不把未知值/字段取值泄露给调用方', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startEducationApp();
-    const corrupted = repository.create(
+    const corrupted = await repository.create(
       fixtureRecord({
         userId: 'u-student-1',
         status: 'unknown_status' as EducationStatus,
@@ -485,7 +511,9 @@ describe('升学记录：未知枚举 fail-closed（存储层异常不得当正�
   it('存储记录时间戳非法 → 500（读取契约包含时间格式）', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startEducationApp();
-    repository.create(fixtureRecord({ userId: 'u-student-1', createdAt: '2026-01-01 00:00:00' }));
+    await repository.create(
+      fixtureRecord({ userId: 'u-student-1', createdAt: '2026-01-01 00:00:00' }),
+    );
 
     const res = await call(baseUrl, 'GET', '/me/education-records', {
       headers: bearer(SESSION_STUDENT_1),
@@ -497,20 +525,40 @@ describe('升学记录：未知枚举 fail-closed（存储层异常不得当正�
 });
 
 describe('切片装配与既有路由不变', () => {
-  it('EducationModule 只注册本切片的路由与服务，并把仓储端口显式绑到内存基线', () => {
+  it('EducationModule 只注册本切片的路由与服务，并通过工厂把仓储端口按配置分流', () => {
     const providers = (Reflect.getMetadata('providers', EducationModule) ?? []) as unknown[];
     const controllers = (Reflect.getMetadata('controllers', EducationModule) ?? []) as unknown[];
     const imports = (Reflect.getMetadata('imports', EducationModule) ?? []) as unknown[];
 
     expect(controllers).toEqual([EducationRecordsController]);
     expect(providers).toContain(EducationRecordsService);
-    expect(providers).toContainEqual({
-      provide: EDUCATION_RECORD_REPOSITORY,
-      useExisting: InMemoryEducationRecordRepository,
-    });
+    // 换绑点是一个 factory provider（未配置数据库 → 内存基线；已配置 → PostgreSQL 实现），
+    // 因此端口令牌与工厂函数都必须出现在 provider 列表里，而内存实现不再是独立 provider。
+    expect(providers).toContainEqual(
+      expect.objectContaining({
+        provide: EDUCATION_RECORD_REPOSITORY,
+        inject: [expect.any(String), expect.objectContaining({ optional: true })],
+      }),
+    );
+    expect(providers).not.toContain(InMemoryEducationRecordRepository);
+    expect(typeof createEducationRecordRepository).toBe('function');
+    expect(createEducationRecordRepository.length).toBe(2);
     // 依赖方向：认证（auth）与授权（access-control）各自只经端口/服务暴露
     expect(imports).toContain(AuthModule);
     expect(imports).toContain(AccessControlModule);
+  });
+
+  it('未配置数据库：端口上就是内存基线（同一实例，可显式 seed）', async () => {
+    const app = await NestFactory.create(EducationHttpModule, { logger: false });
+    startedApps.push(app);
+
+    const onPort = app.get<InMemoryEducationRecordRepository>(EDUCATION_RECORD_REPOSITORY);
+    expect(onPort).toBeInstanceOf(InMemoryEducationRecordRepository);
+    expect(onPort.capabilities).toEqual({
+      backend: 'in-memory-baseline',
+      persistent: false,
+      productionReady: false,
+    });
   });
 
   it('内存基线如实声明非持久化，并在生产环境拒绝构造（不用内存冒充生产存储）', () => {
@@ -554,6 +602,7 @@ describe('切片装配与既有路由不变', () => {
       'apiPort',
       'apiPrefix',
       'databaseConfigured',
+      'dependencyGate',
       'nodeEnv',
     ]);
 

@@ -15,13 +15,17 @@ import type {
   SqlQueryResult,
 } from '../../db/ports/sql-executor.port';
 import {
+  POSTGRES_ADAPTER_REGISTRY,
+  POSTGRES_BOUND_SLICE_REGISTRY,
+} from '../../db/persistence/postgres-adapter-registry';
+import {
   parseStoredEducationRecord,
   storedEducationRecordSchema,
 } from './education-records.contract';
 import { toEducationRecordView } from './education-records.contract';
 import type {
-  AsyncEducationRecordRepository,
   EducationRecord,
+  EducationRecordRepository,
   EducationRecordRepositoryCapabilities,
 } from './education-records.port';
 import { EDUCATION_RECORD_REPOSITORY_BACKEND_POSTGRES } from './education-records.port';
@@ -44,7 +48,8 @@ import {
  *
  * 覆盖六类要求：
  * - **repository 契约**：能力声明（persistent=true / productionReady=false）、列 ↔ 读取契约字段
- *   一一对应、未被装配到 `EducationModule`、不引驱动/ORM、`education_records` 尚未转为迁移；
+ *   一一对应、adapter 自身不是 Nest provider（装配经 `education.module.ts` 的工厂）、不引驱动/ORM、
+ *   `education_records` 已由迁移 0002 建立；
  * - **参数化 SQL 与固定标识符**：客户端可控值只出现在参数里，SQL 文本只由模块常量构成；
  * - **SQL 注入**：主体 / 资源 ID / 文本字段等所有入口的注入载荷要么只进参数、要么在进入 SQL
  *   之前被拒绝；
@@ -78,7 +83,6 @@ const ADAPTER_PATH = resolve(
   'education-records.postgres-repository.ts',
 );
 const ADAPTER_CLASS = 'PostgresEducationRecordRepository';
-const ADAPTER_MODULE = 'education-records.postgres-repository';
 
 interface RecordedCall {
   readonly sql: string;
@@ -314,11 +318,9 @@ describe('PostgreSQL 升学记录仓储：repository 契约与能力声明', () 
     }
   });
 
-  it('实现的是异步仓储契约（Promise 语义），未被绑定为同步端口', async () => {
+  it('实现的是异步端口契约（Promise 语义）：内存基线与 PostgreSQL 实现同一份接口', async () => {
     const executor = new RecordingExecutor([{ rows: [rowFromRecord()], rowCount: 1 }]);
-    const repository: AsyncEducationRecordRepository = new PostgresEducationRecordRepository(
-      executor,
-    );
+    const repository: EducationRecordRepository = new PostgresEducationRecordRepository(executor);
 
     expect(repository.capabilities).toEqual(POSTGRES_EDUCATION_RECORD_REPOSITORY_CAPABILITIES);
     const created = repository.create(RECORD);
@@ -1127,6 +1129,55 @@ describe('PostgreSQL 升学记录仓储：归属隔离（他人记录既不出�
       new PostgresEducationRecordRepository(canonical).findById(RECORD_ID, HEX_OWNER_ID),
     ).resolves.toMatchObject({ userId: HEX_OWNER_ID });
   });
+
+  it('写路径的资源 ID 同样必须落在存储 ID 域内：非规范形 / 空 UUID 在进 SQL 前拒绝', async () => {
+    const executor = new RecordingExecutor([{ rows: [rowFromRecord()], rowCount: 1 }]);
+    const repository = new PostgresEducationRecordRepository(executor);
+
+    for (const id of [
+      HEX_OWNER_ID_UPPER,
+      HEX_OWNER_ID_MIXED,
+      HEX_OWNER_ID.replace(/-/gu, ''),
+      '00000000-0000-0000-0000-000000000000',
+      'nope',
+      '',
+    ]) {
+      const error = await captureRepoError(() =>
+        repository.create({ ...RECORD, id } as unknown as EducationRecord),
+      );
+      expect(error.code).toBe('INVALID_RECORD');
+      expect(error.issues.join(',')).toContain('id');
+      if (id.length > 0) {
+        expect(error.message).not.toContain(id);
+      }
+    }
+    // 关键：全部在**无副作用**状态下失败——一次 SQL 都没发出去，因此不可能留下已写入的行
+    // （否则非规范形 ID 会先落库、再被规范形回读判成 IDENTITY_MISMATCH）
+    expect(executor.calls).toHaveLength(0);
+
+    // 规范小写形本身合法：写入照常发生，且回读主键与请求一致
+    const canonicalId = new RecordingExecutor([
+      { rows: [rowFromRecord({ id: HEX_OWNER_ID, user_id: HEX_OWNER_ID })], rowCount: 1 },
+    ]);
+    await expect(
+      new PostgresEducationRecordRepository(canonicalId).create({
+        ...RECORD,
+        id: HEX_OWNER_ID,
+        userId: HEX_OWNER_ID,
+      }),
+    ).resolves.toMatchObject({ id: HEX_OWNER_ID });
+    expect(canonicalId.calls).toHaveLength(1);
+  });
+
+  it('写入不改动调用方传入的记录对象（无共享可变状态：入参可冻结）', async () => {
+    const executor = new RecordingExecutor([{ rows: [rowFromRecord()], rowCount: 1 }]);
+    const repository = new PostgresEducationRecordRepository(executor);
+    const frozen = Object.freeze({ ...RECORD });
+
+    await expect(repository.create(frozen)).resolves.toEqual(RECORD);
+    expect(frozen).toEqual(RECORD);
+    expect(Object.isFrozen(frozen)).toBe(true);
+  });
 });
 
 describe('PostgreSQL 升学记录仓储：公开视图与错误信息（不泄露归属与个人级内容）', () => {
@@ -1240,27 +1291,34 @@ describe('PostgreSQL 升学记录仓储：公开视图与错误信息（不泄�
   });
 });
 
-describe('PostgreSQL 升学记录仓储：未装配、无驱动依赖、与 schema 边界对齐', () => {
-  it('EducationModule 仍只绑定内存基线（本 adapter 未被装配）', () => {
+describe('PostgreSQL 升学记录仓储：装配、无驱动依赖、与 schema 边界对齐', () => {
+  it('EducationModule 经工厂换绑（令牌 + 工厂导出名），adapter 类名不作为 provider 出现', () => {
     const moduleFile = resolve(process.cwd(), 'src', 'modules', 'education', 'education.module.ts');
     const content = readFileSync(moduleFile, 'utf8');
 
-    expect(content).not.toContain(ADAPTER_CLASS);
-    expect(content).not.toContain(ADAPTER_MODULE);
+    // adapter 类本身不是 provider：装配只经工厂，类名不得作为 import 绑定 / provider 出现
+    // （工厂名里含 "PostgresEducationRecordRepository" 子串，因此这里判「作为独立标识符引用」）
+    expect(content).not.toMatch(/[{,]\s*PostgresEducationRecordRepository\s*(?:[,}]|as\b)/u);
+    expect(content).not.toMatch(/\bnew\s+PostgresEducationRecordRepository\b/u);
+    expect(content).not.toContain('useClass');
+    // 换绑点：端口令牌 + 工厂导出名 + 模块路径（登记表按这三个事实判定绑定成立）
+    expect(content).toContain('EDUCATION_RECORD_REPOSITORY');
+    expect(content).toContain('createLazyPostgresEducationRecordRepository');
+    expect(content).toContain("from './education-records.postgres-repository'");
+    // 未配置数据库时的分支仍是内存基线，且分流用同一份纯函数
     expect(content).toContain('InMemoryEducationRecordRepository');
-    expect(content).toContain(
-      '{ provide: EDUCATION_RECORD_REPOSITORY, useExisting: InMemoryEducationRecordRepository }',
-    );
+    expect(content).toContain('resolveAppDatabaseConfig');
+    // 旧的「useExisting 直绑内存基线」必须已经不存在（否则换绑点失去意义）
+    expect(content).not.toContain('useExisting: InMemoryEducationRecordRepository');
   });
 
-  it('持久化登记与数据库模块都不引用本 adapter（端口登记表仍按令牌判定）', () => {
+  it('持久化登记表 / 数据库模块 / 端口 / app 模块都不直接引用 adapter 文件', () => {
     for (const relative of [
       join('src', 'db', 'persistence-bindings.ts'),
       join('src', 'db', 'database.module.ts'),
       join('src', 'db', 'ports', 'sql-executor.port.ts'),
       join('src', 'modules', 'education', 'education-records.port.ts'),
       join('src', 'app.module.ts'),
-      join('src', 'startup-assembly.spec.ts'),
     ]) {
       const content = readApiFile(relative);
       // 端口文件只在注释里以「示例路径」提到 adapter，这不构成装配；任何 import / provider
@@ -1270,6 +1328,19 @@ describe('PostgreSQL 升学记录仓储：未装配、无驱动依赖、与 sche
         /(?:from\s+['"][^'"]*education-records\.postgres-repository['"]|require\(\s*['"][^'"]*education-records\.postgres-repository['"]\s*\))/u,
       );
     }
+  });
+
+  it('边界登记表把 education 登记为**已绑定切片**（令牌 + 工厂导出名，且不在未装配组）', () => {
+    const bound = POSTGRES_BOUND_SLICE_REGISTRY.filter((item) => item.id === 'education');
+    expect(bound).toHaveLength(1);
+    expect(bound[0]?.token).toBe('EDUCATION_RECORD_REPOSITORY');
+    expect(bound[0]?.factoryExport).toBe('createLazyPostgresEducationRecordRepository');
+    expect(bound[0]?.moduleFile).toBe('modules/education/education.module.ts');
+    // 两组互斥：同一个 adapter 不得同时留在「未装配」登记表里
+    expect(POSTGRES_ADAPTER_REGISTRY.some((item) => item.id === 'education')).toBe(false);
+    expect(POSTGRES_ADAPTER_REGISTRY).not.toContainEqual(
+      expect.objectContaining({ file: bound[0]?.file }),
+    );
   });
 
   it('adapter 不引入任何数据库驱动 / ORM 依赖', () => {
@@ -1308,7 +1379,7 @@ describe('PostgreSQL 升学记录仓储：未装配、无驱动依赖、与 sche
     );
   });
 
-  it('工作区依赖里没有 pg / ORM 包', () => {
+  it('工作区依赖里没有未授权的 pg 族 / ORM 包（官方 pg 驱动已授权，仅限驱动层）', () => {
     for (const relative of [join('services', 'api', 'package.json'), 'package.json']) {
       const manifest = JSON.parse(readFileSync(join(REPO_ROOT, relative), 'utf8')) as {
         dependencies?: Record<string, string>;
@@ -1320,7 +1391,7 @@ describe('PostgreSQL 升学记录仓储：未装配、无驱动依赖、与 sche
       ];
       for (const name of names) {
         expect(
-          /^(?:pg|pg-pool|pg-promise|postgres|prisma|@prisma\/client|typeorm|kysely|drizzle-orm|sequelize|@mikro-orm\/core)$/u.test(
+          /^(?:pg-pool|pg-native|pg-promise|postgres|slonik|prisma|@prisma\/client|typeorm|kysely|drizzle-orm|drizzle-kit|sequelize|@mikro-orm\/core)$/u.test(
             name,
           ),
         ).toBe(false);
@@ -1328,27 +1399,36 @@ describe('PostgreSQL 升学记录仓储：未装配、无驱动依赖、与 sche
     }
   });
 
-  it('education_records 尚未转为迁移：与 productionReady=false 及验证清单第 3 项配对', () => {
+  it('education_records 复用迁移 0002（不重复造 schema），productionReady 仍为 false', () => {
     const migrations = readdirSync(join(REPO_ROOT, 'db', 'migrations'));
-    expect(migrations.some((file) => file.includes('education'))).toBe(false);
+    expect(migrations).toContain('0002_education_records.sql');
 
-    // bootstrap 迁移只在注释里登记了这张表，没有任何 CREATE TABLE education_records
-    const bootstrap = readFileSync(
-      join(REPO_ROOT, 'db', 'migrations', '0001_bootstrap.sql'),
+    const sql = readFileSync(
+      join(REPO_ROOT, 'db', 'migrations', '0002_education_records.sql'),
       'utf8',
     );
-    expect(bootstrap).toContain('education_records');
-    expect(bootstrap).not.toMatch(/CREATE\s+TABLE[^;]*education_records/iu);
-    expect(bootstrap).toContain('主键 UUID');
-    expect(bootstrap).toContain('created_at / updated_at');
+    // 建表语句必须真的存在，而不是像 bootstrap 那样只在注释里登记
+    expect(sql).toMatch(/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+education_records\s*\(/iu);
+    // 列清单里的每一列都必须在迁移里有定义（列清单 ↔ schema 单向核对）
+    for (const column of POSTGRES_EDUCATION_RECORD_COLUMNS) {
+      expect(sql).toMatch(
+        new RegExp(
+          `\\b${column}\\s+(?:uuid|smallint|integer|varchar|timestamptz|jsonb|boolean)\\b`,
+          'u',
+        ),
+      );
+    }
+    // 统计聚合读按归属过滤：user_id 必须被索引
+    expect(sql).toMatch(/CREATE\s+INDEX[\s\S]*?\(\s*user_id/iu);
 
+    // 表已建 ≠ 可声明生产可用：能力声明仍不得声称生产可用
     expect(POSTGRES_EDUCATION_RECORD_REPOSITORY_CAPABILITIES.productionReady).toBe(false);
     expect(POSTGRES_EDUCATION_RECORD_REPOSITORY_VERIFICATION_STEPS).toContain(
       'education-records-schema-draft-created-and-promoted-to-migration',
     );
   });
 
-  it('内存基线仍是同步契约的实现者（本切片不改动它）', () => {
+  it('内存基线实现的是**同一份**异步契约，且归属命中与 PostgreSQL 实现一致', () => {
     const source = readApiFile(
       join('src', 'modules', 'education', 'education-records.in-memory-repository.ts'),
     );
@@ -1356,18 +1436,20 @@ describe('PostgreSQL 升学记录仓储：未装配、无驱动依赖、与 sche
     expect(source).not.toContain(ADAPTER_CLASS);
     expect(source).toContain('persistent: false');
     expect(source).toContain('productionReady: false');
+    // 归属命中（而不是只按资源 ID 命中）：两种实现的 404 语义因此一致
+    expect(source).toContain('findById(recordId: string, ownerUserId: string)');
+    expect(source).toContain('record.userId !== ownerUserId');
   });
 
-  it('同步端口契约未被改成异步（本切片只新增并存的异步契约）', () => {
+  it('端口契约已收敛为**异步唯一契约**（同步版与并存异步版都不再存在）', () => {
     const source = readApiFile(join('src', 'modules', 'education', 'education-records.port.ts'));
     expect(source).toContain('export interface EducationRecordRepository {');
-    expect(source).toContain('create(record: EducationRecord): EducationRecord;');
-    expect(source).toContain('findById(recordId: string): EducationRecord | undefined;');
-    expect(source).toContain('listByUserId(userId: string): readonly EducationRecord[];');
-    // 异步契约是并存的新端口，明确要求「资源 ID + 服务端主体归属」同时命中
-    expect(source).toContain('export interface AsyncEducationRecordRepository {');
+    expect(source).toContain('create(record: EducationRecord): Promise<EducationRecord>;');
     expect(source).toContain(
       'findById(recordId: string, ownerUserId: string): Promise<EducationRecord | undefined>;',
     );
+    expect(source).toContain('listByUserId(userId: string): Promise<readonly EducationRecord[]>;');
+    // 并存的第二份契约必须已被删除：单一契约才能保证「内存 ⇄ PostgreSQL」整步换绑
+    expect(source).not.toContain('AsyncEducationRecordRepository');
   });
 });

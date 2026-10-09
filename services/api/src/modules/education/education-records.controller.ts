@@ -30,25 +30,25 @@ export class EducationRecordsController {
   ) {}
 
   @Get()
-  listMyRecords(
+  async listMyRecords(
     @Headers('authorization') authorization: string | undefined,
-  ): EducationRecordView[] {
-    return this.records.listMyRecords(requireSubject(this.sessions, authorization));
+  ): Promise<EducationRecordView[]> {
+    return this.records.listMyRecords(await requireSubject(this.sessions, authorization));
   }
 
   @Post()
-  createMyRecord(
+  async createMyRecord(
     @Headers('authorization') authorization: string | undefined,
     @Body() body: unknown,
-  ): EducationRecordView {
-    return this.records.createMyRecord(requireSubject(this.sessions, authorization), body);
+  ): Promise<EducationRecordView> {
+    return this.records.createMyRecord(await requireSubject(this.sessions, authorization), body);
   }
 
   @Get(':recordId')
-  getMyRecord(
+  async getMyRecord(
     @Headers('authorization') authorization: string | undefined,
     @Param('recordId') recordId: string,
-  ): EducationRecordView {
-    return this.records.getMyRecord(requireSubject(this.sessions, authorization), recordId);
+  ): Promise<EducationRecordView> {
+    return this.records.getMyRecord(await requireSubject(this.sessions, authorization), recordId);
   }
 }

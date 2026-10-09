@@ -42,11 +42,13 @@ import {
  * 跨 adapter 持久化边界契约门禁（**自动枚举 + fail-closed**）。
  *
  * ## 这道门禁回答什么问题
- * 十一个 `*.postgres-repository.ts` 都是「写好但未装配」的实现，每个 adapter 自己的 spec 只能
- * 证明自身没被装配。本文件从**磁盘自动枚举**全部 adapter 文件，与登记表双向比对，并读**运行时
+ * 十二个 `*.postgres-repository.ts` 分两组：八个是「写好但未装配」的实现，四个已绑定到端口
+ * （auth / achievements / profiles / statistics）。每个 adapter 自己的 spec 只能证明自身状态。本文件从**磁盘自动
+ * 枚举**全部 adapter 文件，与登记表双向比对，并读**运行时
  * 真实导出**判定：
  * - 能力声明必须是 `backend = postgres`、`persistent = true`、`productionReady = false`；
- * - 不得被任何业务 Module 装配（provider / import / 类名引用一律不允许），也不得带 Nest 痕迹；
+ * - 未装配组不得被任何业务 Module 装配（provider / import / 类名引用一律不允许），也不得带 Nest
+ *   痕迹；已绑定组必须在 Module 源文件里出现登记好的令牌名与工厂导出名；
  * - 不得声明、import 或安装 `pg` / ORM / 查询构建器等驱动依赖；
  * - 生产环境持久化边界守卫与执行器断言必须**仍然拒绝**这些未验证实现；
  * - 缺失登记、重复登记、错误登记（目录 / 模块文件 / 导出名 / 豁免陈旧）一律 fail-closed。
@@ -332,9 +334,16 @@ describe('未装配 Postgres adapter 边界：磁盘自动枚举 + 登记表 + �
     ].sort();
     expect(discovered).toHaveLength(registered.length);
     expect(discovered).toEqual(registered);
-    // 12 个 adapter：10 个未装配 + 2 个已绑定（auth=会话存储、statistics=本人统计聚合读）
-    expect(POSTGRES_ADAPTER_REGISTRY).toHaveLength(10);
-    expect(POSTGRES_BOUND_SLICE_REGISTRY.map((item) => item.id)).toEqual(['auth', 'statistics']);
+    // 12 个 adapter：7 个未装配 + 5 个已绑定（auth=会话存储、achievements=成果存储、
+    // education=升学记录存储、profiles=学生画像、statistics=本人统计聚合读）
+    expect(POSTGRES_ADAPTER_REGISTRY).toHaveLength(7);
+    expect(POSTGRES_BOUND_SLICE_REGISTRY.map((item) => item.id)).toEqual([
+      'auth',
+      'achievements',
+      'education',
+      'profiles',
+      'statistics',
+    ]);
     // 枚举口径必须由后缀唯一决定：任何名字不以该后缀结尾的 adapter 都不在门禁范围内
     for (const file of discovered) {
       expect(file.endsWith(POSTGRES_ADAPTER_FILE_SUFFIX)).toBe(true);
