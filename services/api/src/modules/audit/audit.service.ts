@@ -69,6 +69,12 @@ import type { AuditEvent, AuditRepository } from './audit.port';
  * 按主体/资源/时间/结果检索与分页、**拒绝与失败结果的留痕**（需要限流与专用写入通道，避免
  * 未授权请求被放大成写入）、改前/改后快照与理由字段、链式完整性校验与归档留存、
  * 以及其它业务切片向本端口写入各自事件（本切片只写入自身的读取事件）。
+ *
+ * 持久化（本切片新增）：`AUDIT_REPOSITORY` 由 `audit.module.ts` 按是否配置 `DATABASE_URL` 分流
+ * —— 未配置绑定内存基线，配置时绑定延迟建连的 PostgreSQL 实现（`audit_logs`，迁移 `0009`），
+ * 数据库已配置但依赖不就绪时由启动期门禁 fail-closed。仓储端口因此是**异步契约**，
+ * 本 service 的读写都经 `await`；判定顺序（先授权 → 再输入闭集 → 再取数 → 最后写入）
+ * 在异步下同样被测试固定，403/400 时仓储一次都不会被调用。
  */
 @Injectable()
 export class AuditService {
@@ -95,7 +101,7 @@ export class AuditService {
     context: AuditRequestContext,
     query: unknown,
     body: unknown,
-  ): AuditEventView[] {
+  ): Promise<AuditEventView[]> {
     // 事件时间取请求到达时的服务端时钟：客户端没有任何提交时间的入口
     const occurredAt = new Date().toISOString();
 
@@ -107,12 +113,27 @@ export class AuditService {
     assertDeclaredAuditQueryFields(query);
 
     // 3. 只按服务端主体取数；逐条复核读取契约、归属与本人可见标记（绝不外发他人/管理端记录）
-    const views = this.repository
-      .listVisibleByActor(subject.userId)
-      .map((record) => this.toOwnedView(record, subject.userId));
+    return this.readThenRecord(subject, context, occurredAt);
+  }
 
-    // 4. 先读后记：本次请求自身的事件在响应组装之后追加（见类注释的「先读后记」）
-    this.recordSelfAuditRead(subject, context, occurredAt);
+  /**
+   * 「先读后记」的异步实现：仓储端口是异步契约（内存基线与 PostgreSQL 实现同语义）。
+   *
+   * 顺序在**异步**下同样被固定：取数与写入都发生在授权与输入门禁**之后**，
+   * 且写入发生在响应组装（取数结果映射 + 出口校验）之后，因此：
+   * - 403 / 400 时仓储一次都不会被调用（既没有取数，也没有审计写入）；
+   * - 成功响应只反映请求到达前已存在的事件，不会因为本次写入而在同一次响应里漂移。
+   */
+  private async readThenRecord(
+    subject: AuthorizationSubject,
+    context: AuditRequestContext,
+    occurredAt: string,
+  ): Promise<AuditEventView[]> {
+    const records = await this.repository.listVisibleByActor(subject.userId);
+    const views = records.map((record) => this.toOwnedView(record, subject.userId));
+
+    // 先读后记：本次请求自身的事件在响应组装之后追加（见类注释的「先读后记」）
+    await this.recordSelfAuditRead(subject, context, occurredAt);
 
     return views;
   }
@@ -139,11 +160,11 @@ export class AuditService {
    * 写入失败（仓储抛异常或写回记录不合法）→ 500：审计不可用时**不**返回「看起来成功但没有审计」
    * 的响应（fail-closed），也绝不把仓储的内部错误信息外发。
    */
-  private recordSelfAuditRead(
+  private async recordSelfAuditRead(
     subject: AuthorizationSubject,
     context: AuditRequestContext,
     occurredAt: string,
-  ): void {
+  ): Promise<void> {
     const event: AuditEvent = {
       id: randomUUID(),
       actorUserId: subject.userId,
@@ -158,7 +179,7 @@ export class AuditService {
       occurredAt,
     };
 
-    const appended = this.assertStoredAuditEvent(this.repository.append(event));
+    const appended = this.assertStoredAuditEvent(await this.repository.append(event));
     // 写回记录同样要复核归属与可见标记：异常仓储不得借写回把他人/管理端记录写进存储
     this.assertOwnedSelfVisible(appended, subject.userId, '写回');
   }

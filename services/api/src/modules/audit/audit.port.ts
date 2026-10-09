@@ -2,12 +2,20 @@
  * 不可变业务审计记录的**显式持久化端口**与存储侧词汇表
  * （docs/P2-架构与数据设计.md §2「audit | 不可变业务审计记录」，数据字典 §4 `audit_logs`）。
  *
- * 为什么是端口：P5 阶段尚未引入数据库（迁移计划见 `db/migrations/`），但审计切片不能因此
- * 把「进程内 Map」当成生产存储。这里把持久化依赖显式化：
- * - 默认绑定内存基线 `InMemoryAuditRepository`，它如实声明 `persistent = false`、
- *   `productionReady = false`，并在 `NODE_ENV=production` 下**拒绝构造**；
- * - 引入 PostgreSQL（`audit_logs` 表）后只需把 DI 令牌 `AUDIT_REPOSITORY` 换绑到同一接口的
- *   实现，service / controller 无需改动，因此这一迁移步可整步回退。
+ * 为什么是端口：业务切片不能把「进程内 Map」当成生产存储。这里把持久化依赖显式化，并按
+ * **是否配置数据库**分流（与画像 / 成果 / 升学记录 / 会话存储等切片同一口径）：
+ * - 未解析出 `DATABASE_URL`：绑定内存基线 `InMemoryAuditRepository`，它如实声明
+ *   `persistent = false`、`productionReady = false`，并在 `NODE_ENV=production` 下**拒绝构造**；
+ * - 已解析出 `DATABASE_URL`：经 `audit.module.ts` 的 `createAuditRepository` 换绑到
+ *   `audit.postgres-repository.ts` 的 `createLazyPostgresAuditRepository`（**延迟建连**，
+ *   `audit_logs` 表由迁移 `0009` 建立），service / controller 只依赖本接口，因此可整步回退；
+ * - 已解析出 `DATABASE_URL` 但没有 `SQL_CONNECTION_FACTORY`：**抛错**（fail-closed），
+ *   绝不悄悄退回内存审计存储；
+ * - 生产环境（或数据库已配置）的「依赖是否经封存与证据验证」由启动期依赖就绪门禁判定，
+ *   PostgreSQL 实现如实声明 `productionReady = false`，因此在补齐验证证据前启动会被拒绝。
+ *
+ * **异步契约**：读写都返回 Promise。内存基线与 PostgreSQL adapter 同语义，因此两者可以互为替换；
+ * 混用同步端口会掩盖「数据库调用被当成即时返回」的错误，故不保留同步形。
  *
  * 边界事实（可机器判定，见 `audit.controller.spec.ts`）：
  * - 端口**只提供追加与读取**：没有 update / delete / 覆盖写方法，因此「审计删除能力不存在」
@@ -148,7 +156,7 @@ export interface AuditRepositoryCapabilities {
 }
 
 /**
- * 审计仓储端口（**仅追加**）。
+ * 审计仓储端口（**仅追加**，**异步契约**）。
  *
  * 两个方法的语义边界：
  * - `append`：追加一条已由调用方补齐主体/结果/时间戳的服务端记录，返回入库后的记录；
@@ -156,11 +164,19 @@ export interface AuditRepositoryCapabilities {
  *   写入后没有更新入口，因此「业务 API 删除或改写审计」在类型层面即不可表达；
  * - `listVisibleByActor`：只返回「主体本人 **且** 标记为本人可见」的记录，按追加顺序；
  *   service 仍会逐条复核归属与可见标记（纵深防御：仓储的过滤行为不作为安全边界）。
+ *
+ * 为什么是 Promise：PostgreSQL 实现必须等待数据库往返。内存基线按同一异步契约返回 Promise，
+ * 因此「无数据库」与「有数据库」两条路径可以被同一组 service / controller 用例覆盖。
  */
 export interface AuditRepository {
   readonly capabilities: AuditRepositoryCapabilities;
-  append(event: AuditEvent): AuditEvent;
-  listVisibleByActor(actorUserId: string): readonly AuditEvent[];
+  /** 追加一条已由调用方补齐主体/结果/时间戳的服务端记录；同 ID 冲突必须显式抛错，不得静默覆盖 */
+  append(event: AuditEvent): Promise<AuditEvent>;
+  /**
+   * 只返回「主体本人 **且** 标记为本人可见」的记录，按追加顺序。
+   * 调用方必须是已授权访问该主体资源的服务端代码；归属必须下推进 SQL（他人事件不出库）。
+   */
+  listVisibleByActor(actorUserId: string): Promise<readonly AuditEvent[]>;
 }
 
 /**
@@ -185,24 +201,19 @@ export const AUDIT_REPOSITORY_BACKEND_POSTGRES = 'postgres';
 export const AUDIT_REPOSITORY_STORAGE_ID_DOMAIN = 'uuid';
 
 /**
- * **异步仓储契约**（数据库形状的审计仓储端口，与 `AuditRepository` 同语义）。
+ * **异步仓储契约的历史名称（等价别名）**。
  *
- * 为什么与同步端口并存、而不是把它直接改成异步：同步端口是当前运行时绑定（内存基线，同步返回）。
- * 把它改成 Promise 是**跨模块契约变更**（service / controller 与既有 spec 必须一起改），
- * 只能与「引入经评估的驱动 + 对真实 PostgreSQL 的集成验证」在同一片切片完成。在那之前，
- * 数据库 adapter 按本契约实现并单独验证，运行时绑定一动不动，因此「切换到数据库」与
- * 「回退到内存基线」都仍是可整步执行 / 整步回退的操作。
+ * 引入 PostgreSQL adapter 时（驱动已评估并引入、迁移 `0009` 已建立 `audit_logs`）需要 Promise
+ * 语义，于是 `AuditRepository` 本身改成了异步契约。此别名保留给既有引用（adapter 与离线 spec
+ * 用它标注「我实现的是异步端口」），语义与 `AuditRepository` **完全一致**：它不再是「另一份
+ * 契约」，因此不存在「同步绑定 + 异步实现混用」这种状态。
  *
- * 方法集与同步端口**逐字对应**（`append` / `listVisibleByActor`），签名也逐字对应——
- * 这里没有 `findById` 那种「单条读取」，因此不存在需要额外补主体参数的入口；两者都从入参
- * 取**服务端**主体，数据库实现把归属**下推进 SQL**（`WHERE actor_user_id = $1`）。
- *
- * 实现者（当前只有 `audit.postgres-repository.ts`）必须满足与内存基线**完全相同**的语义
+ * 实现者（当前有两个：内存基线与 `audit.postgres-repository.ts`）必须满足**完全相同**的语义
  * （含「同 ID 重复写入视为服务端缺陷、不得静默覆盖」与「只返回主体本人且标记本人可见的记录」），
- * 并额外守住六条边界：
+ * 数据库实现并额外守住六条边界：
  * 1. **仅追加**：端口只有 `append` 与 `listVisibleByActor`，**没有** update / delete / 覆盖写，
  *    因此「业务 API 删除或改写审计」（docs/P1-权限矩阵.md §4、P2-权限目录与状态机.md §1）
- *    在类型层面即不可表达；数据库实现除主键唯一性外不得引入任何改写路径；
+ *    在类型层面即不可表达；数据库侧另有 `0009` 的触发器在存储层拒绝业务侧改写与删除；
  * 2. **归属只来自服务端**：`actorUserId` 由 service 从服务端会话主体写入，adapter 不生成、
  *    不覆盖归属，并逐条复核「返回记录的归属 === 请求主体 / 请求记录的归属」，不一致即判服务端缺陷；
  * 3. **存储 ID 域**：主体与记录内的 `id` / `requestId` / `resourceId` 必须落在
@@ -218,16 +229,7 @@ export const AUDIT_REPOSITORY_STORAGE_ID_DOMAIN = 'uuid';
  *    payload / 改前改后快照 / 理由 / 完整性字段既不出现在 adapter 的列清单里，
  *    也不进入错误信息；公开视图由 `audit.contract.ts` 的 `toAuditEventView` 逐字段裁剪。
  */
-export interface AsyncAuditRepository {
-  readonly capabilities: AuditRepositoryCapabilities;
-  /** 追加一条已由调用方补齐主体/结果/时间戳的服务端记录；同 ID 冲突必须显式抛错，不得静默覆盖 */
-  append(event: AuditEvent): Promise<AuditEvent>;
-  /**
-   * 只返回「主体本人 **且** 标记为本人可见」的记录，按追加顺序。
-   * 调用方必须是已授权访问该主体资源的服务端代码；归属必须下推进 SQL（他人事件不出库）。
-   */
-  listVisibleByActor(actorUserId: string): Promise<readonly AuditEvent[]>;
-}
+export type AsyncAuditRepository = AuditRepository;
 
 /** DI 令牌：审计仓储（真实实现应委托 `audit_logs` 表） */
 export const AUDIT_REPOSITORY = Symbol('AUDIT_REPOSITORY');

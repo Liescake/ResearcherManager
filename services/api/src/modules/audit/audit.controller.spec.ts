@@ -16,6 +16,7 @@ import { loadEnv } from '../../config/env';
 import { AccessControlModule } from '../access-control/access-control.module';
 import { AuthModule } from '../auth/auth.module';
 import { InMemorySessionStore } from '../auth/session-store.in-memory';
+import { SESSION_STORE } from '../auth/session-subject.port';
 import { RUOYI_AUTHZ_ADAPTER } from '../ruoyi-adapter/ruoyi-adapter.port';
 import type { RuoYiAuthzAdapter } from '../ruoyi-adapter/ruoyi-adapter.port';
 import {
@@ -36,6 +37,7 @@ import {
 import type { AuditEventView } from './audit.contract';
 import { AuditController } from './audit.controller';
 import { InMemoryAuditRepository } from './audit.in-memory-repository';
+import { POSTGRES_AUDIT_REPOSITORY_CAPABILITIES } from './audit.postgres-repository';
 import {
   AUDIT_EVENT_TYPE_VALUES,
   AUDIT_REPOSITORY,
@@ -47,7 +49,8 @@ import {
 } from './audit.port';
 import type { AuditEvent } from './audit.port';
 import { AuditService } from './audit.service';
-import { AuditModule } from './audit.module';
+import { createAuditRepository, AuditModule } from './audit.module';
+import type { SqlConnectionFactory } from '../../db/ports/sql-executor.port';
 
 /**
  * 审计切片（`/me/audit-events`）的真实 HTTP 回归：
@@ -212,7 +215,7 @@ async function startAuditApp(options: { readonly seed?: boolean } = {}): Promise
   await app.listen(0, '127.0.0.1');
   startedApps.push(app);
 
-  const store = app.get(InMemorySessionStore);
+  const store = app.get<InMemorySessionStore>(SESSION_STORE);
   store.seed({
     sessionId: SESSION_STUDENT_1,
     subject: { userId: STUDENT_1, roles: [Role.Student] },
@@ -233,14 +236,17 @@ async function startAuditApp(options: { readonly seed?: boolean } = {}): Promise
     subject: { userId: 'u-unknown-1', roles: ['guest' as Role] },
   });
 
-  const repository = app.get(InMemoryAuditRepository);
+  // 端口是唯一取用点：内存基线不再单独作为 provider（否则会出现「容器里那个实例」与
+  // 「端口上那个实例」两份状态）。因此夹具统一从 AUDIT_REPOSITORY 取当前绑定的实现。
+  const repository = app.get<InMemoryAuditRepository>(AUDIT_REPOSITORY);
   const seeded = buildSeededEvents();
   if (options.seed !== false) {
-    repository.append(seeded.ownProfileUpdate);
-    repository.append(seeded.ownApplication);
-    repository.append(seeded.ownDenied);
-    repository.append(seeded.ownAdminOnly);
-    repository.append(seeded.otherVisible);
+    // 端口的异步契约：夹具写入同样要 await（与 service 调用同语义）
+    await repository.append(seeded.ownProfileUpdate);
+    await repository.append(seeded.ownApplication);
+    await repository.append(seeded.ownDenied);
+    await repository.append(seeded.ownAdminOnly);
+    await repository.append(seeded.otherVisible);
   }
 
   return { app, baseUrl: `${await app.getUrl()}/api/v1`, store, repository, seeded };
@@ -332,13 +338,13 @@ function captureZodError(action: () => void): ZodError | undefined {
 }
 
 /** 存储里「本人读取审计摘要」事件（本切片写入的唯一事件类型），按追加顺序 */
-function readEventsOf(
+async function readEventsOf(
   repository: InMemoryAuditRepository,
   actorUserId: string,
-): readonly AuditEvent[] {
-  return repository
-    .listVisibleByActor(actorUserId)
-    .filter((event) => event.type === AuditEventType.SelfAuditEventsRead);
+): Promise<readonly AuditEvent[]> {
+  // 端口是异步契约：夹具读路径同样 await（与 service 一致）
+  const records = await repository.listVisibleByActor(actorUserId);
+  return records.filter((event) => event.type === AuditEventType.SelfAuditEventsRead);
 }
 
 afterAll(async () => {
@@ -443,7 +449,7 @@ describe('审计切片：成功路径（真实 HTTP + 统一响应信封）', ()
     expect(viewsOf(first.body)).toEqual([]);
 
     // 「读一次审计 = 多一条审计」：空审计的读取同样留痕，但本次响应只反映请求到达前的事件
-    const events = readEventsOf(repository, STUDENT_1);
+    const events = await readEventsOf(repository, STUDENT_1);
     expect(events).toHaveLength(1);
     expect(events[0]?.actorUserId).toBe(STUDENT_1);
 
@@ -459,7 +465,7 @@ describe('审计切片：成功路径（真实 HTTP + 统一响应信封）', ()
 
   it('先读后记：本次响应不含自身事件，下一次读取才可见；既有记录只被追加、从不改写', async () => {
     const { baseUrl, repository, seeded } = await startAuditApp();
-    const before: readonly AuditEvent[] = repository.listVisibleByActor(STUDENT_1);
+    const before: readonly AuditEvent[] = await repository.listVisibleByActor(STUDENT_1);
 
     const first = await call(baseUrl, 'GET', '/me/audit-events', {
       headers: bearer(SESSION_STUDENT_1),
@@ -474,7 +480,7 @@ describe('审计切片：成功路径（真实 HTTP + 统一响应信封）', ()
     expect(firstViews.some((view) => view.type === AuditEventType.SelfAuditEventsRead)).toBe(false);
 
     // 请求结束后存储里多了一条读取事件，且既有三条逐字段不变
-    const afterFirst: readonly AuditEvent[] = repository.listVisibleByActor(STUDENT_1);
+    const afterFirst: readonly AuditEvent[] = await repository.listVisibleByActor(STUDENT_1);
     expect(afterFirst).toHaveLength(before.length + 1);
     expect(afterFirst.slice(0, 3)).toEqual([
       seeded.ownProfileUpdate,
@@ -507,7 +513,7 @@ describe('审计切片：成功路径（真实 HTTP + 统一响应信封）', ()
     const after = new Date().toISOString();
     expect(res.status).toBe(200);
 
-    const events = readEventsOf(repository, STUDENT_1);
+    const events = await readEventsOf(repository, STUDENT_1);
     expect(events).toHaveLength(1);
     const event = events[0];
 
@@ -550,7 +556,7 @@ describe('审计切片：成功路径（真实 HTTP + 统一响应信封）', ()
     });
 
     expect(res.status).toBe(200);
-    const event = readEventsOf(repository, STUDENT_1)[0];
+    const event = (await readEventsOf(repository, STUDENT_1))[0];
     expect(LOOPBACK_HASHES).toContain(event?.ipHash);
     expect(event?.ipHash).not.toBe(hashPeerAddress(FORGED_ADDRESS));
     expect(JSON.stringify(event)).not.toContain(FORGED_ADDRESS);
@@ -572,7 +578,7 @@ describe('审计切片：成功路径（真实 HTTP + 统一响应信封）', ()
     expect(first.body.meta.requestId).toBe(FORGED_REQUEST_ID);
     expect(second.body.meta.requestId).toBe(FORGED_REQUEST_ID);
 
-    const events = readEventsOf(repository, STUDENT_1);
+    const events = await readEventsOf(repository, STUDENT_1);
     expect(events).toHaveLength(2);
     for (const event of events) {
       expect(event.requestId).toMatch(UUID_PATTERN);
@@ -687,7 +693,7 @@ describe('审计切片：越权 403（AuthorizationGuard + 服务端资源判定
 
   it('越权请求不产生写入：存储里没有该主体的审计事件，也没有新增任何记录', async () => {
     const { baseUrl, repository } = await startAuditApp();
-    const before = repository.listVisibleByActor(ADMIN_1);
+    const before = await repository.listVisibleByActor(ADMIN_1);
 
     const res = await call(baseUrl, 'GET', '/me/audit-events', {
       headers: bearer(SESSION_ADMIN_1),
@@ -695,7 +701,7 @@ describe('审计切片：越权 403（AuthorizationGuard + 服务端资源判定
 
     expect(res.status).toBe(403);
     expect(before).toEqual([]);
-    expect(repository.listVisibleByActor(ADMIN_1)).toEqual([]);
+    expect(await repository.listVisibleByActor(ADMIN_1)).toEqual([]);
   });
 });
 
@@ -870,11 +876,11 @@ describe('审计切片：claims 伪造（客户端声明不进入判定、取数
     );
 
     // 写入的主体、网络归属与关联 ID 同样不受伪造头影响
-    const event = readEventsOf(repository, STUDENT_1)[0];
+    const event = (await readEventsOf(repository, STUDENT_1))[0];
     expect(event?.actorUserId).toBe(STUDENT_1);
     expect(LOOPBACK_HASHES).toContain(event?.ipHash);
     expect(event?.requestId).not.toBe(FORGED_REQUEST_ID);
-    expect(readEventsOf(repository, STUDENT_2)).toHaveLength(0);
+    expect(await readEventsOf(repository, STUDENT_2)).toHaveLength(0);
   });
 
   it('伪造头不能拿到他人或仅管理端可见的记录（可见范围只由服务端口径决定）', async () => {
@@ -923,7 +929,7 @@ describe('审计切片：PII 与 fail-closed 500', () => {
     const errorLog = vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startAuditApp();
     const append = vi.spyOn(repository, 'append');
-    repository.append(
+    await repository.append(
       fixtureEvent({
         id: '66666666-6666-4666-8666-666666666666',
         summary: `证件核验记录 ${PII_ID_CARD}`,
@@ -963,7 +969,7 @@ describe('审计切片：PII 与 fail-closed 500', () => {
   it('摘要含疑似密钥：同样 fail-closed 500，且不外发任何摘要', async () => {
     const errorLog = vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startAuditApp();
-    repository.append(
+    await repository.append(
       fixtureEvent({
         id: '77777777-7777-4777-8777-777777777777',
         summary: `凭据变更 ${PII_SECRET}`,
@@ -998,7 +1004,7 @@ describe('审计切片：PII 与 fail-closed 500', () => {
 
     for (const broken of brokenRecords) {
       const { baseUrl, repository } = await startAuditApp({ seed: false });
-      repository.append(broken);
+      await repository.append(broken);
 
       const res = await call(baseUrl, 'GET', '/me/audit-events', {
         headers: bearer(SESSION_STUDENT_1),
@@ -1015,7 +1021,7 @@ describe('审计切片：PII 与 fail-closed 500', () => {
   it('存储记录多出字段（存储与审计契约漂移）→ 500，且不外发多出的字段', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startAuditApp({ seed: false });
-    repository.append({
+    await repository.append({
       ...fixtureEvent({ summary: '提交本人画像更新' }),
       reason: `改前值 ${PII_ID_CARD}`,
     } as AuditEvent);
@@ -1033,7 +1039,7 @@ describe('审计切片：PII 与 fail-closed 500', () => {
   it('仓储返回对象/数组等非记录形态：500，响应不含返回值', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startAuditApp();
-    vi.spyOn(repository, 'listVisibleByActor').mockReturnValue([
+    vi.spyOn(repository, 'listVisibleByActor').mockResolvedValue([
       {
         id: 'u-victim-9',
         name: '张三',
@@ -1057,7 +1063,7 @@ describe('审计切片：PII 与 fail-closed 500', () => {
   it('仓储返回归属不一致的记录（未按主体过滤）→ 500，不把他人记录发给调用方', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository, seeded } = await startAuditApp();
-    vi.spyOn(repository, 'listVisibleByActor').mockReturnValue([seeded.otherVisible]);
+    vi.spyOn(repository, 'listVisibleByActor').mockResolvedValue([seeded.otherVisible]);
 
     const res = await call(baseUrl, 'GET', '/me/audit-events', {
       headers: bearer(SESSION_STUDENT_1),
@@ -1072,7 +1078,7 @@ describe('审计切片：PII 与 fail-closed 500', () => {
   it('仓储返回主体形态非法的记录（自由文本式主体）→ 500，且不外发该主体与摘要', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startAuditApp({ seed: false });
-    vi.spyOn(repository, 'listVisibleByActor').mockReturnValue([
+    vi.spyOn(repository, 'listVisibleByActor').mockResolvedValue([
       { ...fixtureEvent({ summary: '提交本人画像更新' }), actorUserId: '张三' },
     ]);
 
@@ -1089,7 +1095,7 @@ describe('审计切片：PII 与 fail-closed 500', () => {
   it('仓储返回未标记本人可见的记录（过滤失效）→ 500：既不静默放行，也不静默丢弃', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository, seeded } = await startAuditApp();
-    vi.spyOn(repository, 'listVisibleByActor').mockReturnValue([seeded.ownAdminOnly]);
+    vi.spyOn(repository, 'listVisibleByActor').mockResolvedValue([seeded.ownAdminOnly]);
 
     const res = await call(baseUrl, 'GET', '/me/audit-events', {
       headers: bearer(SESSION_STUDENT_1),
@@ -1145,14 +1151,14 @@ describe('审计切片：存储异常（仓端口抛错 → 500，不泄露内�
       expect(content).not.toContain(leaked);
     }
     // 写入失败不改变存储：既有记录数与内容不变，也没有新的读取事件
-    expect(readEventsOf(repository, STUDENT_1)).toHaveLength(0);
-    expect(repository.listVisibleByActor(STUDENT_1)).toHaveLength(3);
+    expect(await readEventsOf(repository, STUDENT_1)).toHaveLength(0);
+    expect(await repository.listVisibleByActor(STUDENT_1)).toHaveLength(3);
   });
 
   it('写入返回被替换的记录（归属变成他人）→ 500，不把替换结果交出去', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository, seeded } = await startAuditApp();
-    vi.spyOn(repository, 'append').mockReturnValue(seeded.otherVisible);
+    vi.spyOn(repository, 'append').mockResolvedValue(seeded.otherVisible);
 
     const res = await call(baseUrl, 'GET', '/me/audit-events', {
       headers: bearer(SESSION_STUDENT_1),
@@ -1167,7 +1173,7 @@ describe('审计切片：存储异常（仓端口抛错 → 500，不泄露内�
   it('写入返回未标记本人可见的记录 → 500（写回同样复核可见标记）', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository, seeded } = await startAuditApp();
-    vi.spyOn(repository, 'append').mockReturnValue(seeded.ownAdminOnly);
+    vi.spyOn(repository, 'append').mockResolvedValue(seeded.ownAdminOnly);
 
     const res = await call(baseUrl, 'GET', '/me/audit-events', {
       headers: bearer(SESSION_STUDENT_1),
@@ -1179,25 +1185,66 @@ describe('审计切片：存储异常（仓端口抛错 → 500，不泄露内�
 });
 
 describe('审计切片：装配边界与纯函数门禁', () => {
-  it('AuditModule 只注册本切片的路由/服务，并把仓储令牌显式绑到内存基线', () => {
+  it('AuditModule 只注册本切片的路由/服务，并把仓储令牌交给按配置分流的工厂', () => {
     const providers = (Reflect.getMetadata('providers', AuditModule) ?? []) as unknown[];
     const controllers = (Reflect.getMetadata('controllers', AuditModule) ?? []) as unknown[];
     const imports = (Reflect.getMetadata('imports', AuditModule) ?? []) as unknown[];
 
     expect(controllers).toEqual([AuditController]);
     expect(providers).toContain(AuditService);
-    expect(providers).toContain(InMemoryAuditRepository);
-    // 换绑持久化实现时只改这一处
-    expect(providers).toContainEqual({
-      provide: AUDIT_REPOSITORY,
-      useExisting: InMemoryAuditRepository,
-    });
+    // 内存基线不再是独立 provider：端口是唯一取用点，否则会出现「容器里那个实例」与
+    // 「端口上那个实例」两份状态（测试往其中一个写、service 却读另一个）
+    expect(providers).not.toContain(InMemoryAuditRepository);
+    const repositoryProvider = providers.find(
+      (provider) =>
+        typeof provider === 'object' &&
+        provider !== null &&
+        (provider as { provide?: unknown }).provide === AUDIT_REPOSITORY,
+    ) as { useFactory?: unknown } | undefined;
+    expect(repositoryProvider).toBeDefined();
+    expect(typeof repositoryProvider?.useFactory).toBe('function');
+    expect(repositoryProvider).not.toHaveProperty('useExisting');
     // 依赖方向：认证（auth）与授权（access-control）各自只经端口/服务暴露
     expect(imports).toContain(AuthModule);
     expect(imports).toContain(AccessControlModule);
   });
 
-  it('内存基线如实声明非持久化/不可用于生产，并在生产环境拒绝构造', () => {
+  it('createAuditRepository 按「是否配置数据库」分流：未配置内存基线、配置则延迟建连的 PostgreSQL 实现', async () => {
+    // 未配置数据库：绑定内存基线（开发/测试行为不变）
+    expect(createAuditRepository(loadEnv({}), undefined)).toBeInstanceOf(InMemoryAuditRepository);
+
+    const configuredEnv = loadEnv({
+      NODE_ENV: 'test',
+      DATABASE_URL: 'postgresql://postgres:postgres@127.0.0.1:5432/researcher_manager_test',
+    });
+    let connects = 0;
+    const factory: SqlConnectionFactory = {
+      capabilities: { backend: 'postgres', persistent: true, productionReady: false },
+      connect: () => {
+        connects += 1;
+        return Promise.reject(new Error('本用例不应建立任何连接'));
+      },
+    };
+
+    const bound = createAuditRepository(configuredEnv, factory);
+    expect(bound).not.toBeInstanceOf(InMemoryAuditRepository);
+    expect(bound.capabilities).toEqual(POSTGRES_AUDIT_REPOSITORY_CAPABILITIES);
+    // 装配阶段（分流 + 工厂构造）一次都不建连：延迟建连由端口自己负责
+    expect(connects).toBe(0);
+
+    // 非存储 ID 域主体在进入 SQL 之前就被拒绝，且**仍然没有建连**
+    await expect(bound.listVisibleByActor('u-student-1')).rejects.toMatchObject({
+      code: 'INVALID_SUBJECT',
+    });
+    expect(connects).toBe(0);
+
+    // 配置了数据库但没有执行器工厂：fail-closed，绝不悄悄退回内存审计存储
+    expect(() => createAuditRepository(configuredEnv, undefined)).toThrow(
+      /SQL_CONNECTION_FACTORY/u,
+    );
+  });
+
+  it('内存基线如实声明非持久化/不可用于生产，并在生产环境拒绝构造', async () => {
     const developmentEnv = loadEnv({});
     const productionEnv = loadEnv({ NODE_ENV: 'production' });
 
@@ -1207,22 +1254,22 @@ describe('审计切片：装配边界与纯函数门禁', () => {
       persistent: false,
       productionReady: false,
     });
-    expect(repository.listVisibleByActor('u-nobody')).toEqual([]);
+    await expect(repository.listVisibleByActor('u-nobody')).resolves.toEqual([]);
     // 不用内存冒充生产存储：生产环境直接拒绝构造
     expect(() => new InMemoryAuditRepository(productionEnv)).toThrow(
       /生产环境禁止使用内存审计仓储/u,
     );
   });
 
-  it('内存基线只做存储自身的完整性约束：主键唯一、仅追加（无改写入口）、记录不可变、按主体与可见性取数', () => {
+  it('内存基线只做存储自身的完整性约束：主键唯一、仅追加（无改写入口）、记录不可变、按主体与可见性取数', async () => {
     const repository = new InMemoryAuditRepository(loadEnv({}));
     const record = fixtureEvent();
-    repository.append(record);
-    repository.append(fixtureEvent({ actorUserId: STUDENT_2 }));
-    repository.append(fixtureEvent({ selfVisible: false }));
+    await repository.append(record);
+    await repository.append(fixtureEvent({ actorUserId: STUDENT_2 }));
+    await repository.append(fixtureEvent({ selfVisible: false }));
 
     // 主键冲突属于服务端缺陷，不得静默覆盖既有审计记录
-    expect(() => repository.append(record)).toThrow(/审计事件 ID 冲突/u);
+    await expect(repository.append(record)).rejects.toThrow(/审计事件 ID 冲突/u);
 
     // 仅追加：端口与实现都没有改写/删除入口（审计删除能力不存在）
     for (const forbidden of ['save', 'update', 'delete', 'remove', 'archive']) {
@@ -1230,17 +1277,17 @@ describe('审计切片：装配边界与纯函数门禁', () => {
     }
 
     // 记录不可变：返回的是冻结副本，调用方无法就地改写已记录的事实
-    const found = repository.listVisibleByActor(STUDENT_1)[0];
+    const found = (await repository.listVisibleByActor(STUDENT_1))[0];
     expect(found).toBeDefined();
     expect(() => {
       (found as { summary: string }).summary = '被改写';
     }).toThrow(TypeError);
-    expect(repository.listVisibleByActor(STUDENT_1)[0]?.summary).toBe(record.summary);
+    expect((await repository.listVisibleByActor(STUDENT_1))[0]?.summary).toBe(record.summary);
 
     // 只按「主体本人 + 本人可见」取数：他人记录与仅管理端可见的记录不在本人摘要里
-    expect(repository.listVisibleByActor(STUDENT_1)).toHaveLength(1);
-    expect(repository.listVisibleByActor(STUDENT_2)).toHaveLength(1);
-    expect(repository.listVisibleByActor('u-nobody')).toEqual([]);
+    expect(await repository.listVisibleByActor(STUDENT_1)).toHaveLength(1);
+    expect(await repository.listVisibleByActor(STUDENT_2)).toHaveLength(1);
+    expect(await repository.listVisibleByActor('u-nobody')).toEqual([]);
   });
 
   it('输出白名单是真正的闭集：多出字段、非法枚举与缺字段即违规（门禁非恒真）', () => {
@@ -1427,6 +1474,7 @@ describe('审计切片：装配边界与纯函数门禁', () => {
       'apiPort',
       'apiPrefix',
       'databaseConfigured',
+      'dependencyGate',
       'nodeEnv',
     ]);
 

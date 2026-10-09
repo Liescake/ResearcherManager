@@ -40,6 +40,9 @@ import {
   PostgresAuditRepositoryError,
   assertAuditViewExclusion,
   assertPostgresAuditRepositoryCapabilities,
+  assertPostgresAuditSubject,
+  createLazyPostgresAuditRepository,
+  createPostgresAuditRepository,
   findAuditViewExclusionLeaks,
 } from './audit.postgres-repository';
 
@@ -47,9 +50,10 @@ import {
  * 不可变业务审计记录的 PostgreSQL 仓储 adapter 的**离线**验收（不连数据库、不引驱动）。
  *
  * 覆盖用户要求的补充安全契约测试与交付边界：
- * - **能力与交付边界**：`persistent = true` / `productionReady = false`（未真实驱动验证前严禁
- *   生产）、列清单与读取契约字段双射、`audit_logs` 尚未转为迁移、adapter 未被装配到
- *   `AuditModule`、不引驱动/ORM、同步端口未被改成异步、内存 provider 未被切换；
+ * - **能力与交付边界**：`persistent = true` / `productionReady = false`（未取得封存证据前严禁
+ *   生产）、列清单与读取契约字段双射、`audit_logs` 已由迁移 `0009` 建出且带存储层仅追加触发器、
+ *   adapter 经 `audit.module.ts` 的工厂按「是否配置数据库」装配（登记为**已绑定切片**）、
+ *   不引驱动/ORM、端口是**单份异步契约**、内存基线同语义且仍无改写入口；
  * - **参数化 SQL 与固定标识符**：值只出现在参数里，SQL 文本只由模块常量构成（语句里没有任何
  *   引号 / 分号 / 注释符，因此不存在字面量注入面）；执行过的 SQL 只含 `INSERT` 与 `SELECT`；
  * - **SQL 注入**：摘要、主体、主键、关联 ID 等所有入口的注入载荷要么只进参数、要么在进入 SQL
@@ -90,7 +94,14 @@ const PORT_PATH = resolve(AUDIT_DIR, 'audit.port.ts');
 const MODULE_PATH = resolve(AUDIT_DIR, 'audit.module.ts');
 const IN_MEMORY_PATH = resolve(AUDIT_DIR, 'audit.in-memory-repository.ts');
 const ADAPTER_CLASS = 'PostgresAuditRepository';
-const ADAPTER_MODULE = 'audit.postgres-repository';
+/**
+ * 类名的**词边界**形态：工厂导出名 `createLazyPostgresAuditRepository` 含类名子串，
+ * 因此「模块是否引用 adapter 类」必须按词边界判定，不能直接 `toContain`。
+ */
+const ADAPTER_CLASS_WORD = /\bPostgresAuditRepository\b/u;
+/** adapter 模块的 import / require 形态（叙述里提到文件名不算引用） */
+const ADAPTER_MODULE_IMPORT =
+  /(?:from\s+['"][^'"]*audit\.postgres-repository['"]|require\(\s*['"][^'"]*audit\.postgres-repository['"]\s*\))/u;
 
 interface RecordedCall {
   readonly sql: string;
@@ -148,6 +159,14 @@ const SUMMARY = '读取本人审计事件摘要';
 const TAMPERED_SUMMARY = '被改写后的审计摘要';
 /** 注入载荷：只允许出现在参数里，绝不允许出现在 SQL 文本或错误信息里 */
 const INJECTION = "x'); DROP TABLE audit_logs; --";
+/**
+ * 摘要形态的注入载荷：**不含** SQL 关键字。
+ *
+ * 摘要现在还要过取值级敏感输出策略（连接串 / SQL 语句片段 / 口令形态一律拒绝），
+ * 因此 `INJECTION`（含 `DROP TABLE`）会在进 SQL 之前就被拒绝 —— 它证明不了「值只进参数」。
+ * 这里改用仍覆盖引号 / 分号 / 注释符三类拼接面、但不触发内容门禁的载荷。
+ */
+const SUMMARY_INJECTION = "x'); -- 拼接面";
 /** 疑似身份证号（PII）：读取契约必须拒绝，且错误信息不得回显 */
 const PII_SUMMARY = '证件 11010119900307123X 待核对';
 /** 疑似密钥（PII）：读取契约必须拒绝，且错误信息不得回显 */
@@ -490,24 +509,51 @@ describe('PostgreSQL 审计仓储：能力声明与交付边界', () => {
     expect(source).toContain('非同名映射');
   });
 
-  it('表名是 audit_logs，且尚未登记在迁移与草案目录中（与 productionReady=false 配对）', () => {
+  it('表名是 audit_logs，且已由迁移 0009 建出（列清单与存储层仅追加触发器都在迁移里）', () => {
     expect(POSTGRES_AUDIT_TABLE).toBe('audit_logs');
     expect(/^[a-z][a-z0-9_]*$/u.test(POSTGRES_AUDIT_TABLE)).toBe(true);
 
-    for (const file of readdirSync(join(REPO_ROOT, 'db', 'migrations'))) {
-      if (!file.endsWith('.sql')) continue;
+    // 建表语句必须真的存在（不是像 bootstrap 那样只在占位清单注释里登记），且只建这一张表
+    const migrationFiles = readdirSync(join(REPO_ROOT, 'db', 'migrations')).filter((file) =>
+      file.endsWith('.sql'),
+    );
+    const declaring = migrationFiles.filter((file) => {
       const sql = readFileSync(join(REPO_ROOT, 'db', 'migrations', file), 'utf8');
-      expect(sql).not.toMatch(/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?audit_logs\b/iu);
+      return /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?audit_logs\b/iu.test(sql);
+    });
+    expect(declaring).toEqual(['0009_audit_logs.sql']);
+
+    const sql = readFileSync(join(REPO_ROOT, 'db', 'migrations', '0009_audit_logs.sql'), 'utf8');
+    // 列清单里的每一列都必须在迁移里有定义（列清单 ↔ schema 单向核对；双向一致由集成测试在
+    // 真实库上按 information_schema 判定）
+    for (const column of POSTGRES_AUDIT_COLUMNS) {
+      expect(sql).toMatch(
+        new RegExp(
+          `\\b${column}\\s+(?:uuid|varchar|smallint|integer|boolean|timestamptz|jsonb)\\b`,
+          'u',
+        ),
+      );
     }
+    // 归属下推的取数路径必须有索引支撑（actor_user_id 前导）
+    expect(sql).toMatch(/CREATE\s+INDEX[\s\S]*?\(\s*actor_user_id/u);
+    // 存储层仅追加：改写 / 删除 / 整表截断都必须由触发器拒绝
+    expect(sql).toMatch(/BEFORE\s+UPDATE\s+OR\s+DELETE\s+ON\s+audit_logs/iu);
+    expect(sql).toMatch(/BEFORE\s+TRUNCATE\s+ON\s+audit_logs/iu);
+
+    // 草案目录里不得出现 audit_logs 的草案（草案永不部署，迁移才是唯一事实）
     for (const file of readdirSync(join(REPO_ROOT, 'db', 'schema-drafts'))) {
       if (!file.endsWith('.sql')) continue;
       const draft = readFileSync(join(REPO_ROOT, 'db', 'schema-drafts', file), 'utf8');
       expect(draft).not.toMatch(/^--\s*target-table:\s*audit_logs\s*$/imu);
     }
 
+    // 建表不等于生产可用：能力声明仍然是「持久但未验证」
     expect(POSTGRES_AUDIT_REPOSITORY_CAPABILITIES.productionReady).toBe(false);
     expect(POSTGRES_AUDIT_REPOSITORY_VERIFICATION_STEPS).toContain(
       'audit-logs-schema-draft-created-and-promoted-to-migration',
+    );
+    expect(POSTGRES_AUDIT_REPOSITORY_VERIFICATION_STEPS).toContain(
+      'append-only-enforced-at-storage-layer',
     );
   });
 
@@ -596,14 +642,11 @@ describe('PostgreSQL 审计仓储：能力声明与交付边界', () => {
     expect(typeof repository.append).toBe('function');
     expect(typeof repository.listVisibleByActor).toBe('function');
 
-    // 同步端口与异步契约都只有「追加 + 按主体取数」两个方法（类型层面的断言）
-    const asSyncPort: AuditRepository = {
-      capabilities: POSTGRES_AUDIT_REPOSITORY_CAPABILITIES,
-      append: (event) => event,
-      listVisibleByActor: () => [],
-    };
+    // 端口只有「追加 + 按主体取数」两个方法（类型层面的断言）：`AuditRepository` 与它的
+    // 等价历史别名 `AsyncAuditRepository` 指向同一份（仅追加的异步）契约
     const asAsyncPort: AsyncAuditRepository = repository;
-    for (const port of [asSyncPort, asAsyncPort] as const) {
+    const asPort: AuditRepository = repository;
+    for (const port of [asAsyncPort, asPort] as const) {
       expect(typeof port.append).toBe('function');
       expect(typeof port.listVisibleByActor).toBe('function');
       for (const forbidden of POSTGRES_AUDIT_FORBIDDEN_METHODS) {
@@ -612,15 +655,20 @@ describe('PostgreSQL 审计仓储：能力声明与交付边界', () => {
     }
   });
 
-  it('实现的是异步仓储契约（Promise 语义），未被绑定为同步端口', async () => {
-    const repository: AsyncAuditRepository = new PostgresAuditRepository(
+  it('实现的是端口的异步契约（Promise 语义）：两个方法都返回 Promise', async () => {
+    const repository: AuditRepository = new PostgresAuditRepository(
       new RecordingExecutor([{ rows: [rowFromEvent(EVENT)], rowCount: 1 }]),
     );
     const appended = repository.append(EVENT);
     expect(appended).toBeInstanceOf(Promise);
     await expect(appended).resolves.toEqual(EVENT);
-    // 同步端口要求同步返回值：返回 Promise 说明实现的确实是并存的异步契约
+    // 返回值是 Promise 而不是记录本身：调用方不可能把「数据库往返」当成即时返回
     expect(appended).not.toEqual(EVENT);
+
+    const { repository: reader } = repoWith({ rows: [rowFromEvent(EVENT)], rowCount: 1 });
+    const listed = reader.listVisibleByActor(ACTOR_ID);
+    expect(listed).toBeInstanceOf(Promise);
+    await expect(listed).resolves.toEqual([EVENT]);
   });
 
   it('adapter 不是 Nest provider：源码不含 @Injectable / @Module / Inject( / @nestjs', () => {
@@ -632,17 +680,19 @@ describe('PostgreSQL 审计仓储：能力声明与交付边界', () => {
     expect(source).not.toContain('APP_ENV');
   });
 
-  it('异步契约与同步端口方法集逐字对应，DI 令牌与同步端口名一字未改', () => {
+  it('端口契约是单份异步契约（别名不再是一份并存契约），DI 令牌与端口名一字未改', () => {
     const source = readFileSync(PORT_PATH, 'utf8');
     expect(source).toContain('export interface AuditRepository {');
-    expect(source).toContain('append(event: AuditEvent): AuditEvent;');
-    expect(source).toContain('listVisibleByActor(actorUserId: string): readonly AuditEvent[];');
-
-    expect(source).toContain('export interface AsyncAuditRepository {');
     expect(source).toContain('append(event: AuditEvent): Promise<AuditEvent>;');
     expect(source).toContain(
       'listVisibleByActor(actorUserId: string): Promise<readonly AuditEvent[]>;',
     );
+    // 异步别名指向同一份契约：不存在「同步绑定 + 异步实现混用」这种状态
+    expect(source).toContain('export type AsyncAuditRepository = AuditRepository;');
+    expect(source).not.toContain('export interface AsyncAuditRepository {');
+    // 端口上没有同步形签名（同步端口会在异步往返被当成即时返回时静默出错）
+    expect(source).not.toContain('append(event: AuditEvent): AuditEvent;');
+    expect(source).not.toContain('listVisibleByActor(actorUserId: string): readonly AuditEvent[];');
     expect(source).toContain('export const AUDIT_REPOSITORY_BACKEND_POSTGRES');
     expect(source).toContain('export const AUDIT_REPOSITORY_STORAGE_ID_DOMAIN');
     expect(source).toContain("export const AUDIT_REPOSITORY = Symbol('AUDIT_REPOSITORY');");
@@ -687,7 +737,7 @@ describe('PostgreSQL 审计仓储：能力声明与交付边界', () => {
     );
   });
 
-  it('工作区依赖里没有 pg / ORM 包', () => {
+  it('工作区依赖里没有未授权的 pg 族 / ORM 包（官方 pg 驱动已授权，仅限驱动层）', () => {
     for (const relative of [join('services', 'api', 'package.json'), 'package.json']) {
       const manifest = JSON.parse(readFileSync(join(REPO_ROOT, relative), 'utf8')) as {
         dependencies?: Record<string, string>;
@@ -699,7 +749,7 @@ describe('PostgreSQL 审计仓储：能力声明与交付边界', () => {
       ];
       for (const name of names) {
         expect(
-          /^(?:pg|pg-pool|pg-promise|postgres|prisma|@prisma\/client|typeorm|kysely|drizzle-orm|sequelize|@mikro-orm\/core)$/u.test(
+          /^(?:pg-pool|pg-native|pg-promise|postgres|slonik|prisma|@prisma\/client|typeorm|kysely|drizzle-orm|drizzle-kit|sequelize|@mikro-orm\/core)$/u.test(
             name,
           ),
         ).toBe(false);
@@ -891,7 +941,7 @@ describe('PostgreSQL 审计仓储：参数化 SQL 与固定标识符', () => {
   });
 
   it('摘要里的注入载荷只进参数：SQL 文本与正常输入逐字节相同', async () => {
-    const poisoned: AuditEvent = { ...EVENT, summary: INJECTION };
+    const poisoned: AuditEvent = { ...EVENT, summary: SUMMARY_INJECTION };
     const clean = repoWith({ rows: [rowFromEvent(EVENT)], rowCount: 1 });
     const dirty = repoWith({ rows: [rowFromEvent(poisoned)], rowCount: 1 });
 
@@ -899,8 +949,9 @@ describe('PostgreSQL 审计仓储：参数化 SQL 与固定标识符', () => {
     await dirty.repository.append(poisoned);
 
     expect(callAt(dirty.executor, 0)?.sql).toBe(callAt(clean.executor, 0)?.sql);
-    expect(callAt(dirty.executor, 0)?.sql).not.toContain('DROP TABLE');
-    expect(parameterAt(callAt(dirty.executor, 0), 'summary')).toBe(INJECTION);
+    expect(callAt(dirty.executor, 0)?.sql).not.toContain('--');
+    expect(callAt(dirty.executor, 0)?.sql).not.toContain("'");
+    expect(parameterAt(callAt(dirty.executor, 0), 'summary')).toBe(SUMMARY_INJECTION);
   });
 
   it('主体不是合法 UUID / 非规范小写形 / 空 UUID 时在进入 SQL 之前就被拒绝，且不访问数据库', async () => {
@@ -940,11 +991,11 @@ describe('PostgreSQL 审计仓储：参数化 SQL 与固定标识符', () => {
   it('SQL 语句里没有任何字面量注入面：无引号 / 无分号 / 无注释符 / 无危险关键字', async () => {
     const quoted: AuditEvent = { ...EVENT, summary: "1' OR '1'='1" };
     const { repository, executor } = repoWith(
-      { rows: [rowFromEvent({ ...EVENT, summary: INJECTION })], rowCount: 1 },
+      { rows: [rowFromEvent({ ...EVENT, summary: SUMMARY_INJECTION })], rowCount: 1 },
       { rows: [rowFromEvent(EVENT)], rowCount: 1 },
       { rows: [rowFromEvent(quoted)], rowCount: 1 },
     );
-    await repository.append({ ...EVENT, summary: INJECTION });
+    await repository.append({ ...EVENT, summary: SUMMARY_INJECTION });
     await repository.listVisibleByActor(ACTOR_ID);
     await repository.append(quoted);
 
@@ -1179,6 +1230,41 @@ describe('PostgreSQL 审计仓储：严格行契约与未知列', () => {
     }
   });
 
+  /**
+   * 与 `/health`、`/runtime-info` 共用的**取值级敏感输出策略**（`common/sensitive-output.ts`）
+   * 在审计摘要上的复用处：连接串与 SQL 语句片段既不能落库（写路径先拒绝、一条 SQL 都不执行），
+   * 也不能经读取路径外发；错误信息只带字段路径，不回显取值。
+   */
+  it('摘要含连接串 / SQL 语句片段：写路径与读路径都拒绝，且不落库、不回显取值', async () => {
+    const hostileSummaries = [
+      '连接 postgresql://rm:secret@127.0.0.1:55432/researcher_manager 失败',
+      'SELECT id, summary FROM audit_logs WHERE actor_user_id = $1',
+      'update audit_logs set self_visible = true',
+    ];
+    for (const summary of hostileSummaries) {
+      // 写路径：INVALID_RECORD，且**一个 SQL 都不执行**（因此不可能落库）
+      const write = repoWith({ rows: [rowFromEvent(EVENT)], rowCount: 1 });
+      const writeError = await captureRepoError(() =>
+        write.repository.append({ ...EVENT, summary }),
+      );
+      expect(writeError.code).toBe('INVALID_RECORD');
+      expectIssueOn(writeError, 'summary');
+      expect(write.executor.calls).toHaveLength(0);
+      expectNoValueLeak(writeError);
+
+      // 读路径：存储层被写坏的记录同样 fail-closed 拒绝，且不外发任何一段原文
+      const read = repoWith({ rows: [rowFromEvent(EVENT, { summary })], rowCount: 1 });
+      const readError = await captureRepoError(() => read.repository.listVisibleByActor(ACTOR_ID));
+      expect(readError.code).toBe('INVALID_ROW');
+      expectIssueOn(readError, 'summary');
+      expectNoValueLeak(readError);
+    }
+
+    // 合法摘要不受影响（门禁不是恒真）
+    const clean = repoWith({ rows: [rowFromEvent(EVENT)], rowCount: 1 });
+    await expect(clean.repository.listVisibleByActor(ACTOR_ID)).resolves.toEqual([EVENT]);
+  });
+
   it('控制字符由读取契约兜底拒绝', async () => {
     const { repository } = repoWith({
       rows: [rowFromEvent(EVENT, { summary: 'bad\u0000summary' })],
@@ -1295,8 +1381,8 @@ describe('PostgreSQL 审计仓储：actor / subject owner 隔离与仅追加', (
 
     // 与内存基线同语义：同 ID 冲突抛错、不得静默覆盖
     const baseline = new InMemoryAuditRepository(loadEnv({}));
-    baseline.append(EVENT);
-    expect(() => baseline.append(EVENT)).toThrow(/审计事件 ID 冲突/u);
+    await baseline.append(EVENT);
+    await expect(baseline.append(EVENT)).rejects.toThrow(/审计事件 ID 冲突/u);
 
     const multi = repoWith({ rows: [rowFromEvent(EVENT), rowFromEvent(EVENT)], rowCount: 2 });
     const multiError = await captureRepoError(() => multi.repository.append(EVENT));
@@ -1405,12 +1491,13 @@ describe('PostgreSQL 审计仓储：actor / subject owner 隔离与仅追加', (
 
   it('与内存基线同语义：只返回「主体本人 且 本人可见」的记录', async () => {
     const baseline = new InMemoryAuditRepository(loadEnv({}));
-    baseline.append(EVENT);
-    baseline.append(ADMIN_ONLY_EVENT);
-    baseline.append({ ...EVENT, id: uuidForIndex(9), actorUserId: OTHER_ACTOR_ID });
+    await baseline.append(EVENT);
+    await baseline.append(ADMIN_ONLY_EVENT);
+    await baseline.append({ ...EVENT, id: uuidForIndex(9), actorUserId: OTHER_ACTOR_ID });
 
-    expect(baseline.listVisibleByActor(ACTOR_ID)).toHaveLength(1);
-    expect(baseline.listVisibleByActor(ACTOR_ID)[0]?.id).toBe(EVENT_ID);
+    expect(await baseline.listVisibleByActor(ACTOR_ID)).toHaveLength(1);
+    const baselineVisible = await baseline.listVisibleByActor(ACTOR_ID);
+    expect(baselineVisible[0]?.id).toBe(EVENT_ID);
 
     // adapter 侧由 SQL 谓词 + 逐条复核共同保证同一结论
     const { repository, executor } = repoWith({ rows: [rowFromEvent(EVENT)], rowCount: 1 });
@@ -1593,56 +1680,128 @@ describe('PostgreSQL 审计仓储：公开视图与失败路径信息卫生', ()
   });
 });
 
-describe('PostgreSQL 审计仓储：未装配、无驱动依赖、与 schema 边界对齐', () => {
-  it('AuditModule 仍只绑定内存基线（本 adapter 未被装配）', () => {
+describe('PostgreSQL 审计仓储：绑定、装配、无驱动依赖与 schema 边界对齐', () => {
+  it('AuditModule 经 createAuditRepository 绑定端口：只引用工厂导出，不引用 adapter 类名', () => {
     const content = readFileSync(MODULE_PATH, 'utf8');
 
-    expect(content).not.toContain(ADAPTER_CLASS);
-    expect(content).not.toContain(ADAPTER_MODULE);
+    // 装配必须经由「按是否配置数据库分流」的工厂：内存基线不再是独立 provider
     expect(content).toContain('InMemoryAuditRepository');
-    expect(content).toContain(
-      '{ provide: AUDIT_REPOSITORY, useExisting: InMemoryAuditRepository }',
+    expect(content).toContain('createLazyPostgresAuditRepository');
+    expect(content).toContain('export function createAuditRepository');
+    expect(content).toContain('{ token: SQL_CONNECTION_FACTORY, optional: true }');
+    expect(content).not.toContain('useExisting');
+    // 绑定只经工厂导出名：类名与 adapter 模块名都不出现在 Module 里
+    // （adapter 不得自带依赖注入元数据，装配只允许发生在 Module 的工厂里）。
+    // 注意：工厂导出名 `createLazyPostgresAuditRepository` **含类名子串**，因此这里必须用
+    // 词边界比对，不能直接 `toContain`（否则会把工厂名误判成类名引用）。
+    expect(content).not.toMatch(/\bPostgresAuditRepository\b/u);
+    // Module 只从 adapter 模块取**工厂导出**（类本体不经 import 进入容器装配）
+    expect(content).toContain("from './audit.postgres-repository'");
+    expect(content).toMatch(
+      /import\s*\{[^}]*createLazyPostgresAuditRepository[^}]*\}\s*from\s*'\.\/audit\.postgres-repository'/u,
     );
   });
 
-  it('持久化登记与数据库模块都不引用本 adapter（端口登记表仍按令牌判定）', () => {
+  it('持久化登记表把本 adapter 登记为「已绑定切片」（令牌 + 工厂导出名与 Module 一致，两组互斥）', async () => {
+    const registry = await import('../../db/persistence/postgres-adapter-registry');
+    const bound = registry.POSTGRES_BOUND_SLICE_REGISTRY.find((item) => item.id === 'audit');
+    expect(bound).toBeDefined();
+    expect(bound?.file).toBe('modules/audit/audit.postgres-repository.ts');
+    expect(bound?.moduleFile).toBe('modules/audit/audit.module.ts');
+    expect(bound?.token).toBe('AUDIT_REPOSITORY');
+    expect(bound?.factoryExport).toBe('createLazyPostgresAuditRepository');
+    expect(bound?.capabilitiesExport).toBe('POSTGRES_AUDIT_REPOSITORY_CAPABILITIES');
+    // 同一个 adapter 不得同时出现在「未装配」与「已绑定」两张登记表里
+    expect(registry.POSTGRES_ADAPTER_REGISTRY.map((item) => item.id)).not.toContain('audit');
+
+    // 登记事实与源文件一致：只改其中一处即 fail-closed（门禁会以
+    // BOUND_SLICE_NOT_REFERENCED_BY_MODULE / BOUND_SLICE_TOKEN_NOT_BOUND_IN_MODULE 拒绝）
+    const moduleSource = readFileSync(MODULE_PATH, 'utf8');
+    expect(moduleSource).toContain(bound?.factoryExport ?? '(missing)');
+    expect(moduleSource).toContain(bound?.token ?? '(missing)');
+
+    // 换绑只发生在 Module 的工厂里：绑定登记表、数据库模块、端口层与 app 装配都不引用 adapter
     for (const relative of [
       join('src', 'db', 'persistence-bindings.ts'),
       join('src', 'db', 'database.module.ts'),
       join('src', 'db', 'ports', 'sql-executor.port.ts'),
       join('src', 'modules', 'audit', 'audit.port.ts'),
       join('src', 'app.module.ts'),
-      join('src', 'startup-assembly.spec.ts'),
     ]) {
       const content = readApiFile(relative);
-      expect(content).not.toContain(ADAPTER_CLASS);
-      expect(content).not.toMatch(
-        /(?:from\s+['"][^'"]*audit\.postgres-repository['"]|require\(\s*['"][^'"]*audit\.postgres-repository['"]\s*\))/u,
-      );
+      expect(content).not.toMatch(ADAPTER_CLASS_WORD);
+      expect(content).not.toMatch(ADAPTER_MODULE_IMPORT);
     }
   });
 
-  it('内存基线仍是同步契约的实现者（本切片不改动它，也不切换内存 provider）', () => {
+  it('内存基线实现的是同一个异步端口（两条路径同语义），且仍然没有改写 / 删除入口', () => {
     const source = readFileSync(IN_MEMORY_PATH, 'utf8');
     expect(source).toContain('implements AuditRepository');
     expect(source).not.toContain(ADAPTER_CLASS);
     expect(source).toContain('persistent: false');
     expect(source).toContain('productionReady: false');
+    // 异步契约：两个方法都返回 Promise（与 adapter 同语义，可互为替换）
+    expect(source).toContain('async append(event: AuditEvent): Promise<AuditEvent> {');
+    expect(source).toContain('async listVisibleByActor(actorUserId: string): Promise<');
     // 内存基线也没有改写 / 删除入口
     for (const forbidden of POSTGRES_AUDIT_FORBIDDEN_METHODS) {
       expect(source).not.toMatch(new RegExp(`\\b${forbidden}\\s*\\(`, 'u'));
     }
   });
 
-  it('同步端口契约未被改成异步（本切片只新增并存的异步契约与后端标识）', () => {
-    const source = readFileSync(PORT_PATH, 'utf8');
-    expect(source).toContain('export interface AuditRepository {');
-    expect(source).toContain('append(event: AuditEvent): AuditEvent;');
-    expect(source).toContain('listVisibleByActor(actorUserId: string): readonly AuditEvent[];');
-    expect(source).toContain('export interface AsyncAuditRepository {');
-    expect(source).toContain('append(event: AuditEvent): Promise<AuditEvent>;');
-    expect(source).toContain('export const AUDIT_REPOSITORY_BACKEND_POSTGRES');
-    expect(source).toContain('export const AUDIT_REPOSITORY_STORAGE_ID_DOMAIN');
+  it('延迟建连工厂：主体域先判（非法主体不建连）、连接被复用、失败不缓存', async () => {
+    let connects = 0;
+    const lazy = createLazyPostgresAuditRepository(async () => {
+      connects += 1;
+      return new RecordingExecutor([
+        { rows: [rowFromEvent(EVENT)], rowCount: 1 },
+        { rows: [rowFromEvent(EVENT)], rowCount: 1 },
+      ]);
+    });
+
+    expect(lazy.capabilities).toEqual(POSTGRES_AUDIT_REPOSITORY_CAPABILITIES);
+    // 装配（构造工厂）阶段不建连：失败留给启动期门禁给出结构化违规
+    expect(connects).toBe(0);
+
+    // 非存储 ID 域主体在解析执行器**之前**就被拒绝，因此仍然一次都没有建连
+    await expect(lazy.listVisibleByActor('u-student-1')).rejects.toMatchObject({
+      code: 'INVALID_SUBJECT',
+    });
+    await expect(lazy.append({ ...EVENT, actorUserId: 'u-student-1' })).rejects.toMatchObject({
+      code: 'INVALID_SUBJECT',
+    });
+    expect(connects).toBe(0);
+
+    // 合法主体：建连一次并被复用（第二次调用不再建连）
+    await expect(lazy.listVisibleByActor(ACTOR_ID)).resolves.toEqual([EVENT]);
+    await expect(lazy.append(EVENT)).resolves.toEqual(EVENT);
+    expect(connects).toBe(1);
+
+    // 连接失败不缓存失败结果：下一次调用会重试，而不是永久失败
+    let attempts = 0;
+    const flaky = createLazyPostgresAuditRepository(async () => {
+      attempts += 1;
+      throw new Error('连接失败');
+    });
+    await expect(flaky.listVisibleByActor(ACTOR_ID)).rejects.toThrow(/连接失败/u);
+    await expect(flaky.listVisibleByActor(ACTOR_ID)).rejects.toThrow(/连接失败/u);
+    expect(attempts).toBe(2);
+  });
+
+  it('DI 工厂 createPostgresAuditRepository 把执行器装成同一异步端口', async () => {
+    const executor = new RecordingExecutor([{ rows: [rowFromEvent(EVENT)], rowCount: 1 }]);
+    const repository = createPostgresAuditRepository(executor);
+    await expect(repository.listVisibleByActor(ACTOR_ID)).resolves.toEqual([EVENT]);
+    expect(executor.calls).toHaveLength(1);
+  });
+
+  it('主体域断言可先于建连执行（供分流点与 service 复用），且不回显主体取值', () => {
+    expect(assertPostgresAuditSubject(ACTOR_ID)).toBe(ACTOR_ID);
+    const error = captureSyncError(() => assertPostgresAuditSubject('u-student-1'));
+    expect(error.code).toBe('INVALID_SUBJECT');
+    expectIssueOn(error, 'actorUserId');
+    expect(error.message).not.toContain('u-student-1');
+    expectNoValueLeak(error);
   });
 
   it('adapter 的公开面覆盖能力、验证清单、列清单与仅追加事实（供上层与运维机器判定）', () => {
@@ -1672,11 +1831,17 @@ describe('PostgreSQL 审计仓储：未装配、无驱动依赖、与 schema 边
     expect(source).toContain('productionReady: false');
     expect(source).toContain('不得声称生产可用');
     // 仅追加：源码里的 SQL 模板只有 INSERT 与 SELECT，没有任何以改写 / 删除语句开头的模板
-    // （注释里描述「禁止改写」的措辞不算语句；`DO UPDATE` 的缺席另由「追加语句没有 DO UPDATE」用例固定）
     expect(source).toContain('const INSERT_SQL = `INSERT INTO');
     expect(source).toContain('const SELECT_VISIBLE_BY_ACTOR_SQL = `SELECT');
     expect(source).toContain('ON CONFLICT (id) DO NOTHING');
     expect(source).not.toMatch(/`(?:UPDATE|DELETE|TRUNCATE|ALTER|DROP|GRANT|COPY)\b/u);
+    // 源码文本本身就是「仅追加」的可机器判定面：改写 / 删除语句的大写关键字不得出现在本文件
+    // 的任何位置——注释里的措辞也一样，否则「源码文本安全」扫描会把注释误读成语句，
+    // 所以文档里一律改写为中文表述（「冲突即改写」子句的缺席另由「追加语句没有 DO UPDATE」
+    // 用例在**执行过的 SQL** 上固定）。
+    // 扫描刻意大小写敏感：公开的禁止集合 `POSTGRES_AUDIT_FORBIDDEN_METHODS` 必须保留小写的
+    // delete / truncate 作为「禁止入口」的公开形状，那属于禁令清单，不是语句。
+    expect(source).not.toMatch(/\b(?:UPDATE|DELETE|TRUNCATE|ALTER|DROP|GRANT|COPY)\b/u);
   });
 
   it('闭集取值全部可往返（本 adapter 不臆造额外收紧）', async () => {

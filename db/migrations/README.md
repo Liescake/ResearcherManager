@@ -15,7 +15,8 @@ db/migrations/
 ├─ 0005_ai_match_records.sql   AI 匹配记录表（本人统计来源表）
 ├─ 0006_sessions.sql           服务端会话表（会话存储切片）
 ├─ 0007_student_profiles.sql   学生画像表（PostgreSQL 画像仓储切片）
-└─ 0008_achievements_constraints.sql  成果表存储层约束补齐（PostgreSQL 成果仓储切片）
+├─ 0008_achievements_constraints.sql  成果表存储层约束补齐（PostgreSQL 成果仓储切片）
+└─ 0009_audit_logs.sql         不可变业务审计表（PostgreSQL 审计仓储切片 · 存储层仅追加）
 ```
 
 `0002`–`0005` 是第一个真实业务持久化切片（本人统计聚合读）所需的四张来源表：每张表都带
@@ -33,6 +34,13 @@ db/migrations/
 蕴含的规则下沉」，不引入应用层语义（内容安全、时间格式）与后续切片的对象（审核留痕、
 `deleted_at`、`users` 外键），也不新增索引（`0004` 的 `(user_id, created_at, id)` 已覆盖
 本人列表与本人统计两条取数路径）。
+
+`0009` 建**不可变业务审计表**：列清单与 `audit.postgres-repository.ts` 的
+`POSTGRES_AUDIT_COLUMNS` 一一对应（11 列），并额外用**触发器**把「只追加」变成数据库自身的
+不变量 —— 业务侧改写 / 删除（含整表截断）在存储层被拒绝（`audit_logs_reject_mutation`），
+因此「审计不可删除」不再只依赖 adapter 缺方法。表里刻意**不**建高敏内容与快照列
+（`payload` / `before` / `after` / `reason`）、请求与网络元数据（明文 IP / 请求头 / 路径 / URL）
+以及链式完整性字段：它们属于后续切片，adapter 的列清单里也没有它们，建了只会得到没有写入方的空列。
 
 ## 命名与顺序
 

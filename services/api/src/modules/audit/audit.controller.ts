@@ -44,14 +44,14 @@ export class AuditController {
   ) {}
 
   @Get()
-  listMyAuditEvents(
+  async listMyAuditEvents(
     @Headers('authorization') authorization: string | undefined,
     @Query() query: unknown,
     @Body() body: unknown,
     @Req() request: unknown,
-  ): AuditEventView[] {
+  ): Promise<AuditEventView[]> {
     return this.audit.listMyAuditEvents(
-      requireSubject(this.sessions, authorization),
+      await requireSubject(this.sessions, authorization),
       toAuditRequestContext(request),
       query,
       body,

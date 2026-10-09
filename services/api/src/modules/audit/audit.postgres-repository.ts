@@ -12,39 +12,44 @@ import {
   AUDIT_REPOSITORY_BACKEND_POSTGRES,
   AUDIT_RESOURCE_TYPE_VALUES,
   AUDIT_RESULT_VALUES,
-  type AsyncAuditRepository,
-  type AuditEvent,
-  type AuditRepositoryCapabilities,
+} from './audit.port';
+import type {
+  AsyncAuditRepository,
+  AuditEvent,
+  AuditRepository,
+  AuditRepositoryCapabilities,
 } from './audit.port';
 
 /**
- * 不可变业务审计记录的 **PostgreSQL 仓储 adapter（未接入运行时）**。
+ * 不可变业务审计记录的 **PostgreSQL 仓储 adapter（已按「是否配置数据库」接入运行时）**。
  *
  * ## 交付边界（本切片刻意不做的事）
- * - **不绑定**到 `AuditModule`：模块仍然只绑定内存基线 `InMemoryAuditRepository`
- *   （provider 列表与 DI 令牌一字未改），运行时行为与本切片之前逐字节一致（有回归断言）；
- * - **不切换内存 provider**：`AUDIT_REPOSITORY` 的运行时绑定、持久化登记表与启动装配都不引用
- *   本文件；换绑属于「启用数据库」那一步，且必须与驱动引入、集成验证一起发生；
+ * - **装配由业务模块的工厂决定**：`AuditModule` 经 `createAuditRepository` 按
+ *   `resolveAppDatabaseConfig` 的分流结果绑定实现 —— 未配置 `DATABASE_URL` 时绑定内存基线
+ *   `InMemoryAuditRepository`，配置时绑定本文件经 `createLazyPostgresAuditRepository`
+ *   构造的实现（**延迟建连**，装配阶段一次都不碰数据库）。adapter 本身仍**不带**任何 Nest
+ *   装饰器：依赖注入元数据只允许出现在 Module 的工厂里；
  * - **不引入** `pg` / Prisma / TypeORM 等驱动或 ORM 依赖：本文件只依赖驱动无关的
- *   `SqlExecutor` 端口（`db/ports/sql-executor.port.ts`），真实执行器由消费方在「启用数据库」
- *   那一步显式提供；
+ *   `SqlExecutor` 端口（`db/ports/sql-executor.port.ts`），真实执行器由 `SQL_CONNECTION_FACTORY`
+ *   在数据库已配置且执行器 attest 事实齐全时提供；
  * - **不声称生产可用**：能力声明固定为 `backend = postgres`、`persistent = true`、
- *   `productionReady = false`。在引入经评估的驱动、完成对真实 PostgreSQL 的集成验证、并把
- *   `audit_logs` 从字段字典落成 schema 草案 → 迁移之前，生产启动会被 `PersistenceBoundaryService`
- *   拒绝（`productionReady !== true` 即违规）。
+ *   `productionReady = false`。`audit_logs` 已由迁移 `0009` 建立（含存储层仅追加触发器），
+ *   真实 PostgreSQL 集成验证也已由 `db/postgres/__tests__/audit-integration.spec.ts` 覆盖；
+ *   但生产准入还要求**封存声明 + 已登记的验证证据**（`persistence/dependency-readiness.ts`），
+ *   且会话主体标识尚未收敛为 UUID，因此在补齐这些证据前，生产启动仍会被
+ *   `PersistenceBoundaryService` / `DependencyReadinessService` 拒绝。
  *
- * ## 为什么先有异步契约
- * 现有 `AuditRepository`（`audit.port.ts`）是同步接口；把运行时端口改成 Promise 是跨模块契约
- * 变更（service / controller / 既有 spec 必须一起改），必须与真实驱动引入在同一片切片完成。
- * 因此本文件实现 `AsyncAuditRepository`（Promise 版，语义与内存基线完全一致），让「SQL 与映射
- * 是否正确」可以在**没有驱动、也没有数据库**的情况下被离线验证。
+ * ## 异步契约
+ * 端口 `AuditRepository` 本身就是异步契约（内存基线与本 adapter 同语义、可互为替换）。
+ * 本文件实现 `AsyncAuditRepository`（`AuditRepository` 的等价历史别名），让「SQL 与映射是否正确」
+ * 可以在**没有驱动、也没有数据库**的情况下被离线验证，并让换绑与回退都是整步操作。
  *
  * ## 与内存基线的语义对应（逐条可核对）
  * | 内存基线 | 本 adapter |
  * |---|---|
  * | `append` 同 ID 冲突抛错（不静默覆盖） | `INSERT … ON CONFLICT (id) DO NOTHING` 无返回行 → `CONFLICT` |
  * | `listVisibleByActor` 只返回「主体本人 且 本人可见」 | `WHERE actor_user_id = $1 AND self_visible = TRUE`（归属与可见性下推）+ 逐条复核 |
- * | 记录不可变（返回冻结副本） | 只追加、无 UPDATE / DELETE 路径；SQL 只含 `INSERT` 与 `SELECT` |
+ * | 记录不可变（返回冻结副本） | 只追加、没有任何改写 / 删除语句的路径；SQL 只含 `INSERT` 与 `SELECT` |
  * | 端口没有改写/删除方法 | adapter 同样没有：`update` / `delete` / `remove` / `save` / `archive` / `upsert` 一个都不存在 |
  *
  * 与内存基线的**唯一刻意差异**：内存基线不做读取契约校验（存储层损坏必须能被出口门禁看见），
@@ -81,11 +86,22 @@ import {
  *    在本文件里都是合法存储内容，但**绝不**写进错误消息与日志；错误消息只带字段路径与违规类型，
  *    避免把归属标识、摘要原文、注入载荷或连接信息写进日志与错误响应。
  *
- * ## 尚未解决 / 已登记的前置（因此 productionReady 恒为 false）
- * `db/migrations/0001_bootstrap.sql` 的业务表占位清单里**有** `audit_logs`，但该表既没有 schema
- * 草案也没有迁移；真实 PostgreSQL 的集成验证（建表、`id` 主键冲突、`actor_user_id` 索引、
- * 按归属取数与排序、**存储层禁止 UPDATE / DELETE**）尚未进行；会话主体 `u-student-1` 形也不在
- * 存储 ID 域内；列名（尤其是字典里的 `action`）与字段字典的关系需要在草案定稿时一次性对齐。
+ * ## 已落地 / 仍未解决（因此 productionReady 恒为 false）
+ * 已落地（都有可机器核对的证据）：
+ * - 官方 `pg` 驱动经评估引入，且只出现在 `db/postgres/` 驱动层（本文件仍只依赖 `SqlExecutor`）；
+ * - `audit_logs` 由迁移 `0009_audit_logs.sql` 建立，列清单与本文件 `POSTGRES_AUDIT_COLUMNS` 一一对应，
+ *   并由**触发器**在存储层拒绝业务侧改写 / 删除（仅追加不再只依赖 adapter 缺方法）；
+ * - 真实 PostgreSQL 集成验证：`db/postgres/__tests__/audit-integration.spec.ts`（建表、追加、
+ *   按归属取数与排序、主键冲突、归属 / 可见性隔离、存储层拒绝改写与删除、模块换绑工厂）；
+ * - 端口已迁移为异步契约（内存基线与本 adapter 同步改）。
+ *
+ * 仍未解决（因此 `productionReady` 必须保持 false）：
+ * - 本实现尚未在依赖就绪登记表里登记**封存声明与验证证据**（`persistence/dependency-readiness.ts`），
+ *   数据库已配置 / 生产环境下启动会被门禁拒绝（这正是要求的 fail-closed 行为）；
+ * - 会话主体 `u-student-1` 形仍不在存储 ID 域内：绑定数据库实现时，非 UUID 主体会被
+ *   `assertPostgresAuditSubject` 在进入 SQL 之前 fail-closed 拒绝；
+ * - 列名（尤其是字典里的 `action`）与字段字典的关系、公开视图裁剪对真实查询的复核仍需随
+ *   会话主体收敛一起完成。
  * 这些都已登记在 `POSTGRES_AUDIT_REPOSITORY_VERIFICATION_STEPS` 里，不能只写声明。
  */
 
@@ -260,20 +276,26 @@ export const POSTGRES_AUDIT_REPOSITORY_CAPABILITIES: AuditRepositoryCapabilities
 });
 
 /**
- * 转成生产可用前必须完成的验证清单（每一项都需要证据，不能只写声明）：
- * 1. 驱动依赖经评估后引入（`docs/P2-开源复用评估.md` 的 Prisma / TypeORM 比较结论）；
+ * 转成生产可用前必须完成的验证清单（每一项都需要证据，不能只写声明）。
+ *
+ * 状态标注（本切片的进展；`productionReady` 仍为 false，因为**前 5 项已落地不等于生产准入**）：
+ * 1. 驱动依赖经评估后引入（`docs/P2-开源复用评估.md` 的 Prisma / TypeORM 比较结论）——**已落地**：
+ *    官方 `pg` 已显式声明且只出现在 `db/postgres/` 驱动层；
  * 2. 对真实 PostgreSQL 的集成测试：建表迁移、`id` 主键冲突、按 `actor_user_id` 取数与排序、
- *    并发重复写入只有一条落库；
- * 3. `audit_logs` 的 schema 草案创建并按 `db/migrations/README.md` 转为迁移并执行验证
- *    （当前 `db/migrations/0001_bootstrap.sql` 只在占位清单注释里提到 `audit_logs`，
- *    没有建表语句；列名需与字段字典一次性对齐，尤其是 `action` 与端口 `type` 的对应关系）；
- * 4. **存储层禁止改写**：对审计表撤销业务角色的 UPDATE / DELETE 权限（或以触发器拒绝），
- *    使「仅追加」不只是 adapter 缺方法，而是数据库也拒绝；
- * 5. `AuditRepository` 端口改为异步：service / controller 与其测试一起改；
- * 6. 会话主体 `actorUserId` 收敛为 UUID（当前基线是 `u-student-1` 这类安全 ID，不满足存储 ID 域）；
+ *    归属 / 可见性隔离、存储层拒绝改写与删除 ——**已落地**：
+ *    `db/postgres/__tests__/audit-integration.spec.ts`（需 `TEST_DATABASE_URL`，未配置时明确 skip）；
+ * 3. `audit_logs` 由迁移 `0009_audit_logs.sql` 建出并执行验证（列名与字段字典一次性对齐，
+ *    含 `action` ↔ 端口 `type` 的对应关系）——**已落地**；
+ * 4. **存储层禁止改写**：审计表用触发器拒绝业务侧的改写 / 删除 / 整表截断
+ *    （`audit_logs_reject_mutation`），使「仅追加」不只是 adapter 缺方法，而是数据库也拒绝——**已落地**；
+ * 5. `AuditRepository` 端口改为异步：service / controller 与其测试一起改——**已落地**；
+ * 6. 会话主体 `actorUserId` 收敛为 UUID（当前基线是 `u-student-1` 这类安全 ID，不满足存储 ID 域）
+ *    ——**未落地**：绑定数据库实现时非 UUID 主体被 `assertPostgresAuditSubject` fail-closed 拒绝；
  * 7. 公开视图裁剪对真实查询复核：确认没有任何内部列（请求头 / IP / 路径 / URL / payload /
- *    快照 / 理由 / 完整性字段）随 SELECT 或错误信息外发；
- * 8. 完成 1–7 后，才允许把 `productionReady` 改为 true，并同步删除能力自检
+ *    快照 / 理由 / 完整性字段）随 SELECT 或错误信息外发 ——**部分落地**（离线用例 + 真库列清单核对），
+ *    仍随第 6 项一起做最终复核；
+ * 8. 在依赖就绪登记表里登记**封存声明与验证证据**（`persistence/dependency-readiness.ts`）——**未落地**；
+ * 9. 完成 6–8 后，才允许把 `productionReady` 改为 true，并同步删除能力自检
  *    （`assertPostgresAuditRepositoryCapabilities` 会拒绝「未验证就声称生产可用」）。
  */
 export const POSTGRES_AUDIT_REPOSITORY_VERIFICATION_STEPS = [
@@ -455,7 +477,7 @@ const INSERT_VALUES = POSTGRES_AUDIT_COLUMNS.map(
  * 追加语句：客户端可控值全部走 `$n`；`ON CONFLICT (id) DO NOTHING` 让**主键冲突显式暴露**
  * （与内存基线 `append` 抛「审计事件 ID 冲突」同语义：事件 ID 由服务端生成，冲突属于服务端缺陷，
  * 不得静默覆盖、也没有任何可覆盖的列）。
- * 刻意**没有** `DO UPDATE`：本端口只提供追加，任何「写入即改写」都会绕过「审计不可变」这一底线。
+ * 刻意**没有**「冲突即改写」子句：本端口只提供追加，任何「写入即改写」都会绕过「审计不可变」这一底线。
  * `RETURNING` 让追加结果可被严格行契约复核（而不是「写完就当成功」）。
  */
 const INSERT_SQL = `INSERT INTO ${TABLE_IDENTIFIER} (
@@ -826,7 +848,8 @@ function assertAppendRoundTrip(requested: AuditEvent, stored: AuditEvent): void 
  *
  * 构造与每次调用都会重新校验执行器（`assertUsableExecutor`）与自身能力声明，因此「执行器被换掉 /
  * 被降级」或「能力声明被改写」都会 fail-closed，而不是静默继续。
- * 本类**不是** Nest provider（不带任何 Nest 装饰器），也未在任何模块中注册。
+ * 本类**不是** Nest provider（不带任何 Nest 装饰器）：它只由 `AuditModule` 的工厂显式构造
+ * （`createAuditRepository` → `createLazyPostgresAuditRepository`）。
  */
 export class PostgresAuditRepository implements AsyncAuditRepository {
   readonly capabilities: AuditRepositoryCapabilities = POSTGRES_AUDIT_REPOSITORY_CAPABILITIES;
@@ -893,7 +916,7 @@ export class PostgresAuditRepository implements AsyncAuditRepository {
    *   不静默覆盖；
    * - 返回行必须能通过严格行契约与读取契约，且**主键、归属与其余列**都必须等于请求写入的记录
    *   （数据库回流出「他人记录」或字段被改写时判服务端缺陷）；
-   * - 本方法**只追加**：没有 `DO UPDATE`、没有第二次写语句，执行器收到的 SQL 只有一条 `INSERT`。
+   * - 本方法**只追加**：没有「冲突即改写」子句、没有第二次写语句，执行器收到的 SQL 只有一条 `INSERT`。
    */
   async append(event: AuditEvent): Promise<AuditEvent> {
     const executor = this.usableExecutor();
@@ -942,4 +965,66 @@ export class PostgresAuditRepository implements AsyncAuditRepository {
     const result = await executor.query(SELECT_VISIBLE_BY_ACTOR_SQL, [ownerId]);
     return this.mapScopedRows(rowsOf(result), ownerId);
   }
+}
+
+/** DI 工厂：把驱动无关的 `SqlExecutor` 装成审计仓储端口实现（本切片的换绑点之一） */
+export function createPostgresAuditRepository(executor: SqlExecutor): AuditRepository {
+  return new PostgresAuditRepository(executor);
+}
+
+/**
+ * 把「主体必须落在存储 ID 域内」变成可**先于建连**执行的断言（供分流点、service 与测试复用）。
+ *
+ * 为什么单独导出：延迟建连的实现必须在解析执行器**之前**判定主体，否则一个非 UUID 的会话主体
+ * （例如会话基线的 `u-student-1`）会先触发一次数据库连接、再在 adapter 里被拒绝 ——
+ * 那既浪费连接，也让「主体域判定发生在任何连接之前」这条性质无法被测试固定。
+ * 错误信息不带主体取值（见 `requireStorageUuid`）。
+ */
+export function assertPostgresAuditSubject(actorUserId: unknown): string {
+  return requireSubject(actorUserId);
+}
+
+/**
+ * 延迟建连的审计仓储：**模块装配阶段不碰数据库**。
+ *
+ * 为什么必须延迟：`SQL_CONNECTION_FACTORY.connect()` 在数据库已配置但执行器未通过 attest 契约时
+ * 会抛错。如果在这里急切建连，启动失败会表现为「模块工厂抛了数据库错」，而不是启动期持久化边界
+ * 给出的**结构化违规**（`SQL_EXECUTOR_VERIFICATION_REQUIRED` / `DECLARATION_NOT_SEALED` 等）；
+ * 依赖就绪门禁也必须能在**任何连接之前**给出 `AUDIT_REPOSITORY[DEPENDENCY_NOT_VERIFIED]`。
+ * 延迟后，判定顺序保持为「配置 → 持久化边界 / 依赖就绪 → 首次真正读库」。
+ *
+ * 连接只在首次读写时建立并被复用；建立失败不缓存失败结果（下一次调用会重试）。
+ * 主体域先判、再建连：非存储 ID 域（非 UUID）的主体不会触发任何数据库连接。
+ */
+export function createLazyPostgresAuditRepository(
+  resolveExecutor: () => Promise<SqlExecutor>,
+  capabilities: AuditRepositoryCapabilities = POSTGRES_AUDIT_REPOSITORY_CAPABILITIES,
+): AuditRepository {
+  assertPostgresAuditRepositoryCapabilities(capabilities);
+
+  let pending: Promise<SqlExecutor> | undefined;
+  const executor = (): Promise<SqlExecutor> => {
+    if (pending === undefined) {
+      pending = resolveExecutor().catch((error: unknown) => {
+        pending = undefined;
+        throw error;
+      });
+    }
+    return pending;
+  };
+
+  return {
+    capabilities,
+    async append(event: AuditEvent): Promise<AuditEvent> {
+      // 主体域先判、再建连：非存储 ID 域的写记录不应该触发任何数据库连接
+      assertPostgresAuditSubject(event.actorUserId);
+      const resolved = await executor();
+      return new PostgresAuditRepository(resolved).append(event);
+    },
+    async listVisibleByActor(actorUserId: string): Promise<readonly AuditEvent[]> {
+      const ownerId = assertPostgresAuditSubject(actorUserId);
+      const resolved = await executor();
+      return new PostgresAuditRepository(resolved).listVisibleByActor(ownerId);
+    },
+  };
 }

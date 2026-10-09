@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { riskFreeText, uuidSchema } from '@rm/shared';
+import { findSensitiveOutput } from '../../common/sensitive-output';
 import {
   AUDIT_EVENT_TYPE_VALUES,
   AUDIT_RESOURCE_TYPE_VALUES,
@@ -27,10 +28,11 @@ import {
  *
  * 读取契约（存储记录离开进程前的最后一道门）：字段类型、三个枚举闭集（事件类型 / 结果 / 资源类型）、
  * ISO 时间戳、UUID 形态的主键与关联 ID、`ipHash` 必须是 sha256 十六进制（明文 IP 视为存储损坏），
- * 外加**免 PII 摘要**（身份证号、长数字标识、疑似密钥一律命中）。任一项违规都属于服务端缺陷：
- * 按 500 处理，**且日志只写字段路径与违规类型、不写取值**，因此即使摘要被写入了身份证号或密钥，
- * 也不会经由本切片的任何响应或日志外发。存储记录的字段集合同样是**闭集**（`.strict()`）：
- * 多出字段说明存储与审计契约已经漂移，宁可 fail-closed 也不静默容忍。
+ * 外加**免 PII 摘要 + 取值级敏感输出策略**（身份证号、长数字标识、疑似密钥、连接串、`键=值`
+ * 口令形态、SQL 语句片段、私钥块与系统路径一律命中，见 `auditSummarySchema`）。任一项违规都属于
+ * 服务端缺陷：按 500 处理，**且日志只写字段路径与违规类型、不写取值**，因此即使摘要被写入了
+ * 身份证号或密钥，也不会经由本切片的任何响应或日志外发。存储记录的字段集合同样是**闭集**
+ * （`.strict()`）：多出字段说明存储与审计契约已经漂移，宁可 fail-closed 也不静默容忍。
  *
  * 输出白名单：对外视图**恰好**是 `AUDIT_EVENT_VIEW_FIELDS` 这些字段，且出口再过一遍 `.strict()`
  * 闭集——多出字段即 500，绝不外发。视图**不含** `actorUserId`（归属）、`requestId`（服务端关联 ID）、
@@ -77,7 +79,33 @@ export const actorIdSchema = z.string().regex(/^[A-Za-z0-9._:@-]{1,64}$/u, '审�
  */
 export const SELF_AUDIT_READ_SUMMARY = '读取本人审计事件摘要';
 
-/** 存储记录读取契约：字段闭集 + 三个枚举闭集 + 时间/标识形态 + 免 PII 摘要 */
+/**
+ * 审计摘要的**存储与输出契约**（事件里唯一可以承载自由文本的字段）。
+ *
+ * 两层叠加，顺序即判定优先级：
+ * 1. `riskFreeText(1, 200)`：长度上界 + 免 PII（身份证号、长数字标识、`token=`/`password:` 形态的
+ *    疑似密钥）—— 与其它切片的自由文本字段同一口径；
+ * 2. **取值级敏感输出策略**：复用运维出口的同一份策略（`common/sensitive-output.ts`，与
+ *    `/health`、`/runtime-info` 共用），因此系统路径、私钥块、连接串、`键=值` 口令形态与
+ *    SQL 语句片段一律被拒绝，**既不会落库、也不会随公开视图外发**。
+ *
+ * 为什么复用同一份策略而不是在本切片另写一套正则：摘要是「事件里唯一可能承载连接串 / SQL /
+ * 口令形态的字段」，若两处各写一套，运维出口放行的取值就可能被写进审计（或反之），
+ * 口径必然漂移。命中时只回传**类别**（`connection-string` / `sql-statement` / …），不回传取值，
+ * 因此校验错误本身不会成为泄漏点。
+ */
+export const auditSummarySchema: z.ZodType<string> = riskFreeText(1, 200, '审计摘要').superRefine(
+  (value, ctx) => {
+    for (const finding of findSensitiveOutput(value)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `审计摘要命中敏感输出策略（${finding.kind}）`,
+      });
+    }
+  },
+);
+
+/** 存储记录读取契约：字段闭集 + 三个枚举闭集 + 时间/标识形态 + 免 PII 摘要 + 敏感输出策略 */
 export const storedAuditEventSchema = z
   .object({
     id: uuidSchema,
@@ -86,7 +114,7 @@ export const storedAuditEventSchema = z
     result: z.enum(AUDIT_RESULT_VALUES),
     resourceType: z.enum(AUDIT_RESOURCE_TYPE_VALUES),
     resourceId: uuidSchema.optional(),
-    summary: riskFreeText(1, 200, '审计摘要'),
+    summary: auditSummarySchema,
     selfVisible: z.boolean(),
     requestId: uuidSchema,
     ipHash: ipHashSchema,
@@ -103,7 +131,7 @@ export const auditEventViewSchema = z
     type: z.enum(AUDIT_EVENT_TYPE_VALUES),
     result: z.enum(AUDIT_RESULT_VALUES),
     resourceType: z.enum(AUDIT_RESOURCE_TYPE_VALUES),
-    summary: riskFreeText(1, 200, '审计摘要'),
+    summary: auditSummarySchema,
     occurredAt: z.string().datetime(),
   })
   .strict();

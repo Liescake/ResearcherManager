@@ -16,6 +16,8 @@ import type { AuditEvent, AuditRepository, AuditRepositoryCapabilities } from '.
  *   「禁止级联删除审计」），因此内存基线也无法提供改写入口；
  * - 入库记录**被冻结**：即使调用方持有同一对象引用也无法就地改写，避免「审计记录可变」；
  * - 不做授权判定、不生成归属/结果/时间戳：这些由 service 从服务端会话与时钟写入；
+ * - **按端口的异步契约返回 Promise**（与 PostgreSQL adapter 逐字段同语义），因此
+ *   「无数据库」与「有数据库」两条路径可以被同一组 service/controller 用例覆盖；
  * - **不做读取契约校验**：存储层损坏（未知枚举、摘要含 PII、明文 IP、多出字段）必须能被出口的
  *   fail-closed 门禁看见，因此基线不代替出口做校验，也不静默修正非法记录；
  *   写入只保证「主键唯一」这一存储自身的完整性约束。
@@ -38,7 +40,7 @@ export class InMemoryAuditRepository implements AuditRepository {
     }
   }
 
-  append(event: AuditEvent): AuditEvent {
+  async append(event: AuditEvent): Promise<AuditEvent> {
     if (this.events.has(event.id)) {
       // 主键冲突属于服务端缺陷（ID 由服务端生成），不得静默覆盖既有审计记录
       throw new Error(`审计事件 ID 冲突: ${event.id}`);
@@ -52,7 +54,7 @@ export class InMemoryAuditRepository implements AuditRepository {
    * 只返回「主体本人 **且** 标记为本人可见」的记录，按追加顺序。
    * 过滤行为**不作为安全边界**：service 仍会逐条复核归属与可见标记（纵深防御）。
    */
-  listVisibleByActor(actorUserId: string): readonly AuditEvent[] {
+  async listVisibleByActor(actorUserId: string): Promise<readonly AuditEvent[]> {
     return [...this.events.values()]
       .filter((record) => record.actorUserId === actorUserId && record.selfVisible)
       .map((record) => freezeEvent(record));
