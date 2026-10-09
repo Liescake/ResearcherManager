@@ -410,12 +410,14 @@ export const FORBIDDEN_EXPORT_QUERY_FIELDS = [
   'fileUrl',
   'fileURL',
   'downloadUrl',
+  'signedUrl',
   'url',
   'path',
   'filePath',
   'storagePath',
   'storageKey',
   'objectKey',
+  'storageHandle',
   'artifactId',
   'fileName',
   'filename',
@@ -447,6 +449,11 @@ export const EXPORT_REQUEST_INPUT_FIELDS = ['resource', 'fields'] as const;
 /**
  * 服务端独占的请求体字段（**禁止客户端提交**）：归属、授权、状态、产物位置与产物句柄
  * 只能来自服务端会话、状态机与产物存储；`resource` / `fields` 之外的任何字段都不被接受。
+ *
+ * 位置类字段刻意列全：`fileUrl` / `downloadUrl` / `signedUrl`（下载签名）/
+ * `storageKey` / `objectKey` / `storageHandle`（对象存储句柄）。它们**即使只被客户端声明**
+ * 也必须以可区分的原因拒绝，而不是落进「未声明字段」——这两类拒绝在安全上等价，
+ * 但前者能明确表达「这是服务端独占的能力引用」。
  */
 export const FORBIDDEN_EXPORT_REQUEST_FIELDS = [
   'id',
@@ -475,12 +482,14 @@ export const FORBIDDEN_EXPORT_REQUEST_FIELDS = [
   'fileUrl',
   'fileURL',
   'downloadUrl',
+  'signedUrl',
   'url',
   'path',
   'filePath',
   'storagePath',
   'storageKey',
   'objectKey',
+  'storageHandle',
   'artifactId',
   'fileName',
   'filename',

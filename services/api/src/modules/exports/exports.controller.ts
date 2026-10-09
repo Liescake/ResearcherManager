@@ -38,21 +38,24 @@ export class ExportsController {
   ) {}
 
   @Get()
-  listMyExportRequests(
+  async listMyExportRequests(
     @Headers('authorization') authorization: string | undefined,
     @Query() query: unknown,
-  ): ExportRequestView[] {
-    return this.exports.listMyExportRequests(requireSubject(this.sessions, authorization), query);
+  ): Promise<ExportRequestView[]> {
+    return this.exports.listMyExportRequests(
+      await requireSubject(this.sessions, authorization),
+      query,
+    );
   }
 
   @Post()
-  createMyExportRequest(
+  async createMyExportRequest(
     @Headers('authorization') authorization: string | undefined,
     @Query() query: unknown,
     @Body() body: unknown,
-  ): ExportRequestView {
+  ): Promise<ExportRequestView> {
     return this.exports.createMyExportRequest(
-      requireSubject(this.sessions, authorization),
+      await requireSubject(this.sessions, authorization),
       query,
       body,
     );

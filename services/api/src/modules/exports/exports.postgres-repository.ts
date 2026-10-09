@@ -19,26 +19,26 @@ import {
 import { EXPORT_ENTRY_STATUS, EXPORT_STATUS_TRANSITIONS } from './exports.state-machine';
 
 /**
- * 导出请求（`export_jobs`）的 **PostgreSQL 仓储 adapter（未接入运行时）**。
+ * 导出请求（`export_jobs`）的 **PostgreSQL 仓储 adapter（已接入运行时）**。
  *
- * ## 交付边界（本切片刻意不做的事）
- * - **不绑定**到 `ExportsModule`：模块仍然只绑定内存基线 `InMemoryExportRepository`
- *   （provider 列表与 DI 令牌一字未改），运行时行为与本切片之前逐字节一致（有回归断言）；
- * - **不切换内存 provider**：`EXPORT_REPOSITORY` 的运行时绑定、持久化登记表与启动装配都不引用
- *   本文件；换绑属于「启用数据库」那一步，且必须与驱动引入、集成验证一起发生；
+ * ## 交付边界
+ * - **已绑定**到 `ExportsModule`：`EXPORT_REPOSITORY` 由 `createExportRepository` 按「是否解析出
+ *   `DATABASE_URL`」分流 —— 未配置走内存基线，配置了走本文件的延迟建连工厂
+ *   （`createLazyPostgresExportRepository`）；已配置却拿不到执行器工厂时抛错（fail-closed）；
+ * - **延迟建连**：装配阶段一次都不碰数据库，因此「数据库已配置但执行器未 attest / 依赖未就绪」
+ *   由启动期门禁给出结构化违规，而不是在这里表现为一个数据库连接错误；
  * - **不引入** `pg` / Prisma / TypeORM 等驱动或 ORM 依赖：本文件只依赖驱动无关的
- *   `SqlExecutor` 端口（`db/ports/sql-executor.port.ts`），真实执行器由消费方在「启用数据库」
- *   那一步显式提供；
+ *   `SqlExecutor` 端口（`db/ports/sql-executor.port.ts`），真实执行器由 `SQL_CONNECTION_FACTORY`
+ *   在驱动层提供；
  * - **不声称生产可用**：能力声明固定为 `backend = postgres`、`persistent = true`、
- *   `productionReady = false`。在引入经评估的驱动、完成对真实 PostgreSQL 的集成验证、并把
- *   `export_jobs` 从字段字典落成 schema 草案 → 迁移之前，生产启动会被 `PersistenceBoundaryService`
- *   拒绝（`productionReady !== true` 即违规）。
+ *   `productionReady = false`。完成 `POSTGRES_EXPORT_REPOSITORY_VERIFICATION_STEPS` 的全部前置、
+ *   并取得封存声明与已登记证据之前，生产启动会被 `PersistenceBoundaryService` 与依赖就绪门禁
+ *   拒绝（`productionReady !== true` / `DEPENDENCY_NOT_VERIFIED` 即违规）。
  *
- * ## 为什么先有异步契约
- * 现有 `ExportRepository`（`exports.port.ts`）是同步接口；把运行时端口改成 Promise 是跨模块契约
- * 变更（service / controller / 既有 spec 必须一起改），必须与真实驱动引入在同一片切片完成。
- * 因此本文件实现 `AsyncExportRepository`（Promise 版，语义与内存基线完全一致），让「SQL 与映射
- * 是否正确」可以在**没有驱动、也没有数据库**的情况下被离线验证。
+ * ## 契约形态
+ * 本文件实现 `AsyncExportRepository`（现在是 `ExportRepository` 的**类型别名**：同步与异步两份
+ * 契约已收敛为一份，见 `exports.port.ts`）。内存基线与本 adapter 因此实现**同一份**签名，
+ * 两条路径的语义由同一组 spec 口径约束，不再存在「同步一份、异步一份」的漂移面。
  *
  * ## 与内存基线的语义对应（逐条可核对）
  * | 内存基线 | 本 adapter |
@@ -100,14 +100,14 @@ import { EXPORT_ENTRY_STATUS, EXPORT_STATUS_TRANSITIONS } from './exports.state-
  *    生产可用」既过不了自检，也过不了 `PersistenceBoundaryService`。
  *
  * ## 尚未解决 / 已登记的前置（因此 productionReady 恒为 false）
- * `db/migrations/0001_bootstrap.sql` 的业务表占位清单里**有** `export_jobs`，但该表既没有 schema
- * 草案也没有迁移；`docs/P2-ER图.md` 的最小字段列表里没有 `artifact_id`（本切片端口需要它承载
- * 产物句柄），`docs/P1-字段级数据字典.md` 把 `fields` / `filters` 标注为 JSON（本 adapter 的行契约
- * 要求驱动把它解析为**字符串数组**，`text[]` 与 `jsonb` 的自然形态都满足）；真实 PostgreSQL 的
- * 集成验证（建表、`id` 主键冲突、按 `requester_id` 取数与排序、并发重复推进只有一次命中、
- * 存储层不产生未授权改写）尚未进行；会话主体 `u-student-1` 形也不在存储 ID 域内；端口早先注释里的
- * 表名 `export_requests` 与占位清单 / ER 图的 `export_jobs` 需要一次性对齐。
- * 这些都已登记在 `POSTGRES_EXPORT_REPOSITORY_VERIFICATION_STEPS` 里，不能只写声明。
+ * 本切片已落地的部分：`export_jobs` 的迁移（`0013_export_jobs.sql`，列与
+ * `POSTGRES_EXPORT_COLUMNS` 逐列一致，含 `artifact_id` 与 `fields text[]`）、运行时可换绑的
+ * 延迟建连工厂、对真实 PostgreSQL 的集成验证（建表、`id` 主键冲突、按 `requester_id` 取数与排序、
+ * 条件写入 0 行、公开视图裁剪）。
+ * **仍然未完成**：会话主体 `u-student-1` 形不在存储 ID 域内（数据库路径对非 UUID 主体
+ * fail-closed）；`productionReady` 的提升还需要封存声明与已登记证据（依赖就绪契约），
+ * 这一点**不是**本 adapter 能自行声称的。
+ * 剩余项都登记在 `POSTGRES_EXPORT_REPOSITORY_VERIFICATION_STEPS` 里，不能只写声明。
  */
 
 /** 表名：与 docs/P2-ER图.md、docs/P1-字段级数据字典.md 与 `db/migrations/0001_bootstrap.sql` 的 `export_jobs` 一致 */
@@ -216,25 +216,21 @@ export const POSTGRES_EXPORT_INTERNAL_COLUMNS = Object.freeze([
 export type PostgresExportInternalColumn = (typeof POSTGRES_EXPORT_INTERNAL_COLUMNS)[number];
 
 /**
- * 高敏列（字典标注「内部 / 高敏感」或可指纹化 / 可据以取回产物）：在本 adapter 的**存储**范围内
- * 是合法内容，因此不裁剪为「不可读」；但**绝不**写进错误消息与日志。
- * 内部列里的产物位置、文件体、内部资源内容与原始错误本 adapter 根本不投影（见上面的内部列清单）。
+ * 高敏列：**归属 + 全部存储侧内部列**（与 `POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS` 同源，
+ * 只少一个 `artifact_id`）。
+ *
+ * 立场是 **fail-closed**：凡**不进入公开视图**的列一律按高敏处理——归属标识、产物位置与文件体
+ * （位置即能力）、文件摘要、内部资源标识与快照、筛选条件、原始错误文本（可能含内部路径与连接
+ * 信息），以及存储侧簿记（有效期 / 下载时间 / 软删除时间 / 幂等键），都**绝不**写进错误消息与日志。
+ *
+ * 它们在**存储**范围内是合法内容，因此不裁剪为「不可读」（本 adapter 根本不投影它们，
+ * 见上面的内部列清单）；这里把内部列**整体**登记为高敏，是为了让「高敏声明覆盖全部内部列」
+ * 成为**可机器校验**的边界（同名 spec 逐列断言），而不是靠人工逐列比对——任何新增的内部列
+ * 都会自动进入本清单，不会被漏登记。
  */
 export const POSTGRES_EXPORT_PII_COLUMNS: readonly string[] = Object.freeze([
   'requester_id',
-  'file_name',
-  'file_path',
-  'download_url',
-  'signed_url',
-  'storage_key',
-  'object_key',
-  'artifact_handle',
-  'content',
-  'resource_snapshot',
-  'filters',
-  'error_message',
-  'failure_reason',
-  'stack_trace',
+  ...POSTGRES_EXPORT_INTERNAL_COLUMNS,
 ]);
 
 /**
@@ -301,39 +297,35 @@ export const POSTGRES_EXPORT_REPOSITORY_CAPABILITIES: ExportRepositoryCapabiliti
 });
 
 /**
- * 转成生产可用前必须完成的验证清单（每一项都需要证据，不能只写声明）：
- * 1. 驱动依赖经评估后引入（`docs/P2-开源复用评估.md` 的 Prisma / TypeORM 比较结论）；
- * 2. 对真实 PostgreSQL 的集成测试：建表迁移、`id` 主键冲突、按 `requester_id` 取数与排序、
- *    **并发重复推进**（两个请求只有一个能命中条件写入）、非法转移不产生写入；
- * 3. `export_jobs` 的 schema 草案创建并按 `db/migrations/README.md` 转为迁移并执行验证
- *    （当前 `db/migrations/0001_bootstrap.sql` 只在占位清单注释里提到 `export_jobs`，没有建表语句）；
- * 4. 列名与字段字典一次性对齐：归属列是 `requester_id`（端口字段 `ownerUserId`），
- *    `artifact_id` 需补入字典与迁移（`docs/P2-ER图.md` 的最小字段列表里没有它），
- *    本文件早先的 `export_requests` 旧名统一为 `export_jobs`；
- * 5. `fields` 列类型与驱动对齐：字典标注 JSON，本 adapter 的行契约要求驱动把它解析为**字符串数组**
- *    （`text[]` 与 `jsonb` 的自然形态都满足），列类型定稿后须复核往返一致与顺序稳定；
- * 6. `ExportRepository` 端口改为异步：service / controller 与其测试一起改；
- * 7. 会话主体 `ownerUserId` 收敛为 UUID（当前基线是 `u-student-1` 这类安全 ID，不满足存储 ID 域）；
- * 8. `save` 的 `TRANSITION_REJECTED` 在 service 层映射为 409 `STATE_TRANSITION_INVALID`
- *    （重复处理是客户端可见冲突，不是服务端缺陷，不得直接冒泡为 500）；
- * 9. 执行器异常（`EXECUTOR_FAILURE`）在 service 层映射为 500，且原始错误文本只由驱动层记录，
- *    不得进入响应与业务日志；
- * 10. 公开视图裁剪对真实查询复核：确认没有任何内部列（文件名 / 路径 / URL / 存储 key / 对象 key /
- *    产物句柄 / 文件体 / 内部资源内容 / 筛选条件 / 原始错误 / 簿记）随 SELECT 或错误信息外发；
- * 11. 完成 1–10 后，才允许把 `productionReady` 改为 true，并同步删除能力自检
- *    （`assertPostgresExportRepositoryCapabilities` 会拒绝「未验证就声称生产可用」）。
+ * **仍未完成**的生产准入前置（每一项都需要证据，不能只写声明）。
+ *
+ * 本切片已经关闭的前置（证据在仓库里，不是声明）：
+ * - 驱动依赖经评估后引入（官方 `pg`，只允许出现在 `db/postgres/` 驱动层）；
+ * - `export_jobs` 落成**迁移** `db/migrations/0013_export_jobs.sql`（列与 `POSTGRES_EXPORT_COLUMNS`
+ *   逐列一致，`uuid` 主键 / 归属、`resource` 与 `status` 闭集 CHECK、`fields text[]`、
+ *   `artifact_id` 与状态自洽的跨字段 CHECK、`(requester_id, created_at, id)` 取数索引）；
+ * - 列名与字段字典对齐（归属列 `requester_id` → 端口字段 `ownerUserId`，只有这一处非同名映射）；
+ * - `fields` 列类型与驱动对齐（`text[]`，往返一致且顺序稳定）；
+ * - `ExportRepository` 端口收敛为**唯一一份异步契约**（service / controller 与其测试同时改）；
+ * - 对真实 PostgreSQL 的集成测试（`db/postgres/__tests__/exports-integration.spec.ts`）：
+ *   建表迁移、`id` 主键冲突、按 `requester_id` 取数与全序、条件写入 0 行、归属不出库；
+ * - 公开视图裁剪对**真实查询**复核（`SELECT` 列表恰好是公开列，内部列一列都不在结果里）；
+ * - 执行器异常收敛为不含原始文本的 `EXECUTOR_FAILURE`，并由统一错误出口映射为 500
+ *   `INTERNAL_ERROR`（原始文本只由驱动层记录）。
+ *
+ * 仍然未完成的三项（因此 `productionReady` 恒为 false）：
+ * 1. 会话主体 `ownerUserId` 收敛为 UUID：当前会话基线是 `u-student-1` 这类安全 ID，
+ *    不满足存储 ID 域，数据库路径对它 fail-closed（`INVALID_SUBJECT`，且在解析执行器之前）；
+ * 2. `save` 的 `TRANSITION_REJECTED` 在 service 层映射为 409 `STATE_TRANSITION_INVALID`：
+ *    正常路径由 service 的状态机门禁先判（已映射 409），但**并发竞态**下 adapter 的条件写入
+ *    0 行会抛 `TRANSITION_REJECTED`，目前会经统一出口冒泡为 500 —— 这一条尚未闭合；
+ * 3. 取得**封存声明 + 已登记验证证据**后，才允许把 `productionReady` 改为 true
+ *    （`assertPostgresExportRepositoryCapabilities` 会拒绝「未验证就声称生产可用」；
+ *    封存与证据由依赖就绪契约判定，不是本 adapter 能自行声称的）。
  */
 export const POSTGRES_EXPORT_REPOSITORY_VERIFICATION_STEPS = [
-  'driver-dependency-evaluated',
-  'integration-tests-against-real-postgres',
-  'export-jobs-schema-draft-created-and-promoted-to-migration',
-  'export-jobs-column-names-aligned-with-field-dictionary',
-  'export-fields-column-type-aligned-with-driver',
-  'export-repository-port-migrated-to-async',
   'session-subject-owner-ids-converged-to-uuid',
   'state-transition-rejection-mapped-to-409',
-  'executor-failure-mapped-to-500-without-raw-text',
-  'public-view-exclusion-verified-against-real-queries',
   'production-ready-capability-flipped-with-evidence',
 ] as const;
 
@@ -801,8 +793,13 @@ function requireStorageUuid(
   return value;
 }
 
-/** 服务端主体：会话解析值，非法即服务端缺陷（不得静默按「查不到」处理） */
-function requireSubject(ownerUserId: unknown): string {
+/**
+ * 服务端主体：会话解析值，非法即服务端缺陷（不得静默按「查不到」处理）。
+ *
+ * 导出为公开的**存储 ID 域断言**，供延迟建连工厂在**解析执行器之前**调用：
+ * 非 UUID 主体既不进 SQL，也不触发任何数据库连接。
+ */
+export function assertPostgresExportSubject(ownerUserId: unknown): string {
   return requireStorageUuid(
     ownerUserId,
     'INVALID_SUBJECT',
@@ -1042,7 +1039,9 @@ function assertWriteRoundTrip(requested: ExportRequest, stored: ExportRequest): 
  *
  * 构造与每次调用都会重新校验执行器（`assertUsableExecutor`）与自身能力声明，因此「执行器被换掉 /
  * 被降级」或「能力声明被改写」都会 fail-closed，而不是静默继续。
- * 本类**不是** Nest provider（不带任何 Nest 装饰器），也未在任何模块中注册。
+ * 本类**不是** Nest provider（不带任何 Nest 装饰器）：容器里绑定的是
+ * `createLazyPostgresExportRepository` 返回的延迟建连包装，本类只承载「拿到执行器之后」的
+ * SQL 与行映射语义，因而可以在没有驱动、也没有数据库的情况下被离线验证。
  */
 export class PostgresExportRepository implements AsyncExportRepository {
   readonly capabilities: ExportRepositoryCapabilities = POSTGRES_EXPORT_REPOSITORY_CAPABILITIES;
@@ -1228,9 +1227,61 @@ export class PostgresExportRepository implements AsyncExportRepository {
    */
   async listByOwnerId(ownerUserId: string): Promise<readonly ExportRequest[]> {
     const executor = this.usableExecutor();
-    const ownerId = requireSubject(ownerUserId);
+    const ownerId = assertPostgresExportSubject(ownerUserId);
 
     const rows = await runQuery(executor, SELECT_BY_OWNER_SQL, [ownerId]);
     return this.mapScopedRows(rows, ownerId);
   }
+}
+
+/**
+ * **延迟建连**的 PostgreSQL 导出仓储：模块换绑工厂（`createExportRepository`）返回的实现。
+ *
+ * 为什么必须延迟：装配阶段（`NestFactory.create()`）**一次都不能碰数据库**。否则
+ * 「数据库已配置但 SQL 执行器未 attest / 依赖未就绪」就会在这里表现为一个**连接错误**，
+ * 而启动期门禁（`PersistenceBoundaryService` + 依赖就绪契约）就轮不到给出结构化违规。
+ * 本工厂因此只持有 `resolveExecutor`，第一次真正取数时才解析执行器并建连；
+ * 连接结果被缓存，且**失败不缓存**（下一次调用会重新解析，避免一次瞬时故障把端口永久钉死）。
+ *
+ * 判定顺序（与 `listByOwnerId` 同一口径，且被 `exports.binding.spec.ts` 固定）：
+ * 1. 能力自检（未验证的实现不得声称生产可用）；
+ * 2. **存储 ID 域先判**：非 UUID 主体在解析执行器**之前**就被拒绝 —— 既不进 SQL、也不建连；
+ * 3. 解析执行器并构造 `PostgresExportRepository`，由其执行严格行契约与逐列复核。
+ *
+ * 执行器解析失败（例如拿到 fail-closed 的未验证驱动工厂）时，错误**原样抛出**：
+ * 它是基础设施故障，不是业务结论，且其消息由驱动层构造（本文件不追加任何连接信息）。
+ */
+export function createLazyPostgresExportRepository(
+  resolveExecutor: () => Promise<SqlExecutor>,
+  capabilities: ExportRepositoryCapabilities = POSTGRES_EXPORT_REPOSITORY_CAPABILITIES,
+): AsyncExportRepository {
+  assertPostgresExportRepositoryCapabilities(capabilities);
+
+  let pending: Promise<SqlExecutor> | undefined;
+  const executor = (): Promise<SqlExecutor> => {
+    if (pending === undefined) {
+      pending = resolveExecutor().catch((error: unknown) => {
+        pending = undefined;
+        throw error;
+      });
+    }
+    return pending;
+  };
+
+  return {
+    capabilities,
+    async create(request: ExportRequest): Promise<ExportRequest> {
+      // 归属先判、再建连：写入路径的归属同样只来自服务端主体
+      assertPostgresExportSubject(request.ownerUserId);
+      return new PostgresExportRepository(await executor()).create(request);
+    },
+    async save(request: ExportRequest): Promise<ExportRequest> {
+      assertPostgresExportSubject(request.ownerUserId);
+      return new PostgresExportRepository(await executor()).save(request);
+    },
+    async listByOwnerId(ownerUserId: string): Promise<readonly ExportRequest[]> {
+      const ownerId = assertPostgresExportSubject(ownerUserId);
+      return new PostgresExportRepository(await executor()).listByOwnerId(ownerId);
+    },
+  };
 }

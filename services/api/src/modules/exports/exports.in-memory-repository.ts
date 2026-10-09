@@ -36,7 +36,7 @@ export class InMemoryExportRepository implements ExportRepository {
     }
   }
 
-  create(request: ExportRequest): ExportRequest {
+  async create(request: ExportRequest): Promise<ExportRequest> {
     if (this.requests.has(request.id)) {
       // 主键冲突属于服务端缺陷（ID 由服务端生成），不得静默覆盖既有导出请求
       throw new Error(`导出请求 ID 冲突: ${request.id}`);
@@ -45,7 +45,7 @@ export class InMemoryExportRepository implements ExportRepository {
     return copyRequest(request);
   }
 
-  save(request: ExportRequest): ExportRequest {
+  async save(request: ExportRequest): Promise<ExportRequest> {
     const existing = this.requests.get(request.id);
     if (!existing) {
       // 覆盖写入未知 id 说明调用链已错（状态机推进只针对已创建的请求），不得退化成插入
@@ -63,7 +63,7 @@ export class InMemoryExportRepository implements ExportRepository {
    * 只返回该服务端主体名下的记录，按创建顺序。
    * 过滤行为**不作为安全边界**：service 仍会逐条复核归属（纵深防御）。
    */
-  listByOwnerId(ownerUserId: string): readonly ExportRequest[] {
+  async listByOwnerId(ownerUserId: string): Promise<readonly ExportRequest[]> {
     return [...this.requests.values()]
       .filter((record) => record.ownerUserId === ownerUserId)
       .map((record) => copyRequest(record));

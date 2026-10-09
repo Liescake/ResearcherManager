@@ -47,6 +47,7 @@ import {
   assertExportInternalColumnsAbsent,
   assertExportViewExclusion,
   assertPostgresExportRepositoryCapabilities,
+  createLazyPostgresExportRepository,
   exportStatusPredecessors,
   findExportInternalColumnOverlaps,
   findExportViewExclusionLeaks,
@@ -56,9 +57,10 @@ import {
  * 导出请求（`export_jobs`）的 PostgreSQL 仓储 adapter 的**离线**验收（不连数据库、不引驱动）。
  *
  * 覆盖用户要求的补充安全契约测试与交付边界：
- * - **能力与交付边界**：`persistent = true` / `productionReady = false`（未真实驱动验证前严禁
- *   生产）、列清单与读取契约字段双射、`export_jobs` 尚未转为迁移、adapter 未被装配到
- *   `ExportsModule`、不引驱动/ORM、同步端口未被改成异步、内存 provider 未被切换；
+ * - **能力与交付边界**：`persistent = true` / `productionReady = false`（未取得封存声明与已登记
+ *   证据前严禁生产）、列清单与读取契约字段双射、`export_jobs` 已由迁移 `0013` 建出、adapter 已经
+ *   换绑工厂装配到 `ExportsModule`（延迟建连，装配阶段不建连）、不引驱动/ORM、端口只保留一份
+ *   异步契约（同步与异步已收敛）；
  * - **参数化 SQL 与固定标识符**：值只出现在参数里，SQL 文本只由模块常量构成（语句里没有任何
  *   引号 / 分号 / 注释符，因此不存在字面量注入面）；执行过的 SQL 只含 `INSERT` / `UPDATE` / `SELECT`；
  * - **SQL 注入**：归属、主键、资源、字段等所有入口的注入载荷要么只进参数、要么在进入 SQL
@@ -102,7 +104,6 @@ const PORT_PATH = resolve(EXPORTS_DIR, 'exports.port.ts');
 const MODULE_PATH = resolve(EXPORTS_DIR, 'exports.module.ts');
 const IN_MEMORY_PATH = resolve(EXPORTS_DIR, 'exports.in-memory-repository.ts');
 const ADAPTER_CLASS = 'PostgresExportRepository';
-const ADAPTER_MODULE = 'exports.postgres-repository';
 
 interface RecordedCall {
   readonly sql: string;
@@ -451,27 +452,39 @@ describe('PostgreSQL 导出仓储：能力声明与交付边界', () => {
     }
   });
 
-  it('验证清单覆盖「未验证不得生产」的全部前置（含 schema 草案、列名对齐、409 映射与视图复核）', () => {
+  it('验证清单只剩真正未闭合的前置：已闭环的必须从待办移除，且证据在仓库里', () => {
+    // 仍未闭合的三项（因此 productionReady 恒为 false）
     for (const step of [
+      'session-subject-owner-ids-converged-to-uuid',
+      'state-transition-rejection-mapped-to-409',
+      'production-ready-capability-flipped-with-evidence',
+    ]) {
+      expect(POSTGRES_EXPORT_REPOSITORY_VERIFICATION_STEPS).toContain(step);
+    }
+    expect(POSTGRES_EXPORT_REPOSITORY_VERIFICATION_STEPS).toHaveLength(3);
+    // 本切片已经闭环的前置**必须**从「待办」里移除：清单停留在旧状态就是一条假声明
+    for (const delivered of [
       'driver-dependency-evaluated',
       'integration-tests-against-real-postgres',
       'export-jobs-schema-draft-created-and-promoted-to-migration',
       'export-jobs-column-names-aligned-with-field-dictionary',
       'export-fields-column-type-aligned-with-driver',
       'export-repository-port-migrated-to-async',
-      'session-subject-owner-ids-converged-to-uuid',
-      'state-transition-rejection-mapped-to-409',
       'executor-failure-mapped-to-500-without-raw-text',
       'public-view-exclusion-verified-against-real-queries',
-      'production-ready-capability-flipped-with-evidence',
     ]) {
-      expect(POSTGRES_EXPORT_REPOSITORY_VERIFICATION_STEPS).toContain(step);
+      expect(POSTGRES_EXPORT_REPOSITORY_VERIFICATION_STEPS).not.toContain(delivered);
     }
-    expect(POSTGRES_EXPORT_REPOSITORY_VERIFICATION_STEPS).toHaveLength(11);
     // 清单本身不得声称「已生产可用」
     expect([...POSTGRES_EXPORT_REPOSITORY_VERIFICATION_STEPS].join(' ')).not.toContain(
       'production-ready-verified',
     );
+    // 「schema 已落成迁移」这条证据必须真的在磁盘上（不是只在注释里声明）
+    expect(
+      readFileSync(join(REPO_ROOT, 'db', 'migrations', '0013_export_jobs.sql'), 'utf8'),
+    ).toMatch(/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+export_jobs\s*\(/u);
+    // 能力声明仍是「持久但未验证」：清单变短不等于可以声称生产可用
+    expect(POSTGRES_EXPORT_REPOSITORY_CAPABILITIES.productionReady).toBe(false);
   });
 
   it('列清单与读取契约字段构成双射，且只有 requester_id → ownerUserId 一处非同名映射', () => {
@@ -555,6 +568,14 @@ describe('PostgreSQL 导出仓储：能力声明与交付边界', () => {
     ]) {
       expect(POSTGRES_EXPORT_PII_COLUMNS).toContain(column);
     }
+    // 高敏声明必须覆盖**全部**内部列（fail-closed：凡不进入公开视图的列一律按高敏处理）
+    for (const column of ['requester_id', ...POSTGRES_EXPORT_INTERNAL_COLUMNS]) {
+      expect(POSTGRES_EXPORT_PII_COLUMNS).toContain(column);
+    }
+    // 高敏集合与公开视图字段零交集（公开字段绝不能被登记为高敏）
+    for (const field of EXPORT_REQUEST_VIEW_FIELDS) {
+      expect(POSTGRES_EXPORT_PII_COLUMNS).not.toContain(field);
+    }
     // 高敏集合必须整体落在「不进入公开输出」的裁剪集合内（没有任何 PII 列会被投影出去）
     for (const column of POSTGRES_EXPORT_PII_COLUMNS) {
       expect(POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS).toContain(column);
@@ -565,15 +586,35 @@ describe('PostgreSQL 导出仓储：能力声明与交付边界', () => {
     }
   });
 
-  it('表名与 db schema 边界一致：占位清单里有 export_jobs，但既无草案也无迁移', () => {
+  it('表名与 db schema 边界一致：占位清单里的 export_jobs 已由迁移 0013 真实建出', () => {
     expect(POSTGRES_EXPORT_TABLE).toBe('export_jobs');
     const bootstrap = readFileSync(
       join(REPO_ROOT, 'db', 'migrations', '0001_bootstrap.sql'),
       'utf8',
     );
+    // 0001 已应用且不可改写（校验和）：它只把 export_jobs 登记在业务表**占位清单**注释里
     expect(bootstrap).toContain('export_jobs');
     expect(bootstrap).not.toMatch(/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?export_jobs/iu);
 
+    // 表由**迁移 0013** 建出（本切片直接按迁移规范落成，不再需要 schema 草案这一中间物）
+    const migration = readFileSync(
+      join(REPO_ROOT, 'db', 'migrations', '0013_export_jobs.sql'),
+      'utf8',
+    );
+    expect(migration).toMatch(/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+export_jobs\s*\(/u);
+    // 迁移的列清单必须覆盖 adapter 的**每一个**输出列（少了任何一列，读取路径立刻 fail-closed）
+    for (const column of POSTGRES_EXPORT_COLUMNS) {
+      expect(migration).toMatch(new RegExp(`\\b${column}\\b`, 'u'));
+    }
+    // 存储侧内部列（产物位置 / 文件路径 / 下载与签名地址 / 存储 key / 文件体 / 原始错误 / 簿记）
+    // 一律不得被声明成真实列——它们只允许出现在「刻意不建」的说明注释里
+    for (const column of POSTGRES_EXPORT_INTERNAL_COLUMNS) {
+      expect(migration).not.toMatch(
+        new RegExp(`^\\s+${column}\\s+(?:uuid|varchar|text|timestamptz)`, 'mu'),
+      );
+    }
+
+    // 草案目录不参与：迁移已定稿，草案里不得再出现 export_jobs（避免同一张表两份真相）
     const draftDir = join(REPO_ROOT, 'db', 'schema-drafts');
     const drafts = readdirSync(draftDir).filter((entry) => entry.endsWith('.draft.sql'));
     const draftContents = drafts
@@ -581,29 +622,37 @@ describe('PostgreSQL 导出仓储：能力声明与交付边界', () => {
       .join('\n');
     expect(draftContents).not.toContain('export_jobs');
 
-    const migrationFiles = readdirSync(join(REPO_ROOT, 'db', 'migrations')).filter((entry) =>
-      entry.endsWith('.sql'),
-    );
-    const migrationContents = migrationFiles
-      .map((entry) => readFileSync(join(REPO_ROOT, 'db', 'migrations', entry), 'utf8'))
-      .join('\n');
-    expect(migrationContents).not.toMatch(
-      /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?export_jobs/iu,
-    );
+    // 建表语句**只有一份**：不能既在 0013 建、又在别的迁移里重复建
+    const creators = readdirSync(join(REPO_ROOT, 'db', 'migrations'))
+      .filter((entry) => entry.endsWith('.sql'))
+      .filter((entry) =>
+        /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?export_jobs/iu.test(
+          readFileSync(join(REPO_ROOT, 'db', 'migrations', entry), 'utf8'),
+        ),
+      );
+    expect(creators).toEqual(['0013_export_jobs.sql']);
   });
 
-  it('端口已新增并存的异步契约与后端标识，同步端口签名一字未改', () => {
+  it('端口只保留一份异步契约（同步与异步已收敛），并保留后端标识与令牌', () => {
     const source = readFileSync(PORT_PATH, 'utf8');
+    // 唯一一份契约：`ExportRepository` 本身就是异步契约
     expect(source).toContain('export interface ExportRepository {');
-    expect(source).toContain('create(request: ExportRequest): ExportRequest;');
-    expect(source).toContain('save(request: ExportRequest): ExportRequest;');
-    expect(source).toContain('listByOwnerId(ownerUserId: string): readonly ExportRequest[];');
-    expect(source).toContain('export interface AsyncExportRepository {');
     expect(source).toContain('create(request: ExportRequest): Promise<ExportRequest>;');
     expect(source).toContain('save(request: ExportRequest): Promise<ExportRequest>;');
     expect(source).toContain(
       'listByOwnerId(ownerUserId: string): Promise<readonly ExportRequest[]>;',
     );
+    // 历史名保留为**类型别名**（引用不必改名），但绝不允许再出现第二份接口
+    expect(source).toContain('export type AsyncExportRepository = ExportRepository;');
+    expect(source).not.toContain('export interface AsyncExportRepository {');
+    // 同步签名必须彻底消失：收敛后不该残留任何一份「返回非 Promise」的契约
+    for (const syncSignature of [
+      'create(request: ExportRequest): ExportRequest;',
+      'save(request: ExportRequest): ExportRequest;',
+      'listByOwnerId(ownerUserId: string): readonly ExportRequest[];',
+    ]) {
+      expect(source).not.toContain(syncSignature);
+    }
     expect(source).toContain('export const EXPORT_REPOSITORY_BACKEND_POSTGRES');
     expect(source).toContain('export const EXPORT_REPOSITORY_STORAGE_ID_DOMAIN');
     expect(source).toContain("export const EXPORT_REPOSITORY = Symbol('EXPORT_REPOSITORY');");
@@ -1616,40 +1665,43 @@ describe('PostgreSQL 导出仓储：公开视图与失败路径信息卫生', ()
   });
 });
 
-describe('PostgreSQL 导出仓储：未装配、无驱动依赖、与 schema 边界对齐', () => {
-  it('ExportsModule 仍只绑定内存基线（本 adapter 未被装配）', () => {
+describe('PostgreSQL 导出仓储：已装配、无驱动依赖、与 schema 边界对齐', () => {
+  it('ExportsModule 通过换绑工厂装配本 adapter（不再是「只绑内存基线」）', () => {
     const content = readFileSync(MODULE_PATH, 'utf8');
 
-    expect(content).not.toContain(ADAPTER_CLASS);
-    expect(content).not.toContain(ADAPTER_MODULE);
+    // 模块引用的是**工厂导出名**（延迟建连），而不是 adapter 类名：
+    // 装配阶段一次都不碰数据库，准入判定留给启动期门禁
+    expect(content).toContain('createLazyPostgresExportRepository');
+    expect(content).toContain('resolveAppDatabaseConfig');
+    expect(content).toContain('SQL_CONNECTION_FACTORY');
+    // 内存实现仍是「未配置数据库」分支，但**不再是 provider**（否则容器里会出现两份状态）
     expect(content).toContain('InMemoryExportRepository');
-    expect(content).toContain(
-      '{ provide: EXPORT_REPOSITORY, useExisting: InMemoryExportRepository }',
-    );
+    expect(content).not.toContain('useExisting: InMemoryExportRepository');
+    // adapter 类名不进模块（模块只能经工厂导出名换绑，不能绕过能力自检直接 new）
+    expect(content).not.toContain(`new ${ADAPTER_CLASS}`);
   });
 
-  it('持久化登记与数据库模块都不引用本 adapter（端口登记表仍按令牌判定）', () => {
+  it('adapter 与 port 都不直接引驱动：驱动只允许出现在 db/postgres 驱动层', () => {
     for (const relative of [
-      join('src', 'db', 'persistence-bindings.ts'),
-      join('src', 'db', 'database.module.ts'),
-      join('src', 'db', 'ports', 'sql-executor.port.ts'),
+      join('src', 'modules', 'exports', 'exports.postgres-repository.ts'),
+      join('src', 'modules', 'exports', 'exports.module.ts'),
       join('src', 'modules', 'exports', 'exports.port.ts'),
-      join('src', 'app.module.ts'),
-      join('src', 'startup-assembly.spec.ts'),
+      join('src', 'modules', 'exports', 'exports.in-memory-repository.ts'),
     ]) {
-      const content = readApiFile(relative);
-      expect(content).not.toContain(ADAPTER_CLASS);
-      expect(content).not.toMatch(
-        /(?:from\s+['"][^'"]*exports\.postgres-repository['"]|require\(\s*['"][^'"]*exports\.postgres-repository['"]\s*\))/u,
-      );
+      const source = readApiFile(relative);
+      const specifiers = moduleSpecifiersOf(source);
+      for (const forbidden of ['pg', 'pg-pool', 'pg-promise', 'postgres', 'slonik']) {
+        expect(specifiers).not.toContain(forbidden);
+      }
     }
-    // 登记表里导出端口仍按令牌登记，且没有把 adapter 类名写进任何绑定
+    // 持久化登记表里导出端口仍按令牌登记，且没有把 adapter 类名写进任何绑定
     const bindings = readApiFile(join('src', 'db', 'persistence-bindings.ts'));
     expect(bindings).toContain('EXPORT_REPOSITORY');
     expect(bindings).toContain('EXPORT_ARTIFACT_STORE');
+    expect(bindings).not.toContain(ADAPTER_CLASS);
   });
 
-  it('内存基线仍是同步契约的实现者（本切片不改动它，也不切换内存 provider）', () => {
+  it('内存基线实现**同一份**异步契约，且如实声明非持久 / 不可用于生产', () => {
     const source = readFileSync(IN_MEMORY_PATH, 'utf8');
     expect(source).toContain('implements ExportRepository');
     expect(source).not.toContain(ADAPTER_CLASS);
@@ -1659,7 +1711,15 @@ describe('PostgreSQL 导出仓储：未装配、无驱动依赖、与 schema 边
     for (const forbidden of POSTGRES_EXPORT_FORBIDDEN_METHODS) {
       expect(source).not.toMatch(new RegExp(`\\b${forbidden}\\s*\\(`, 'u'));
     }
-    // 同步端口的实现者仍是内存基线（本切片只新增并存的异步契约，不改动它）
+    // 三个方法都是异步签名：与端口收敛后的唯一契约逐字一致
+    for (const signature of [
+      'async create(request: ExportRequest): Promise<ExportRequest>',
+      'async save(request: ExportRequest): Promise<ExportRequest>',
+      'async listByOwnerId(ownerUserId: string): Promise<readonly ExportRequest[]>',
+    ]) {
+      expect(source).toContain(signature);
+    }
+
     const memory: ExportRepository = new InMemoryExportRepository({
       NODE_ENV: 'test',
     } as unknown as ConstructorParameters<typeof InMemoryExportRepository>[0]);
@@ -1670,19 +1730,39 @@ describe('PostgreSQL 导出仓储：未装配、无驱动依赖、与 schema 边
     });
   });
 
-  it('同步端口契约未被改成异步（本切片只新增并存的异步契约与后端标识）', () => {
-    const source = readFileSync(PORT_PATH, 'utf8');
-    const syncPort = source.slice(
-      source.indexOf('export interface ExportRepository {'),
-      source.indexOf('export interface AsyncExportRepository {'),
-    );
-    expect(syncPort).not.toMatch(/\b(?:create|save|listByOwnerId)\s*\([^)]*\)\s*:\s*Promise/u);
-    const asyncPort = source.slice(source.indexOf('export interface AsyncExportRepository {'));
-    expect(asyncPort).toContain('create(request: ExportRequest): Promise<ExportRequest>;');
-    expect(asyncPort).toContain('save(request: ExportRequest): Promise<ExportRequest>;');
-    expect(asyncPort).toContain(
-      'listByOwnerId(ownerUserId: string): Promise<readonly ExportRequest[]>;',
-    );
+  it('延迟建连工厂是本切片的换绑点：导出它、且构造时不解析执行器', async () => {
+    const source = readFileSync(ADAPTER_PATH, 'utf8');
+    expect(source).toContain('export function createLazyPostgresExportRepository');
+    expect(source).toContain('export function assertPostgresExportSubject');
+
+    // 类型层面的契约对应：延迟包装同样满足端口契约，能力声明与冻结常量一致
+    let resolves = 0;
+    const lazy: AsyncExportRepository = createLazyPostgresExportRepository(() => {
+      resolves += 1;
+      return Promise.resolve(undefined as unknown as SqlExecutor);
+    });
+    expect(lazy.capabilities).toEqual(POSTGRES_EXPORT_REPOSITORY_CAPABILITIES);
+    expect(resolves).toBe(0);
+
+    // 非 UUID 主体在**解析执行器之前**就被拒绝：既不进 SQL，也不建连
+    await expect(lazy.listByOwnerId('u-student-1')).rejects.toMatchObject({
+      code: 'INVALID_SUBJECT',
+    });
+    expect(resolves).toBe(0);
+
+    // 主体域断言同样拦住写入路径（归属只能来自服务端会话主体）
+    const pendingRecord = {
+      id: '11111111-1111-4111-8111-111111111111',
+      ownerUserId: 'u-student-1',
+      resource: ExportResource.Profile,
+      fields: ['title'],
+      status: ExportStatus.Pending,
+      createdAt: '2026-10-10T00:00:00.000Z',
+      updatedAt: '2026-10-10T00:00:00.000Z',
+    } satisfies ExportRequest;
+    await expect(lazy.create(pendingRecord)).rejects.toMatchObject({ code: 'INVALID_SUBJECT' });
+    await expect(lazy.save(pendingRecord)).rejects.toMatchObject({ code: 'INVALID_SUBJECT' });
+    expect(resolves).toBe(0);
   });
 
   it('adapter 的公开面覆盖能力、验证清单、列清单、内部列与裁剪事实（供上层与运维机器判定）', () => {
@@ -1760,7 +1840,7 @@ describe('PostgreSQL 导出仓储：未装配、无驱动依赖、与 schema 边
     );
   });
 
-  it('工作区依赖里没有 pg / ORM 包', () => {
+  it('工作区依赖里没有未授权的 pg 族 / ORM 包（官方 pg 驱动已授权，仅限驱动层）', () => {
     for (const relative of [join('services', 'api', 'package.json'), 'package.json']) {
       const manifest = JSON.parse(readFileSync(join(REPO_ROOT, relative), 'utf8')) as {
         dependencies?: Record<string, string>;
@@ -1772,7 +1852,7 @@ describe('PostgreSQL 导出仓储：未装配、无驱动依赖、与 schema 边
       ];
       for (const name of names) {
         expect(
-          /^(?:pg|pg-pool|pg-promise|postgres|prisma|@prisma\/client|typeorm|kysely|drizzle-orm|sequelize|@mikro-orm\/core)$/u.test(
+          /^(?:pg-pool|pg-native|pg-promise|postgres|slonik|prisma|@prisma\/client|typeorm|kysely|drizzle-orm|drizzle-kit|sequelize|@mikro-orm\/core)$/u.test(
             name,
           ),
         ).toBe(false);

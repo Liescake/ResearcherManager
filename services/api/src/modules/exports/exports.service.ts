@@ -83,8 +83,17 @@ export class ExportsService {
     @Inject(EXPORT_ARTIFACT_STORE) private readonly artifacts: ExportArtifactStore,
   ) {}
 
-  /** 本人导出请求列表与状态：先入口授权，再查询串闭集，最后只按服务端主体取数 */
-  listMyExportRequests(subject: AuthorizationSubject, query: unknown): ExportRequestView[] {
+  /**
+   * 本人导出请求列表与状态：先入口授权，再查询串闭集，最后只按服务端主体取数。
+   *
+   * 契约改为异步后的**顺序约束没有变化**：入口授权与查询串闭集都在**任何 `await` 之前**完成，
+   * 因此「未授权主体一次都不会触达仓储」在异步契约下同样成立 —— 拒绝路径上一个 Promise
+   * 都不会被创建，更不会建立任何数据库连接。
+   */
+  async listMyExportRequests(
+    subject: AuthorizationSubject,
+    query: unknown,
+  ): Promise<ExportRequestView[]> {
     // 1. 入口授权先于查询串校验与任何仓储访问（未授权主体拿不到任何字段级反馈）
     this.authorizeEntry(subject);
 
@@ -92,9 +101,8 @@ export class ExportsService {
     assertDeclaredExportQueryFields(query);
 
     // 3. 只按服务端主体取数；逐条复核读取契约与归属（绝不外发他人记录）
-    return this.repository
-      .listByOwnerId(subject.userId)
-      .map((record) => this.toOwnedView(record, subject.userId));
+    const records = await this.repository.listByOwnerId(subject.userId);
+    return records.map((record) => this.toOwnedView(record, subject.userId));
   }
 
   /**
@@ -106,11 +114,11 @@ export class ExportsService {
    * 产物生成失败 → 201 + `failed` 终态；仓储返回非 `pending` → 409。
    * 未授权请求在两个端口上都没有调用记录。
    */
-  createMyExportRequest(
+  async createMyExportRequest(
     subject: AuthorizationSubject,
     query: unknown,
     body: unknown,
-  ): ExportRequestView {
+  ): Promise<ExportRequestView> {
     // 1. 入口授权（服务端常量）先于任何输入校验与任何端口调用
     this.authorizeEntry(subject);
 
@@ -133,7 +141,7 @@ export class ExportsService {
 
     // 7. 入口记录：状态恒为 pending、无产物句柄；此时不得声称导出已生成
     const exportRequestId = randomUUID();
-    const created = this.repository.create({
+    const created = await this.repository.create({
       id: exportRequestId,
       ownerUserId: subject.userId,
       resource: input.resource,
@@ -161,7 +169,7 @@ export class ExportsService {
 
     const outcome = this.materialize(created);
 
-    const saved = this.repository.save({
+    const saved = await this.repository.save({
       ...created,
       status: outcome.status,
       ...(outcome.artifactId !== undefined ? { artifactId: outcome.artifactId } : {}),

@@ -23,6 +23,7 @@ import { loadEnv } from '../../config/env';
 import { AccessControlModule } from '../access-control/access-control.module';
 import { AuthModule } from '../auth/auth.module';
 import { InMemorySessionStore } from '../auth/session-store.in-memory';
+import { SESSION_STORE } from '../auth/session-subject.port';
 import { RUOYI_AUTHZ_ADAPTER } from '../ruoyi-adapter/ruoyi-adapter.port';
 import type { RuoYiAuthzAdapter } from '../ruoyi-adapter/ruoyi-adapter.port';
 import {
@@ -132,6 +133,11 @@ const FORGED_FILE_URL = 'https://files.example.com/exports/secret-export.csv';
 const FORGED_STORAGE_KEY = 's3://internal-bucket/exports/secret-export.csv';
 const FORGED_FILE_NAME = 'secret-export.csv';
 const FORGED_ARTIFACT_ID = '99999999-9999-4999-8999-999999999999';
+/** 伪造的**下载签名**地址：客户端提交它必须被拒，且绝不回显（签名即取件能力） */
+const FORGED_DOWNLOAD_URL =
+  'https://files.example.com/exports/secret-export.csv?X-Amz-Signature=deadbeefcafe&Expires=1999999999';
+/** 伪造的**对象存储句柄**（含桶与凭据式引用）：同样是服务端独占，不得由客户端声明 */
+const FORGED_STORAGE_HANDLE = 'arn:aws:s3:::internal-bucket/exports/secret-export.csv';
 /** 客户端伪造的传输层跟踪 ID：只作为响应 meta，不进入存储 */
 const FORGED_REQUEST_ID = 'client-trace-00000001';
 
@@ -255,7 +261,7 @@ async function startExportsApp(options: { readonly seed?: boolean } = {}): Promi
   await app.listen(0, '127.0.0.1');
   startedApps.push(app);
 
-  const store = app.get(InMemorySessionStore);
+  const store = app.get<InMemorySessionStore>(SESSION_STORE);
   store.seed({
     sessionId: SESSION_STUDENT_1,
     subject: { userId: STUDENT_1, roles: [Role.Student] },
@@ -284,14 +290,16 @@ async function startExportsApp(options: { readonly seed?: boolean } = {}): Promi
     subject: { userId: 'u-unknown-1', roles: ['guest' as Role] },
   });
 
-  const repository = app.get(InMemoryExportRepository);
+  // 换绑后 `InMemoryExportRepository` 不再是 provider：内存实现只能从端口令牌取回
+  // （否则容器里会同时存在一个「被端口使用」与一个「只被测试使用」的实例）
+  const repository = app.get<InMemoryExportRepository>(EXPORT_REPOSITORY);
   const artifacts = app.get(InMemoryExportArtifactStore);
   const seeded = buildSeededExports();
   if (options.seed !== false) {
-    repository.create(seeded.ownPending);
-    repository.create(seeded.ownCompleted);
-    repository.create(seeded.ownFailed);
-    repository.create(seeded.otherCompleted);
+    await repository.create(seeded.ownPending);
+    await repository.create(seeded.ownCompleted);
+    await repository.create(seeded.ownFailed);
+    await repository.create(seeded.otherCompleted);
   }
 
   return { app, baseUrl: `${await app.getUrl()}/api/v1`, store, repository, artifacts, seeded };
@@ -465,7 +473,7 @@ describe('导出切片：成功路径（真实 HTTP + 统一响应信封）', ()
     expectNoStorageLeak(content);
 
     // 存储事实：落库结论是 completed，句柄只存在服务端
-    const stored = app.repository.listByOwnerId(STUDENT_1);
+    const stored = await app.repository.listByOwnerId(STUDENT_1);
     expect(stored).toHaveLength(4);
     const saved = stored[stored.length - 1];
     expect(saved?.id).toBe(view.id);
@@ -519,7 +527,7 @@ describe('导出切片：成功路径（真实 HTTP + 统一响应信封）', ()
 
   it('每次创建都产生新的请求 ID 与新的产物句柄，既有记录从不被改写', async () => {
     const app = await startExportsApp();
-    const before = app.repository.listByOwnerId(STUDENT_1);
+    const before = await app.repository.listByOwnerId(STUDENT_1);
 
     const first = await call(app.baseUrl, 'POST', '/me/exports', {
       headers: bearer(SESSION_STUDENT_1),
@@ -534,7 +542,7 @@ describe('导出切片：成功路径（真实 HTTP + 统一响应信封）', ()
     expect(second.status).toBe(201);
     expect(viewOf(first.body).id).not.toBe(viewOf(second.body).id);
 
-    const after = app.repository.listByOwnerId(STUDENT_1);
+    const after = await app.repository.listByOwnerId(STUDENT_1);
     expect(after).toHaveLength(before.length + 2);
     // 既有夹具逐字段不变（导出请求只追加、结论不被覆盖）
     expect(after.slice(0, before.length)).toEqual([...before]);
@@ -773,7 +781,7 @@ describe('导出切片：越权 403（AuthorizationGuard + 服务端资源判定
 
   it('越权请求不产生写入：存储里没有该主体的任何导出请求', async () => {
     const app = await startExportsApp();
-    const before = app.repository.listByOwnerId(ADMIN_1);
+    const before = await app.repository.listByOwnerId(ADMIN_1);
 
     const res = await call(app.baseUrl, 'POST', '/me/exports', {
       headers: bearer(SESSION_ADMIN_1),
@@ -782,7 +790,7 @@ describe('导出切片：越权 403（AuthorizationGuard + 服务端资源判定
 
     expect(res.status).toBe(403);
     expect(before).toEqual([]);
-    expect(app.repository.listByOwnerId(ADMIN_1)).toEqual([]);
+    expect(await app.repository.listByOwnerId(ADMIN_1)).toEqual([]);
   });
 });
 
@@ -850,6 +858,18 @@ describe('导出切片：输入拒绝 400（VALIDATION_FAILED，不取数/不落
       body: { resource: ExportResource.Profile, storageKey: FORGED_STORAGE_KEY },
       expected: '禁止设置服务端字段 storageKey',
       leaked: FORGED_STORAGE_KEY,
+    },
+    {
+      name: 'downloadUrl（含下载签名）',
+      body: { resource: ExportResource.Profile, downloadUrl: FORGED_DOWNLOAD_URL },
+      expected: '禁止设置服务端字段 downloadUrl',
+      leaked: FORGED_DOWNLOAD_URL,
+    },
+    {
+      name: 'storageHandle（对象存储句柄）',
+      body: { resource: ExportResource.Profile, storageHandle: FORGED_STORAGE_HANDLE },
+      expected: '禁止设置服务端字段 storageHandle',
+      leaked: FORGED_STORAGE_HANDLE,
     },
     {
       name: 'artifactId',
@@ -948,6 +968,16 @@ describe('导出切片：输入拒绝 400（VALIDATION_FAILED，不取数/不落
         query: `artifactId=${FORGED_ARTIFACT_ID}`,
         expected: '禁止使用查询参数 artifactId',
         leaked: FORGED_ARTIFACT_ID,
+      },
+      {
+        query: `downloadUrl=${encodeURIComponent(FORGED_DOWNLOAD_URL)}`,
+        expected: '禁止使用查询参数 downloadUrl',
+        leaked: FORGED_DOWNLOAD_URL,
+      },
+      {
+        query: `storageHandle=${encodeURIComponent(FORGED_STORAGE_HANDLE)}`,
+        expected: '禁止使用查询参数 storageHandle',
+        leaked: FORGED_STORAGE_HANDLE,
       },
       { query: 'page=1&pageSize=10', expected: '本端点不接受查询参数 page' },
     ];
@@ -1219,11 +1249,11 @@ describe('导出切片：claims 伪造（客户端声明不进入判定、归属
     }
 
     // 写入的主体与产物句柄不受伪造头影响
-    const stored = app.repository.listByOwnerId(STUDENT_1);
+    const stored = await app.repository.listByOwnerId(STUDENT_1);
     const saved = stored[stored.length - 1];
     expect(saved?.ownerUserId).toBe(STUDENT_1);
     expect(saved?.artifactId).not.toBe(FORGED_ARTIFACT_ID);
-    expect(app.repository.listByOwnerId(STUDENT_2)).toHaveLength(1);
+    expect(await app.repository.listByOwnerId(STUDENT_2)).toHaveLength(1);
 
     const content = contentText(res);
     for (const leaked of [
@@ -1330,7 +1360,7 @@ describe('导出切片：状态机（pending → completed / failed）', () => {
     expect(viewOf(res.body).status).toBe(ExportStatus.Failed);
 
     // 记录收敛到 failed 终态，且不带任何产物句柄
-    const stored = app.repository.listByOwnerId(STUDENT_1);
+    const stored = await app.repository.listByOwnerId(STUDENT_1);
     const saved = stored[stored.length - 1];
     expect(saved?.status).toBe(ExportStatus.Failed);
     expect(saved?.artifactId).toBeUndefined();
@@ -1390,7 +1420,7 @@ describe('导出切片：状态机（pending → completed / failed）', () => {
     }
 
     // 七次创建全部收敛为 failed，且没有任何一条带上产物句柄
-    const stored = app.repository.listByOwnerId(STUDENT_1);
+    const stored = await app.repository.listByOwnerId(STUDENT_1);
     expect(stored).toHaveLength(3 + badRefs.length);
     for (const record of stored.slice(3)) {
       expect(record.status).toBe(ExportStatus.Failed);
@@ -1403,7 +1433,7 @@ describe('导出切片：状态机（pending → completed / failed）', () => {
     const store = vi.spyOn(app.artifacts, 'store');
     const save = vi.spyOn(app.repository, 'save');
     // 模拟「记录已经是 completed 却被再次推进」：状态机必须拦截，绝不覆盖既有结论
-    vi.spyOn(app.repository, 'create').mockImplementation((record) => ({
+    vi.spyOn(app.repository, 'create').mockImplementation(async (record) => ({
       ...record,
       status: ExportStatus.Completed,
       artifactId: FORGED_ARTIFACT_ID,
@@ -1440,7 +1470,7 @@ describe('导出切片：状态机（pending → completed / failed）', () => {
 
     for (const { name, save } of cases) {
       const app = await startExportsApp();
-      vi.spyOn(app.repository, 'save').mockImplementation((record) => ({
+      vi.spyOn(app.repository, 'save').mockImplementation(async (record) => ({
         ...save(record),
         fields: [...record.fields],
       }));
@@ -1526,7 +1556,7 @@ describe('导出切片：PII 与 fail-closed 500', () => {
   it('存储字段里出现证件号（不在白名单）→ 500：响应与日志都不含取值', async () => {
     const errorLog = vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const app = await startExportsApp({ seed: false });
-    app.repository.create(
+    await app.repository.create(
       fixtureExportRequest({
         id: '77777777-7777-4777-8777-777777777777',
         fields: [PII_ID_CARD],
@@ -1559,7 +1589,7 @@ describe('导出切片：PII 与 fail-closed 500', () => {
   it('存储记录多出字段（fileUrl/path/storageKey）→ 500：不外发多出的字段与取值', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const app = await startExportsApp({ seed: false });
-    app.repository.create({
+    await app.repository.create({
       ...fixtureExportRequest({ status: ExportStatus.Completed }),
       fileUrl: FORGED_FILE_URL,
       path: FORGED_PATH,
@@ -1582,7 +1612,7 @@ describe('导出切片：PII 与 fail-closed 500', () => {
   it('仓储返回归属不一致的记录（未按主体过滤）→ 500：不把他人记录发给调用方', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const app = await startExportsApp();
-    vi.spyOn(app.repository, 'listByOwnerId').mockReturnValue([app.seeded.otherCompleted]);
+    vi.spyOn(app.repository, 'listByOwnerId').mockResolvedValue([app.seeded.otherCompleted]);
 
     const res = await call(app.baseUrl, 'GET', '/me/exports', {
       headers: bearer(SESSION_STUDENT_1),
@@ -1607,7 +1637,7 @@ describe('导出切片：PII 与 fail-closed 500', () => {
 
     for (const overrides of broken) {
       const app = await startExportsApp({ seed: false });
-      app.repository.create(fixtureExportRequest(overrides));
+      await app.repository.create(fixtureExportRequest(overrides));
 
       const res = await call(app.baseUrl, 'GET', '/me/exports', {
         headers: bearer(SESSION_STUDENT_1),
@@ -1637,7 +1667,7 @@ describe('导出切片：PII 与 fail-closed 500', () => {
       const app = await startExportsApp({ seed: false });
       // 直接由仓储返回损坏记录（归属形态非法的一条不会被「按主体取数」命中，
       // 必须这样构造才能让出口的 fail-closed 门禁看见它）
-      vi.spyOn(app.repository, 'listByOwnerId').mockReturnValue([record]);
+      vi.spyOn(app.repository, 'listByOwnerId').mockResolvedValue([record]);
 
       const res = await call(app.baseUrl, 'GET', '/me/exports', {
         headers: bearer(SESSION_STUDENT_1),
@@ -1702,7 +1732,7 @@ describe('导出切片：PII 与 fail-closed 500', () => {
     expect(create.status).toBe(201);
     expect(list.status).toBe(200);
 
-    const stored = app.repository.listByOwnerId(STUDENT_1);
+    const stored = await app.repository.listByOwnerId(STUDENT_1);
     const created = stored[stored.length - 1];
     const descriptor = app.artifacts.findArtifactDescriptor(created?.artifactId ?? '');
     expect(descriptor).toBeDefined();
@@ -1735,7 +1765,7 @@ describe('导出切片：存储异常（仓储端口抛错 → 500，不泄露�
       const app = await startExportsApp({ seed: false });
       const store = vi.spyOn(app.artifacts, 'store');
       const save = vi.spyOn(app.repository, 'save');
-      vi.spyOn(app.repository, 'create').mockImplementation((record) => ({
+      vi.spyOn(app.repository, 'create').mockImplementation(async (record) => ({
         ...record,
         ...replacement,
         fields: replacement.fields ? [...replacement.fields] : [...record.fields],
@@ -1815,7 +1845,7 @@ describe('导出切片：存储异常（仓储端口抛错 → 500，不泄露�
       expect(content).not.toContain(leaked);
     }
     // 入口记录仍是 pending（结论未落库），不得谎报为 completed
-    expect(app.repository.listByOwnerId(STUDENT_1).map((record) => record.status)).toEqual([
+    expect((await app.repository.listByOwnerId(STUDENT_1)).map((record) => record.status)).toEqual([
       ExportStatus.Pending,
     ]);
   });
@@ -1842,20 +1872,25 @@ describe('导出切片：存储异常（仓储端口抛错 → 500，不泄露�
 });
 
 describe('导出切片：装配边界与纯函数门禁', () => {
-  it('ExportsModule 只注册本切片的路由/服务，并把两个令牌显式绑到非生产内存基线', () => {
+  it('ExportsModule 只注册本切片的路由/服务：仓储令牌走换绑工厂，产物令牌绑非生产内存基线', () => {
     const providers = (Reflect.getMetadata('providers', ExportsModule) ?? []) as unknown[];
     const controllers = (Reflect.getMetadata('controllers', ExportsModule) ?? []) as unknown[];
     const imports = (Reflect.getMetadata('imports', ExportsModule) ?? []) as unknown[];
 
     expect(controllers).toEqual([ExportsController]);
     expect(providers).toContain(ExportsService);
-    expect(providers).toContain(InMemoryExportRepository);
     expect(providers).toContain(InMemoryExportArtifactStore);
-    // 换绑持久化实现时只改这两处
-    expect(providers).toContainEqual({
-      provide: EXPORT_REPOSITORY,
-      useExisting: InMemoryExportRepository,
-    });
+    // 仓储令牌由工厂换绑（按 DATABASE_URL 分流）：既不再 `useExisting` 内存实现，
+    // 也不再把内存实现本身留在 provider 列表里（否则容器里会出现两份互不相干的状态）
+    expect(providers).not.toContain(InMemoryExportRepository);
+    const repositoryProvider = providers.find(
+      (provider): provider is { provide: unknown; useFactory: unknown } =>
+        typeof provider === 'object' &&
+        provider !== null &&
+        (provider as { provide?: unknown }).provide === EXPORT_REPOSITORY,
+    );
+    expect(typeof repositoryProvider?.useFactory).toBe('function');
+    // 产物存储仍是显式 useExisting：真实产物存储（对象存储/临时文件区）不在本切片
     expect(providers).toContainEqual({
       provide: EXPORT_ARTIFACT_STORE,
       useExisting: InMemoryExportArtifactStore,
@@ -1865,13 +1900,13 @@ describe('导出切片：装配边界与纯函数门禁', () => {
     expect(imports).toContain(AccessControlModule);
   });
 
-  it('两个令牌在容器里解析到内存基线的同一个实例（useExisting 语义）', async () => {
+  it('未配置数据库时：仓储令牌解析到内存基线；产物令牌与其保持 useExisting 语义', async () => {
     const app = await startExportsApp({ seed: false });
-    expect(app.app.get(EXPORT_REPOSITORY)).toBe(app.app.get(InMemoryExportRepository));
+    expect(app.app.get(EXPORT_REPOSITORY)).toBeInstanceOf(InMemoryExportRepository);
     expect(app.app.get(EXPORT_ARTIFACT_STORE)).toBe(app.app.get(InMemoryExportArtifactStore));
   });
 
-  it('两个内存基线如实声明非持久化/不可用于生产，并在生产环境拒绝构造', () => {
+  it('两个内存基线如实声明非持久化/不可用于生产，并在生产环境拒绝构造', async () => {
     const developmentEnv = loadEnv({});
     const productionEnv = loadEnv({ NODE_ENV: 'production' });
 
@@ -1881,7 +1916,7 @@ describe('导出切片：装配边界与纯函数门禁', () => {
       persistent: false,
       productionReady: false,
     });
-    expect(repository.listByOwnerId('u-nobody')).toEqual([]);
+    await expect(repository.listByOwnerId('u-nobody')).resolves.toEqual([]);
     expect(() => new InMemoryExportRepository(productionEnv)).toThrow(
       /生产环境禁止使用内存导出仓储/u,
     );
@@ -1897,24 +1932,24 @@ describe('导出切片：装配边界与纯函数门禁', () => {
     );
   });
 
-  it('内存仓储：主键唯一、未知 ID 不可更新、归属不可改写、按主体取数、无删除入口、返回副本', () => {
+  it('内存仓储：主键唯一、未知 ID 不可更新、归属不可改写、按主体取数、无删除入口、返回副本', async () => {
     const repository = new InMemoryExportRepository(loadEnv({}));
     const record = fixtureExportRequest();
-    repository.create(record);
-    repository.create(fixtureExportRequest({ ownerUserId: STUDENT_2 }));
+    await repository.create(record);
+    await repository.create(fixtureExportRequest({ ownerUserId: STUDENT_2 }));
 
     // 主键冲突属于服务端缺陷，不得静默覆盖既有导出请求
-    expect(() => repository.create(record)).toThrow(/导出请求 ID 冲突/u);
+    await expect(repository.create(record)).rejects.toThrow(/导出请求 ID 冲突/u);
 
     // 覆盖写入未知 id 不得退化成插入
-    expect(() => repository.save(fixtureExportRequest({ id: randomUUID() }))).toThrow(
+    await expect(repository.save(fixtureExportRequest({ id: randomUUID() }))).rejects.toThrow(
       /导出请求不存在，无法更新/u,
     );
 
     // 归属不得在更新中被改写
-    expect(() =>
+    await expect(
       repository.save(fixtureExportRequest({ id: record.id, ownerUserId: STUDENT_2 })),
-    ).toThrow(/导出请求归属不一致/u);
+    ).rejects.toThrow(/导出请求归属不一致/u);
 
     // 本切片没有删除/归档能力
     for (const forbidden of ['update', 'delete', 'remove', 'archive', 'softDelete']) {
@@ -1922,16 +1957,16 @@ describe('导出切片：装配边界与纯函数门禁', () => {
     }
 
     // 只按服务端主体取数
-    expect(repository.listByOwnerId(STUDENT_1)).toHaveLength(1);
-    expect(repository.listByOwnerId(STUDENT_2)).toHaveLength(1);
-    expect(repository.listByOwnerId('u-nobody')).toEqual([]);
+    await expect(repository.listByOwnerId(STUDENT_1)).resolves.toHaveLength(1);
+    await expect(repository.listByOwnerId(STUDENT_2)).resolves.toHaveLength(1);
+    await expect(repository.listByOwnerId('u-nobody')).resolves.toEqual([]);
 
     // 返回副本：调用方无法就地改写已存储的记录与字段数组
-    const returned = repository.listByOwnerId(STUDENT_1)[0];
+    const returned = (await repository.listByOwnerId(STUDENT_1))[0];
     expect(returned).toBeDefined();
     (returned as { status: ExportStatus }).status = ExportStatus.Failed;
     (returned?.fields as unknown as string[]).push('title');
-    const again = repository.listByOwnerId(STUDENT_1)[0];
+    const again = (await repository.listByOwnerId(STUDENT_1))[0];
     expect(again?.status).toBe(ExportStatus.Completed);
     expect(again?.fields).toEqual(profileFields());
   });
@@ -2158,6 +2193,10 @@ describe('导出切片：装配边界与纯函数门禁', () => {
       'artifactId',
       'fileUrl',
       'path',
+      'downloadUrl',
+      'signedUrl',
+      'storageKey',
+      'storageHandle',
     ]) {
       expect(EXPORTABLE_FIELD_NAME_VALUES).not.toContain(forbidden);
     }
@@ -2235,6 +2274,7 @@ describe('导出切片：装配边界与纯函数门禁', () => {
       'apiPort',
       'apiPrefix',
       'databaseConfigured',
+      'dependencyGate',
       'nodeEnv',
     ]);
 
