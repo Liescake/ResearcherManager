@@ -1,0 +1,11 @@
+packages:
+  # 显式列出应用工作区，避免通配符把未评估的目录（如 apps/miniapp）纳入 workspace。
+  # apps/miniapp 工作区文件保持原样，但不作为 workspace 成员安装与校验。
+  - "apps/admin-web"
+  - "packages/*"
+  - "services/*"
+
+# 依赖安装脚本白名单：pnpm 默认不执行依赖的 postinstall 脚本。
+# 只允许经评估的原生构建工具，避免引入未经审查的安装脚本。
+onlyBuiltDependencies:
+  - esbuild

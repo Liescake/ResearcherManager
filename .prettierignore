@@ -1,0 +1,24 @@
+# 本地文档与既有 P1/P2 基线文档：不得被格式化工具改写
+docs/
+需求.txt
+要求.txt
+AI开发计划表.md
+计划表待确认问题清单.md
+_acl-recovery/
+
+# 依赖与构建产物
+node_modules/
+.pnpm-store/
+.pnpm-cache/
+dist/
+coverage/
+*.tsbuildinfo
+
+# 非 Prettier 支持的小程序模板与样式文件
+**/*.wxml
+**/*.wxss
+**/*.wxs
+
+# 其他生成物
+pnpm-lock.yaml
+*.bundle
