@@ -148,6 +148,20 @@ function bearer(sessionId: string): Record<string, string> {
   return { authorization: `Bearer ${sessionId}` };
 }
 
+/**
+ * 响应中「业务内容」部分的文本：去掉 `meta`（`requestId` 随机、`generatedAt` 是时间戳）
+ * 与 `error.requestId`。「逐字段相同」的不可区分断言必须建立在这部分上。
+ */
+function contentText(res: HttpResult): string {
+  const error = res.body.error;
+  return JSON.stringify({
+    data: res.body.data,
+    error: error
+      ? { code: error.code, message: error.message, details: error.details ?? null }
+      : null,
+  });
+}
+
 /** 存储记录夹具：id/groupId 走 UUID（读取契约要求），userId 保持会话基线的安全 ID 形状 */
 function reviewRecord(overrides: Partial<Application> = {}): Application {
   const now = '2026-05-01T00:00:00.000Z';
@@ -209,6 +223,49 @@ describe('审核端 HTTP：认证与授权边界', () => {
       body: { decision: 'nonsense', status: ApplicationStatus.Approved },
     });
     expect(res.status).toBe(403);
+  });
+
+  it('服务端主体不可由客户端覆盖：伪造的角色/范围/归属声明既不升级权限，也不改写审核人', async () => {
+    const { baseUrl, reviews } = await startReviewsApp();
+    const inOpen = reviewRecord({ groupId: GROUP_OPEN });
+    const inOther = reviewRecord({ groupId: GROUP_OTHER });
+    reviews.seed(inOpen);
+    reviews.seed(inOther);
+
+    const forged = {
+      'x-user-id': 'u-attacker',
+      'x-actor-user-id': 'u-attacker',
+      'x-roles': 'super_admin',
+      'x-scope': 'GLOBAL',
+      'x-group-id': GROUP_OTHER,
+    };
+
+    // 无审核权限的主体：伪造超管角色/全局范围不会升级为放行
+    const student = await call(baseUrl, 'GET', '/admin/applications', {
+      headers: { ...bearer(SESSION_STUDENT), ...forged },
+    });
+    expect(student.status).toBe(403);
+    expect(student.body.error?.code).toBe('FORBIDDEN');
+
+    // 小组审核者：伪造 GLOBAL 范围不会让他看到他组的申请（仍是统一 404）
+    const leader = await call(baseUrl, 'POST', `/admin/applications/${inOther.id}/review`, {
+      headers: { ...bearer(SESSION_LEADER_OPEN), ...forged },
+      body: { decision: 'approve' },
+    });
+    expect(leader.status).toBe(404);
+    expect(leader.body.error?.code).toBe('NOT_FOUND');
+
+    // 本组内审核：审核人取自服务端会话主体，而不是伪造头里的归属
+    const allowed = await call(baseUrl, 'POST', `/admin/applications/${inOpen.id}/review`, {
+      headers: { ...bearer(SESSION_LEADER_OPEN), ...forged },
+      body: { decision: 'approve' },
+    });
+    expect(allowed.status).toBe(200);
+    const data = allowed.body.data as Record<string, unknown>;
+    expect(data.status).toBe(ApplicationStatus.Approved);
+    expect(data.reviewedByUserId).toBe('u-leader-open');
+    expect(contentText(allowed)).not.toContain('u-attacker');
+    expect(contentText(allowed)).not.toContain('super_admin');
   });
 });
 
@@ -346,6 +403,38 @@ describe('审核端 HTTP：审核动作', () => {
       body: { decision: 'approve' },
     });
     expect(res.status).toBe(404);
+  });
+
+  it('不存在的申请与范围外的申请共用同一个 404 响应（逐字段相同，不可据响应探测他人申请）', async () => {
+    const { baseUrl, reviews } = await startReviewsApp();
+    const other = reviewRecord({ groupId: GROUP_OTHER });
+    reviews.seed(other);
+
+    const outOfScope = await call(baseUrl, 'POST', `/admin/applications/${other.id}/review`, {
+      headers: bearer(SESSION_LEADER_OPEN),
+      body: { decision: 'approve' },
+    });
+    const missing = await call(baseUrl, 'POST', `/admin/applications/${randomUUID()}/review`, {
+      headers: bearer(SESSION_LEADER_OPEN),
+      body: { decision: 'approve' },
+    });
+
+    for (const res of [outOfScope, missing]) {
+      expect(res.status).toBe(404);
+      expect(res.body.error?.code).toBe('NOT_FOUND');
+      expect(res.body.data).toBeNull();
+    }
+    // 两条路径的 status/code/message 完全一致：调用方无法区分「不存在」与「不在我的范围」
+    expect(contentText(missing)).toBe(contentText(outOfScope));
+
+    // 不存在的申请不产生任何写入，范围外的记录也保持未审核
+    const global = await call(baseUrl, 'GET', '/admin/applications', {
+      headers: bearer(SESSION_SUPER_ADMIN),
+    });
+    const row = (global.body.data as { id: string; status: string }[]).find(
+      (item) => item.id === other.id,
+    );
+    expect(row?.status).toBe(ApplicationStatus.Pending);
   });
 
   it('已终态申请再审 → 409 STATE_TRANSITION_INVALID', async () => {

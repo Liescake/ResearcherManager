@@ -1,4 +1,5 @@
 import { Controller, Get, Inject, InternalServerErrorException, Logger } from '@nestjs/common';
+import { describeSensitiveFindings, findSensitiveOutput } from '../../common/sensitive-output';
 import type { HealthContractIssue } from '../ruoyi-adapter/contract/health-contract';
 import {
   checkHealthDataAgainstContract,
@@ -15,6 +16,11 @@ import { HealthService } from './health.service';
  * 契约边界：两个响应的业务数据在离开进程前必须满足 health.openapi.yaml 的运行时约束
  * （`modules/ruoyi-adapter/contract/health-contract.ts` 是同一契约的只读适配器）。
  * 违反契约属于服务端缺陷：返回 500，而不是把不合规数据当成正常输出发给调用方。
+ *
+ * 契约之外还有一道**取值级脱敏门禁**（`common/sensitive-output.ts`）：就绪信息里的持久化
+ * 状态只能是脱敏事实，`detail` 之类的自由文本里出现连接串、口令键值、SQL、内部路径或
+ * 证据/连接配置字段名一律 500 —— 与 runtime-info 同一口径，两个运维出口不留下不对称的缺口。
+ *
  * 校验只读取数据，不新增/删除/改名任何对外字段，也不改变任何路径。
  */
 @Controller('health')
@@ -67,15 +73,16 @@ export class HealthController {
     check: (payload: T) => HealthContractIssue[],
   ): T {
     const issues = check(payload);
-    if (issues.length === 0) {
+    const sensitive = findSensitiveOutput(payload);
+    if (issues.length === 0 && sensitive.length === 0) {
       return payload;
     }
 
-    this.logger.error(
-      `[health-contract] ${route} 响应不符合契约: ${issues
-        .map((issue) => `${issue.path}(${issue.kind})`)
-        .join(', ')}`,
-    );
+    const problems = [
+      ...issues.map((issue) => `${issue.path}(${issue.kind})`),
+      ...(sensitive.length === 0 ? [] : [`sensitive: ${describeSensitiveFindings(sensitive)}`]),
+    ];
+    this.logger.error(`[health-contract] ${route} 响应不符合契约: ${problems.join(', ')}`);
     throw new InternalServerErrorException('健康探针响应不符合 health 契约');
   }
 }

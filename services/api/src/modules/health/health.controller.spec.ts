@@ -224,6 +224,65 @@ describe('非法健康数据必须服务端 500，不允许被当作正常输出
   });
 });
 
+describe('运维取值级脱敏门禁：契约合法但含敏感取值同样 500', () => {
+  const secretConnectionString =
+    'postgresql://rm_user:pg-sup3rsecret@db.internal:5432/researcher_manager';
+  const readinessWithSecret = {
+    status: 'ready',
+    checks: [
+      { name: 'database', status: 'ok', detail: `已连接 ${secretConnectionString}` },
+      { name: 'sessionSecret', status: 'ok' },
+      { name: 'aiMatching', status: 'ok' },
+    ],
+  };
+
+  it('契约检查本身通过（字段名与取值类型都合法），因此只能由脱敏门禁拦下', () => {
+    expect(checkReadinessDataAgainstContract(readinessWithSecret)).toEqual([]);
+  });
+
+  it('真实 HTTP：/health/ready → 500，且响应不回显连接串的任何片段', async () => {
+    const baseUrl = await startApp(healthTestModule({ getReadiness: () => readinessWithSecret }));
+    const { status, text, body } = await get(baseUrl, '/health/ready');
+
+    expect(status).toBe(500);
+    expect(body.data).toBeNull();
+    expect(body.error?.code).toBe(ApiErrorCode.InternalError);
+    for (const fragment of ['sup3rsecret', 'db.internal', '5432', 'postgresql://', 'rm_user']) {
+      expect(text).not.toContain(fragment);
+    }
+  });
+
+  it('控制器单元：detail 里出现 SQL 语句同样抛 500（不返回不合规数据）', () => {
+    const controller = new HealthController({
+      getReadiness: () => ({
+        status: 'ready',
+        checks: [
+          { name: 'database', status: 'ok', detail: 'SELECT count(*) FROM pg_stat_activity' },
+          { name: 'sessionSecret', status: 'ok' },
+          { name: 'aiMatching', status: 'ok' },
+        ],
+      }),
+    } as unknown as HealthService);
+
+    expect(() => controller.getReadiness()).toThrow(InternalServerErrorException);
+  });
+
+  it('控制器单元：内部文件路径出现在 detail 里同样抛 500', () => {
+    const controller = new HealthController({
+      getReadiness: () => ({
+        status: 'degraded',
+        checks: [
+          { name: 'database', status: 'ok', detail: 'D:\\WorkSpace\\ReseacherManager\\db' },
+          { name: 'sessionSecret', status: 'not_configured' },
+          { name: 'aiMatching', status: 'degraded' },
+        ],
+      }),
+    } as unknown as HealthService);
+
+    expect(() => controller.getReadiness()).toThrow(InternalServerErrorException);
+  });
+});
+
 describe('控制器契约校验的单元行为', () => {
   beforeEach(() => {
     // 契约违规的日志属于观测行为，静音以保持测试输出可读

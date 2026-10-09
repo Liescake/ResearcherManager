@@ -40,6 +40,9 @@ export class StatisticsController {
     @Headers('authorization') authorization: string | undefined,
     @Query() query: unknown,
   ): Promise<SelfStatisticsView> {
-    return this.statistics.getMyStatistics(requireSubject(this.sessions, authorization), query);
+    return this.statistics.getMyStatistics(
+      await requireSubject(this.sessions, authorization),
+      query,
+    );
   }
 }
