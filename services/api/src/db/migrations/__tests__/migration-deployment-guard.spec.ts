@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { computeMigrationChecksum, type MigrationApplication } from '../migration-boundary';
@@ -209,10 +209,15 @@ describe('部署守卫契约：身份与来源目录', () => {
       DRAFTS_DIR,
       MIGRATION_DRAFT_SOURCE_DIRECTORY,
     );
-    expect(candidates.map((item) => item.fileName)).toEqual([
-      '0001_research_groups.draft.sql',
-      '0002_user_compliance.draft.sql',
-    ]);
+    // 期望集合**由目录实际内容推导**：公开仓库必须带小组草案，但不写死「本地、不入公开仓库」
+    // 的合规草案文件名，也不允许漏读任何一份已存在的草案（否则「整体拒绝」会因漏读而失效）。
+    const draftsOnDisk = readdirSync(DRAFTS_DIR)
+      .filter((name) => name.endsWith('.draft.sql'))
+      .sort();
+    expect(draftsOnDisk).toContain('0001_research_groups.draft.sql');
+    expect(candidates.length).toBeGreaterThan(0);
+    expect(candidates.map((item) => item.fileName).sort()).toEqual(draftsOnDisk);
+    expect(candidates.every((item) => item.source === 'schema-draft-directory')).toBe(true);
     expect(candidates[0]?.source).toBe('schema-draft-directory');
 
     const report = evaluateMigrationDeploymentGuard(

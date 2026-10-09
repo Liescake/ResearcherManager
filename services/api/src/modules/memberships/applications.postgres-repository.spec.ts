@@ -85,6 +85,13 @@ function findRepoRoot(start: string): string {
 }
 
 const REPO_ROOT = findRepoRoot(process.cwd());
+
+/**
+ * 内部字段级数据字典：属**内部文档**，不随公开仓库发布。公开归档里该文件不存在，
+ * 相关的一致性断言因此无法校验，按设计**显式跳过**（见对应的 `it.skipIf`），
+ * 而不是让整个测试文件因为读不到内部文档而报 ENOENT。
+ */
+const INTERNAL_FIELD_DICTIONARY = join(REPO_ROOT, 'docs', 'P1-字段级数据字典.md');
 const MEMBERSHIPS_DIR = resolve(process.cwd(), 'src', 'modules', 'memberships');
 const ADAPTER_PATH = resolve(MEMBERSHIPS_DIR, 'applications.postgres-repository.ts');
 const PORT_PATH = resolve(MEMBERSHIPS_DIR, 'applications.port.ts');
@@ -364,16 +371,15 @@ describe('PostgreSQL 入组申请仓储：repository 契约与能力声明', () 
   it('表名是字段字典里的 join_applications，字典已登记的列都在列清单里', () => {
     expect(POSTGRES_APPLICATION_TABLE).toBe('join_applications');
 
-    const dictionary = readFileSync(join(REPO_ROOT, 'docs', 'P1-字段级数据字典.md'), 'utf8');
-    // 字段字典为该表登记的字段必须都落在列清单里（否则存储层与数据字典脱节）
+    // 字段字典为该表登记的字段必须都落在列清单里（否则存储层与数据字典脱节）。
+    // 字典正文属内部文档，公开归档不可读；这里断言**公开可校验**的那一半（列清单包含这些字段），
+    // 与字典正文逐行比对的另一半放在下面按需跳过的用例里。
     for (const field of ['status', 'note']) {
-      expect(dictionary).toContain(`| join_applications | ${field} |`);
       expect([...POSTGRES_APPLICATION_COLUMNS]).toContain(field);
     }
 
     // 其余列（主键 / 归属 / 目标小组 / 类型 / 审核留痕 / 时间戳）只由约定与读取契约声明，
-    // 字段字典尚未逐行登记；本切片不得改 docs，因此把差异固定成断言：schema 草案那一步补登
-    // 之后这里会失败，提醒同步核对列清单与迁移。
+    // 字段字典尚未逐行登记。
     for (const contractOnly of [
       'id',
       'user_id',
@@ -385,10 +391,35 @@ describe('PostgreSQL 入组申请仓储：repository 契约与能力声明', () 
       'created_at',
       'updated_at',
     ]) {
-      expect(dictionary).not.toContain(`| join_applications | ${contractOnly} |`);
       expect([...POSTGRES_APPLICATION_COLUMNS]).toContain(contractOnly);
     }
   });
+
+  // 内部字典不可读时**显式跳过**（输出里可见），不做「静默通过」的降级：
+  // 生产安全断言（fail-closed / 列清单边界）不受影响，本用例只对齐文档与列清单。
+  it.skipIf(!existsSync(INTERNAL_FIELD_DICTIONARY))(
+    '与内部字段级数据字典逐行对齐（需要内部文档；公开归档按设计跳过）',
+    () => {
+      const dictionary = readFileSync(INTERNAL_FIELD_DICTIONARY, 'utf8');
+      for (const field of ['status', 'note']) {
+        expect(dictionary).toContain(`| join_applications | ${field} |`);
+      }
+      // schema 草案那一步补登之后这里会失败，提醒同步核对列清单与迁移
+      for (const contractOnly of [
+        'id',
+        'user_id',
+        'group_id',
+        'kind',
+        'reviewed_by_user_id',
+        'review_comment',
+        'reviewed_at',
+        'created_at',
+        'updated_at',
+      ]) {
+        expect(dictionary).not.toContain(`| join_applications | ${contractOnly} |`);
+      }
+    },
+  );
 
   it('归属列 / 个人级内容列 / 审核内部列 / 公开输出裁剪列各有明确清单', () => {
     expect([...POSTGRES_APPLICATION_OWNER_COLUMNS]).toEqual(['user_id']);
