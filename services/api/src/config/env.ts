@@ -27,6 +27,28 @@ const booleanFromEnv = z
   .default('false')
   .transform((value) => value === 'true' || value === '1');
 
+/**
+ * 可选布尔型配置：未配置（含空串/纯空白）时是 `undefined`，而不是 `false`。
+ *
+ * 为什么不能用 `booleanFromEnv` 的默认值：「未配置」与「显式 false」语义不同。
+ * `DATABASE_SSL` 若默认成 `false`，`@rm/db` 的 `resolveDatabaseConfig` 会把它当成
+ * 「显式关闭 TLS」，从而**绕过**「远端主机未配置 TLS 时按安全默认要求 TLS / 生产环境
+ * 对非回环主机关闭 TLS 一律拒绝」这条 fail-closed 规则（见
+ * `src/db/config/database-config.ts` 的 `resolveSslMode`）。留作 `undefined` 后，
+ * 安全默认值才能生效；显式 `false` 仍然被如实识别，并在生产环境按违规拒绝。
+ */
+const optionalBooleanFromEnv = z.preprocess(
+  emptyToUndefined,
+  z
+    .enum(['true', 'false', '1', '0'])
+    .transform((value) => value === 'true' || value === '1')
+    .optional(),
+);
+
+/** 可选数值型配置：空串视为未配置，缺省回落到安全默认值 */
+const optionalCount = (min: number, max: number, fallback: number) =>
+  z.preprocess(emptyToUndefined, z.coerce.number().int().min(min).max(max).default(fallback));
+
 export const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
@@ -37,7 +59,50 @@ export const envSchema = z.object({
   API_PUBLIC_URL: optionalUrl,
 
   DATABASE_URL: optionalSecret,
-  DATABASE_SSL: booleanFromEnv,
+  // 未配置时留空：由 @rm/db 按「回环不强制 TLS、远端默认要求 TLS」的安全默认值解析
+  DATABASE_SSL: optionalBooleanFromEnv,
+  // 显式 TLS 档位：disable / require / verify-full。
+  // 生产环境只接受 verify-full（缺失按 require 的安全默认值处理，同样被拒绝启动）。
+  DATABASE_SSL_MODE: z.enum(['disable', 'require', 'verify-full']).optional(),
+  // TLS 证书**路径**（绝对路径；证书内容必须由挂载卷 / 环境变量注入，禁止写入仓库工作区）
+  DATABASE_SSL_CA_PATH: optionalSecret,
+  DATABASE_SSL_CERT_PATH: optionalSecret,
+  DATABASE_SSL_KEY_PATH: optionalSecret,
+  // PostgreSQL 连接池与超时（由 @rm/db 的共享配置解析再校验一次；此处先做启动期快速失败）
+  DATABASE_POOL_MAX: optionalCount(1, 100, 10),
+  DATABASE_CONNECT_TIMEOUT_MS: optionalCount(1000, 60000, 10000),
+  DATABASE_STATEMENT_TIMEOUT_MS: optionalCount(0, 300000, 30000),
+  // 写入连接 application_name，便于 DBA 在 pg_stat_activity 中定位来源
+  DATABASE_APPLICATION_NAME: optionalSecret,
+  // ---------------------------------------------------------------------------
+  // 执行器 attest 取证事实（由**运维 / CI 显式提供**，代码绝不生成「已验证」）
+  // 缺任何一项 ⇒ 拿不到封存声明 ⇒ 数据库已配置时启动 fail-closed。
+  //
+  // 这组字段同时是一份**类型契约**：`db/database.module.ts` 把解析出的 env 对象直接交给
+  // `resolvePostgresAttestationRegistration(env)`，其形参类型是 `PostgresAttestationSource`
+  // （见 `db/postgres/postgres-attestation.ts`）。两边字段名必须逐一对应 —— 此处少一个字段，
+  // 纯净检出就会在 `db/database.module.ts` 的调用点报「类型不兼容」。
+  // ---------------------------------------------------------------------------
+  DATABASE_EXECUTOR_EVIDENCE_ID: optionalSecret,
+  DATABASE_EXECUTOR_VERIFIED_BY: optionalSecret,
+  DATABASE_EXECUTOR_VERIFIED_AT: optionalSecret,
+  DATABASE_EXECUTOR_EVIDENCE_REF: optionalSecret,
+  // 验证方式：空串/纯空白同样视为未配置（与本文件顶部规则一致）；允许取值是**闭集**，
+  // 非法取值直接拒绝启动，避免把任意文本当成「验证方式」带进证据。
+  DATABASE_EXECUTOR_EVIDENCE_METHOD: z.preprocess(
+    emptyToUndefined,
+    z.enum(['integration-test', 'contract-test', 'manual-review']).optional(),
+  ),
+  DATABASE_SCHEMA_READINESS_ID: optionalSecret,
+  DATABASE_SCHEMA_CHECKED_BY: optionalSecret,
+  DATABASE_SCHEMA_CHECKED_AT: optionalSecret,
+  DATABASE_SCHEMA_READINESS_REF: optionalSecret,
+  // 迁移版本事实（CSV，升序）：代码侧可用版本与数据库侧已应用版本，必须由取证方核对后给出
+  DATABASE_MIGRATION_AVAILABLE_VERSIONS: optionalSecret,
+  DATABASE_MIGRATION_APPLIED_VERSIONS: optionalSecret,
+  // 迁移 CLI 的可选覆盖（默认 <repo>/db/migrations）
+  DATABASE_MIGRATIONS_DIR: optionalSecret,
+  DATABASE_MIGRATION_APPLIED_BY: optionalSecret,
 
   SESSION_SECRET: optionalSecret,
 
