@@ -151,6 +151,12 @@ describe('部署守卫契约：身份与来源目录', () => {
       '0006_sessions.sql',
       '0007_student_profiles.sql',
       '0008_achievements_constraints.sql',
+      '0009_audit_logs.sql',
+      '0010_notifications.sql',
+      '0011_research_groups.sql',
+      '0012_user_compliance.sql',
+      '0013_export_jobs.sql',
+      '0014_ai_match_records_guards.sql',
     ];
     const candidates = collectMigrationDeploymentCandidates(MIGRATIONS_DIR);
     expect(candidates.map((item) => item.fileName)).toEqual(REAL_MIGRATIONS);
@@ -173,6 +179,12 @@ describe('部署守卫契约：身份与来源目录', () => {
       '0006',
       '0007',
       '0008',
+      '0009',
+      '0010',
+      '0011',
+      '0012',
+      '0013',
+      '0014',
     ]);
     expect(report.executionOrder).toEqual([
       '0001',
@@ -183,6 +195,12 @@ describe('部署守卫契约：身份与来源目录', () => {
       '0006',
       '0007',
       '0008',
+      '0009',
+      '0010',
+      '0011',
+      '0012',
+      '0013',
+      '0014',
     ]);
   });
 
@@ -191,7 +209,10 @@ describe('部署守卫契约：身份与来源目录', () => {
       DRAFTS_DIR,
       MIGRATION_DRAFT_SOURCE_DIRECTORY,
     );
-    expect(candidates.map((item) => item.fileName)).toEqual(['0001_research_groups.draft.sql']);
+    expect(candidates.map((item) => item.fileName)).toEqual([
+      '0001_research_groups.draft.sql',
+      '0002_user_compliance.draft.sql',
+    ]);
     expect(candidates[0]?.source).toBe('schema-draft-directory');
 
     const report = evaluateMigrationDeploymentGuard(

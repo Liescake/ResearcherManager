@@ -152,6 +152,12 @@ describe('readMigrationDirectory：与仓库真实迁移对齐', () => {
       '0006_sessions.sql',
       '0007_student_profiles.sql',
       '0008_achievements_constraints.sql',
+      '0009_audit_logs.sql',
+      '0010_notifications.sql',
+      '0011_research_groups.sql',
+      '0012_user_compliance.sql',
+      '0013_export_jobs.sql',
+      '0014_ai_match_records_guards.sql',
     ]);
     expect(descriptors.map((item) => item.version)).toEqual([
       '0001',
@@ -162,10 +168,22 @@ describe('readMigrationDirectory：与仓库真实迁移对齐', () => {
       '0006',
       '0007',
       '0008',
+      '0009',
+      '0010',
+      '0011',
+      '0012',
+      '0013',
+      '0014',
     ]);
     // 全部迁移都必须是「可回滚」：建表迁移由 DROP TABLE IF EXISTS 恢复，约束迁移由
     // ALTER TABLE ... DROP CONSTRAINT IF EXISTS 恢复
     expect(descriptors.map((item) => item.reversible)).toEqual([
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
       true,
       true,
       true,
@@ -187,11 +205,33 @@ describe('readMigrationDirectory：与仓库真实迁移对齐', () => {
       ['0005_ai_match_records.sql', 'ai_match_records'],
       ['0006_sessions.sql', 'sessions'],
       ['0007_student_profiles.sql', 'student_profiles'],
+      ['0009_audit_logs.sql', 'audit_logs'],
+      ['0010_notifications.sql', 'notifications'],
+      ['0011_research_groups.sql', 'research_groups'],
+      ['0012_user_compliance.sql', 'user_compliance'],
+      ['0013_export_jobs.sql', 'export_jobs'],
     ] as const) {
       expect(readFileSync(join(repoRoot, 'db', 'migrations', file), 'utf8')).toMatch(
         new RegExp(`CREATE\\s+TABLE\\s+IF\\s+NOT\\s+EXISTS\\s+${table}\\s*\\(`, 'u'),
       );
     }
+
+    // 0014 同属**约束补齐**（不建表）：它必须真的给 0005 建出的 ai_match_records 加约束
+    const matchingConstraintMigration = readFileSync(
+      join(repoRoot, 'db', 'migrations', '0014_ai_match_records_guards.sql'),
+      'utf8',
+    );
+    expect(matchingConstraintMigration).toMatch(/ALTER\s+TABLE\s+ai_match_records\b/iu);
+    for (const constraint of [
+      'ai_match_records_id_not_nil',
+      'ai_match_records_user_id_not_nil',
+      'ai_match_records_recommendations_is_array',
+      'ai_match_records_recommendations_max_items',
+    ]) {
+      expect(matchingConstraintMigration).toContain(`ADD CONSTRAINT ${constraint}`);
+    }
+    expect(matchingConstraintMigration).not.toMatch(/CREATE\s+TABLE\b/iu);
+    expect(matchingConstraintMigration).not.toMatch(/CREATE\s+(?:UNIQUE\s+)?INDEX\b/iu);
 
     // 0008 是**约束补齐**（不建表）：它必须真的给 0004 建出的表加约束，而不是只在注释里声明
     const constraintMigration = readFileSync(

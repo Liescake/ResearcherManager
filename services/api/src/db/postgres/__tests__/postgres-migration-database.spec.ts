@@ -220,8 +220,32 @@ describe('createPostgresMigrationDatabase：全新数据库（记账表缺失）
       '0003',
       '0004',
       '0005',
+      '0006',
+      '0007',
+      '0008',
+      '0009',
+      '0010',
+      '0011',
+      '0012',
+      '0013',
+      '0014',
     ]);
-    expect(report.appliedAfter).toEqual(['0001', '0002', '0003', '0004', '0005']);
+    expect(report.appliedAfter).toEqual([
+      '0001',
+      '0002',
+      '0003',
+      '0004',
+      '0005',
+      '0006',
+      '0007',
+      '0008',
+      '0009',
+      '0010',
+      '0011',
+      '0012',
+      '0013',
+      '0014',
+    ]);
 
     // 记账表由 0001 建立，且建表之后就写入了 0001 的记账行（同事务）
     expect(connection.ledgerPresent).toBe(true);
@@ -235,7 +259,7 @@ describe('createPostgresMigrationDatabase：全新数据库（记账表缺失）
     ]);
 
     // 每条迁移一个事务；事务外只有「读记账表」两次（执行前 / 执行后）
-    expect(connection.transactions).toBe(5);
+    expect(connection.transactions).toBe(14);
     expect(connection.outsideStatements).toEqual([
       SCHEMA_MIGRATIONS_SELECT_SQL,
       SCHEMA_MIGRATIONS_SELECT_SQL,
@@ -253,7 +277,22 @@ describe('createPostgresMigrationDatabase：全新数据库（记账表缺失）
       appliedBy: 'unit-test',
     });
     expect(status.applied).toEqual([]);
-    expect(status.pending).toEqual(['0001', '0002', '0003', '0004', '0005']);
+    expect(status.pending).toEqual([
+      '0001',
+      '0002',
+      '0003',
+      '0004',
+      '0005',
+      '0006',
+      '0007',
+      '0008',
+      '0009',
+      '0010',
+      '0011',
+      '0012',
+      '0013',
+      '0014',
+    ]);
     expect(status.upToDate).toBe(false);
 
     const dryRun = await runMigrations({
@@ -295,7 +334,22 @@ describe('createPostgresMigrationDatabase：重复 status 与幂等重跑', () =
       appliedBy: 'unit-test',
     });
 
-    const versions = ['0001', '0002', '0003', '0004', '0005'];
+    const versions = [
+      '0001',
+      '0002',
+      '0003',
+      '0004',
+      '0005',
+      '0006',
+      '0007',
+      '0008',
+      '0009',
+      '0010',
+      '0011',
+      '0012',
+      '0013',
+      '0014',
+    ];
     expect(first.applied).toEqual(versions);
     expect(first.upToDate).toBe(true);
     expect(second).toEqual(first);

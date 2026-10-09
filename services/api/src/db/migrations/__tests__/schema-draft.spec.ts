@@ -49,7 +49,10 @@ describe('schema 草案规则：与 db/schema-drafts 的真实文件对齐', () 
     const repoRoot = findRepoRoot(process.cwd());
     const drafts = readSchemaDraftDirectory(join(repoRoot, 'db', 'schema-drafts'));
 
-    expect(drafts.map((item) => item.fileName)).toEqual(['0001_research_groups.draft.sql']);
+    expect(drafts.map((item) => item.fileName)).toEqual([
+      '0001_research_groups.draft.sql',
+      '0002_user_compliance.draft.sql',
+    ]);
     expect(drafts[0]).toMatchObject({
       version: '0001',
       name: 'research_groups',
@@ -58,6 +61,14 @@ describe('schema 草案规则：与 db/schema-drafts 的真实文件对齐', () 
       applied: false,
     });
     expect(drafts[0]?.checksum).toMatch(/^[0-9a-f]{64}$/u);
+    // 合规读模型草案：已按 db/schema-drafts/README.md 的规范转写为迁移 0012，但草案本身仍是未应用
+    expect(drafts[1]).toMatchObject({
+      version: '0002',
+      name: 'user_compliance',
+      targetTable: 'user_compliance',
+      applied: false,
+    });
+    expect(drafts[1]?.checksum).toMatch(/^[0-9a-f]{64}$/u);
   });
 
   it('合规草案没有违规项', () => {

@@ -17,7 +17,10 @@ db/migrations/
 ├─ 0007_student_profiles.sql   学生画像表（PostgreSQL 画像仓储切片）
 ├─ 0008_achievements_constraints.sql  成果表存储层约束补齐（PostgreSQL 成果仓储切片）
 ├─ 0009_audit_logs.sql         不可变业务审计表（PostgreSQL 审计仓储切片 · 存储层仅追加）
-└─ 0010_notifications.sql       站内通知表（PostgreSQL 通知仓储切片 · 归属隔离 + read 状态机）
+├─ 0010_notifications.sql      站内通知表（PostgreSQL 通知仓储切片 · 归属隔离 + read 状态机）
+├─ 0011_research_groups.sql    科研小组表（PostgreSQL 小组仓储切片）
+├─ 0012_user_compliance.sql    本人合规状态聚合读模型（PostgreSQL 合规格切片）
+└─ 0013_export_jobs.sql        导出请求事实表（PostgreSQL 导出仓储切片 · 状态读 / 创建 / 完成）
 ```
 
 `0002`–`0005` 是第一个真实业务持久化切片（本人统计聚合读）所需的四张来源表：每张表都带
@@ -51,6 +54,17 @@ db/migrations/
 `(user_id, created_at, id)` 覆盖本人列表的「过滤 + 全序排序」。刻意**不**建订阅消息外发列
 （收件标识 / 模板 / 重试次数）与跳转 / 附件 / 软删除 / 幂等键列：它们属于后续切片，adapter 的列
 清单里也没有它们（内部列已单独登记为「不进 SELECT / RETURNING」）。
+
+`0013` 建**导出请求事实表** `export_jobs`：列清单与 `exports.postgres-repository.ts` 的
+`POSTGRES_EXPORT_COLUMNS` 一一对应（8 列），并按 adapter 契约蕴含的规则补上 CHECK
+（资源 / 状态闭集、字段数组非空、存储 ID 域，以及「产物短引用**当且仅当**结论为 `completed`
+时存在」这条跨字段不变式 —— 它正是状态机与读取契约在存储层的镜像）。取数索引
+`(requester_id, created_at, id)` 覆盖 adapter 的 `ORDER BY created_at ASC, id ASC` 与归属谓词。
+表里刻意**不**建产物位置与文件体（文件名 / 路径 / 下载地址 / 签名地址 / 存储 key / 对象 key /
+文件体 / 摘要）、内部资源内容与筛选条件、原始错误文本，以及存储侧簿记（有效期 / 下载时间 /
+软删除时间 / 幂等键）：原始 PII、文件路径、对象存储凭据与下载签名**都不得落库**，本表只保存
+受控状态与服务端生成的短引用，因此这些列既不在迁移里，也不在 adapter 的列清单里（adapter 的
+`POSTGRES_EXPORT_INTERNAL_COLUMNS` 把它们登记为「不进 SELECT / RETURNING」）。
 
 ## 命名与顺序
 
