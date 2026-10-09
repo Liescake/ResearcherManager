@@ -7,6 +7,8 @@ import type { ApiEnvelope, ApiErrorBody } from '@rm/shared';
  * 边界与不变量：
  * - 强制解析 `{ data, meta, error }` 信封，非信封响应一律视为错误（后端换了形状不会被当成成功）；
  * - 禁止请求绝对地址，避免把会话票据发往第三方；
+ * - 基地址 fail-closed 校验：只放行同源根相对路径与显式 http(s) 绝对地址，协议相对、带用户名/密码、
+ *   含控制字符等一律抛 `INVALID_BASE_URL`；校验在任何请求之前完成，票据不会被发出去；
  * - 统一超时并转换为稳定的前端错误码；
  * - 会话票据只经 `tokenProvider` 注入 `Authorization: Bearer`，**不落任何日志**；
  * - 401 不是「页面错误」而是「会话失效」：统一回调 `onUnauthorized`，由会话层清空并跳登录，
@@ -37,19 +39,128 @@ export class ApiClientError extends Error {
   }
 }
 
-/** 读取 VITE_API_BASE_URL；未配置时回落到同源 /api/v1（配合反向代理） */
+/** 基地址非法时的稳定错误码：fail-closed，请求根本不会发出，票据也就不可能被送出 */
+export const INVALID_BASE_URL_CODE = 'INVALID_BASE_URL';
+
+const HAS_SCHEME = /^[a-z][a-z0-9+.-]*:/iu;
+
+/** 控制字符（C0 与 DEL）检测：可用于 URL/头部注入，一律拒绝（按码点判断，避免正则控制字符） */
+function hasControlChars(value: string): boolean {
+  for (const char of value) {
+    const code = char.codePointAt(0) ?? 0;
+    if (code < 0x20 || code === 0x7f) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function invalidBaseUrl(reason: string): ApiClientError {
+  return new ApiClientError(
+    INVALID_BASE_URL_CODE,
+    `API 基地址不合法（${reason}），已拒绝，避免把会话票据发往非预期目标`,
+  );
+}
+
+function stripTrailingSlashes(value: string): string {
+  return value.replace(/\/+$/u, '');
+}
+
+/**
+ * 校验并归一化 API 基地址（唯一入口，必须 fail-closed）。
+ *
+ * 为什么必须校验：基地址决定 `Authorization: Bearer <会话票据>` 的去向，一个误配
+ * （协议相对 `//evil.com`、环境变量里混入的控制字符等）就等于把票据发给第三方。
+ * 因此只放行两类目标，其余一律抛 `INVALID_BASE_URL`：
+ * - 同源根相对路径（默认 `/api/v1`）：部署在反向代理后面时使用；
+ * - 显式 `http(s)://host[:port][/path]` 绝对地址：独立 API 域时使用。
+ *
+ * 明确拒绝：控制字符、反斜杠（浏览器把 `\` 当 `/`，`\evil.com` 会变成换源地址）、
+ * 协议相对 `//host`、非 http(s) 协议、空 origin、带用户名/密码、带查询串或片段，
+ * 以及不以 `/` 开头的裸相对值（会相对当前页面路径解析，落点不可预期）。
+ */
+function normalizeBaseUrl(raw: string | undefined): string {
+  const value = typeof raw === 'string' ? raw.trim() : '';
+  if (value === '') {
+    return DEFAULT_API_BASE_URL;
+  }
+  if (hasControlChars(value)) {
+    throw invalidBaseUrl('含控制字符');
+  }
+  if (value.includes('\\')) {
+    throw invalidBaseUrl('含反斜杠');
+  }
+  if (value.startsWith('//')) {
+    throw invalidBaseUrl('不允许协议相对地址');
+  }
+
+  if (!HAS_SCHEME.test(value)) {
+    if (!value.startsWith('/')) {
+      throw invalidBaseUrl('相对基地址必须以 / 开头');
+    }
+    if (value.includes('?') || value.includes('#')) {
+      throw invalidBaseUrl('不允许携带查询串或片段');
+    }
+    // 根路径 `/` 本身是合法的同源基地址：不能把末尾斜杠剥成空串——空基地址会让
+    // `baseUrl` 退化，且基地址字段不再是可解析的目标，因此单独保留为 `/`。
+    const stripped = stripTrailingSlashes(value);
+    return stripped === '' ? '/' : stripped;
+  }
+
+  const colon = value.indexOf(':');
+  const scheme = value.slice(0, colon).toLowerCase();
+  if (scheme !== 'http' && scheme !== 'https') {
+    throw invalidBaseUrl(`不支持的协议 ${scheme}:`);
+  }
+  if (value.slice(colon + 1, colon + 3) !== '//') {
+    throw invalidBaseUrl('绝对地址必须是 http(s)://host 形式');
+  }
+
+  const authorityStart = colon + 3;
+  const authorityEnd = value.slice(authorityStart).search(/[/?#]/u);
+  const authority =
+    authorityEnd === -1
+      ? value.slice(authorityStart)
+      : value.slice(authorityStart, authorityStart + authorityEnd);
+  if (authority === '') {
+    throw invalidBaseUrl('缺少有效 origin');
+  }
+  if (authority.includes('@')) {
+    throw invalidBaseUrl('不允许携带用户名/密码');
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw invalidBaseUrl('不是合法的 http(s) 地址');
+  }
+  if (parsed.search !== '' || parsed.hash !== '') {
+    throw invalidBaseUrl('不允许携带查询串或片段');
+  }
+  return stripTrailingSlashes(parsed.href);
+}
+
+/** 显式 baseUrl 与 VITE_API_BASE_URL 共用一套校验：空值回落默认，非法值 fail-closed */
+function resolveClientBaseUrl(baseUrl?: string): string {
+  return baseUrl === undefined ? resolveApiBaseUrl() : normalizeBaseUrl(baseUrl);
+}
+
+/** 读取 VITE_API_BASE_URL；未配置时回落到同源 /api/v1（配合反向代理）；非法值抛 INVALID_BASE_URL */
 export function resolveApiBaseUrl(env?: Record<string, unknown>): string {
   const source = env ?? (import.meta.env as unknown as Record<string, unknown>);
   const configured = source['VITE_API_BASE_URL'];
-  const value = typeof configured === 'string' ? configured.trim() : '';
-  return value === '' ? DEFAULT_API_BASE_URL : value.replace(/\/+$/u, '');
+  return normalizeBaseUrl(typeof configured === 'string' ? configured : undefined);
 }
 
 function joinUrl(baseUrl: string, path: string): string {
   if (/^[a-z][a-z0-9+.-]*:\/\//iu.test(path) || path.startsWith('//')) {
     throw new ApiClientError('INVALID_PATH', '不允许请求绝对地址');
   }
-  return `${baseUrl}${path.startsWith('/') ? path : `/${path}`}`;
+  // 基地址允许保留为站点根 `/`：拼接前剥掉末尾斜杠，否则 `baseUrl + '/path'` 会拼出
+  // `//path`——那是协议相对地址，会被浏览器解析成「另一个主机」，等于把票据换源发出去。
+  const base = stripTrailingSlashes(baseUrl);
+  return `${base}${path.startsWith('/') ? path : `/${path}`}`;
 }
 
 /** 分页查询串：pageSize 由共享常量封顶，服务端仍会再校验一次 */
@@ -74,6 +185,7 @@ export function buildPageQuery(query: {
 }
 
 export interface ApiClientOptions {
+  /** 基地址；与 `VITE_API_BASE_URL` 共用同一套校验，非法值抛 `INVALID_BASE_URL` */
   baseUrl?: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
@@ -106,7 +218,8 @@ function readRequestId(envelope: ApiEnvelope<unknown> | undefined): string | und
 }
 
 export function createApiClient(options: ApiClientOptions = {}): ApiClient {
-  const baseUrl = (options.baseUrl ?? resolveApiBaseUrl()).replace(/\/+$/u, '');
+  // 基地址先于任何请求完成校验：非法配置直接抛 INVALID_BASE_URL，票据不会被送出去
+  const baseUrl = resolveClientBaseUrl(options.baseUrl);
   const fetchImpl = options.fetchImpl ?? globalThis.fetch;
   const timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
 
