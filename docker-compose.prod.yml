@@ -1,0 +1,140 @@
+# ============================================================================
+# Researcher Manager —— 生产编排（单主机 / WSL2 或 Linux 主机）
+#
+# 与 `docker-compose.yml`（本地开发档）**分开维护**，不用 `-f` 叠加，原因：
+#   - 生产需要的差异是「结构性」的（TLS 档位、证书挂载、不发布数据库端口、
+#     必填的取证变量），叠加式覆盖对 `ports` 这类序列字段是**追加**而不是替换，
+#     很容易在评审时看错最终结果；独立文件让 `docker compose -f ... config`
+#     的输出就是最终事实。
+#   - 两份文件的服务集合与卷名保持一致，由 `pnpm verify:docker` 静态比对守护。
+#
+# 启动：
+#   docker compose -f docker-compose.prod.yml --env-file .env.docker.prod up -d
+#   docker compose -f docker-compose.prod.yml --env-file .env.docker.prod ps
+#
+# 【fail-closed 设计】本文件里所有机密与取证事实都用 `${VAR:?}` 声明为**必填**：
+# 缺任何一项，Compose 在解析阶段就报错退出，绝不带着空值/默认口令启动。具体地：
+#   - POSTGRES_* / DATABASE_URL / SESSION_SECRET：没有内置默认值；
+#   - DATABASE_SSL_MODE 在编排里**写死 verify-full**，不能用环境变量降级成
+#     disable/require（应用侧也会独立拒绝：NODE_ENV=production 时非 verify-full 一律
+#     拒绝启动，见 services/api/src/db/config/database-config.ts）；
+#   - DATABASE_EXECUTOR_* / DATABASE_SCHEMA_* / DATABASE_MIGRATION_*：SQL 执行器的
+#     取证事实必须由**真的做过验证的人或 CI**填写（代码不会生成「已验证」），
+#     缺失时应用在任何数据库连接之前终止启动；
+#   - 证书只登记**路径**，内容来自 `${RM_TLS_DIR}` 的只读挂载，绝不写入仓库。
+#
+# 【TLS 拓扑】两端都显式启用 TLS：
+#   - postgres：`ssl=on` + 服务端证书从 `${RM_TLS_DIR}` 挂载，并用随仓库公开分发的
+#     `db/docker/prod/pg_hba.conf`（`hba_file=`）**只接受 hostssl**、显式 reject 明文连接；
+#   - api：`DATABASE_SSL_MODE=verify-full`（校验证书链与主机名），CA 来自同一挂载。
+#   证书文件必须对容器内的 postgres/node 用户可读（见 DOCKER.md「证书准备」）。
+#
+# 【未做的验证，如实声明】本文件只通过 `docker compose ... config` 做了静态渲染校验；
+# 本构建环境没有可用的 Docker 守护进程，因此**没有**做真实启动/连通性验证。
+# ============================================================================
+
+name: researcher-manager-prod
+
+networks:
+  rm-internal:
+    driver: bridge
+
+volumes:
+  rm-postgres-data:
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:?生产必须显式提供 POSTGRES_USER（无默认值）}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?生产必须显式提供 POSTGRES_PASSWORD（无默认值）}"
+      POSTGRES_DB: "${POSTGRES_DB:?生产必须显式提供 POSTGRES_DB（无默认值）}"
+      POSTGRES_INITDB_ARGS: "--data-checksums --auth-host=scram-sha-256 --auth-local=scram-sha-256"
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/etc/rm-tls/server.crt
+      - -c
+      - ssl_key_file=/etc/rm-tls/server.key
+      - -c
+      - ssl_ca_file=/etc/rm-tls/ca.pem
+      # 只接受 TLS：明文 host 连接被显式拒绝（见该文件内的 hostssl / hostnossl 规则）
+      - -c
+      - hba_file=/etc/rm-tls/pg_hba.conf
+    networks:
+      - rm-internal
+    # 生产**不**把数据库端口发布到宿主机：只允许编排网络内的 api 访问
+    expose:
+      - "5432"
+    volumes:
+      - rm-postgres-data:/var/lib/postgresql/data
+      - "${RM_TLS_DIR:?生产必须通过 RM_TLS_DIR 提供证书目录（绝对路径）}:/etc/rm-tls:ro"
+    healthcheck:
+      test: ["CMD-SHELL", 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    restart: always
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      NODE_ENV: production
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      API_HOST: "0.0.0.0"
+      API_PORT: "3000"
+      API_PREFIX: "${API_PREFIX:-/api/v1}"
+      API_PUBLIC_URL: "${API_PUBLIC_URL:?生产必须显式提供对外地址 API_PUBLIC_URL（用于日志与导出链接）}"
+      # 连接串指向编排网络内的 postgres；sslmode 与下面的显式档位同义
+      DATABASE_URL: "${DATABASE_URL:?生产必须显式提供 DATABASE_URL（无默认值）}"
+      # 写死 verify-full：生产只接受可校验证书链与主机名的 TLS，不可用环境变量降级
+      DATABASE_SSL_MODE: verify-full
+      DATABASE_SSL_CA_PATH: "/etc/rm-tls/ca.pem"
+      # 双向 TLS（可选）：留空即不使用客户端证书；证书与私钥必须成对（应用侧校验）
+      DATABASE_SSL_CERT_PATH: "${RM_TLS_CLIENT_CERT_PATH:-}"
+      DATABASE_SSL_KEY_PATH: "${RM_TLS_CLIENT_KEY_PATH:-}"
+      DATABASE_APPLICATION_NAME: "${DATABASE_APPLICATION_NAME:-researcher-manager-api}"
+      SESSION_SECRET: "${SESSION_SECRET:?生产必须显式提供 SESSION_SECRET（至少 32 字节随机值）}"
+      # ---- SQL 执行器取证事实（CI / 运维填写，缺失即 fail-closed）----
+      DATABASE_EXECUTOR_EVIDENCE_ID: "${DATABASE_EXECUTOR_EVIDENCE_ID:?执行器取证事实缺失：必须由已完成的验证填写}"
+      DATABASE_EXECUTOR_VERIFIED_BY: "${DATABASE_EXECUTOR_VERIFIED_BY:?执行器取证事实缺失：必须填写验证人/任务标识}"
+      DATABASE_EXECUTOR_VERIFIED_AT: "${DATABASE_EXECUTOR_VERIFIED_AT:?执行器取证事实缺失：必须填写验证时间}"
+      DATABASE_EXECUTOR_EVIDENCE_REF: "${DATABASE_EXECUTOR_EVIDENCE_REF:?执行器取证事实缺失：必须填写可核对引用（CI 链接/用例路径）}"
+      DATABASE_EXECUTOR_EVIDENCE_METHOD: "${DATABASE_EXECUTOR_EVIDENCE_METHOD:?执行器取证事实缺失：必须填写 integration-test / contract-test / manual-review}"
+      DATABASE_SCHEMA_READINESS_ID: "${DATABASE_SCHEMA_READINESS_ID:?schema 就绪事实缺失：必须由迁移核对结果填写}"
+      DATABASE_SCHEMA_CHECKED_BY: "${DATABASE_SCHEMA_CHECKED_BY:?schema 就绪事实缺失：必须填写核对人/任务标识}"
+      DATABASE_SCHEMA_CHECKED_AT: "${DATABASE_SCHEMA_CHECKED_AT:?schema 就绪事实缺失：必须填写核对时间}"
+      DATABASE_SCHEMA_READINESS_REF: "${DATABASE_SCHEMA_READINESS_REF:?schema 就绪事实缺失：必须填写可核对引用}"
+      DATABASE_MIGRATION_AVAILABLE_VERSIONS: "${DATABASE_MIGRATION_AVAILABLE_VERSIONS:?迁移版本事实缺失：必须填写代码侧可用版本}"
+      DATABASE_MIGRATION_APPLIED_VERSIONS: "${DATABASE_MIGRATION_APPLIED_VERSIONS:?迁移版本事实缺失：必须按 pnpm db:migrate:status 的真实输出填写}"
+      AI_PROVIDER: "${AI_PROVIDER:-disabled}"
+      AI_MATCHING_ENABLED: "${AI_MATCHING_ENABLED:-false}"
+      AI_BASE_URL: "${AI_BASE_URL:-}"
+      AI_API_KEY: "${AI_API_KEY:-}"
+      AI_MODEL: "${AI_MODEL:-}"
+    networks:
+      - rm-internal
+    ports:
+      - "${API_PORT:-3000}:3000"
+    volumes:
+      # 只读挂载证书：内容绝不写入镜像/仓库，只登记路径
+      - "${RM_TLS_DIR:?生产必须通过 RM_TLS_DIR 提供证书目录（绝对路径）}:/etc/rm-tls:ro"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "scripts/docker-healthcheck.mjs"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    restart: always

@@ -1,0 +1,102 @@
+# ============================================================================
+# Researcher Manager —— 本地开发编排（WSL2 + Docker Desktop）
+#
+# 【适用范围 · 仅本机】本文件面向**单机开发/联调**：
+#   - 口令来自环境变量且**没有内置默认值**（`${VAR:?}` 未提供即报错退出），
+#     但这只是「不出现人人可猜的默认口令」，不等于生产凭据管理；
+#   - 数据库不启用 TLS（`DATABASE_SSL_MODE=disable`），仅当数据库只在本机网络内时才允许；
+#   - 证书目录、.env 文件都不入库（见 .gitignore / .dockerignore）。
+#   生产编排请用 `docker-compose.prod.yml`（TLS verify-full + 证书挂载 + fail-closed）。
+#
+# 快速开始（完整说明见仓库根 DOCKER.md）：
+#   cp .env.docker.example .env.docker      # 只在本机填写，禁止提交
+#   docker compose --env-file .env.docker up -d postgres   # 只起本地开发库（55432）
+#   docker compose --env-file .env.docker up -d            # 起库 + API 容器
+#   docker compose --env-file .env.docker ps               # 等 healthcheck 变 healthy
+#   docker compose --env-file .env.docker down             # 停止（加 -v 连数据卷一起删）
+#
+# 编排要点（与验收口径一一对应）：
+#   - 网络：两个服务都在显式声明的 `rm-internal` 桥接网络上，互不依附默认网络；
+#   - 健康检查：postgres=`pg_isready`，api=`scripts/docker-healthcheck.mjs`（跟随 API_PREFIX）；
+#   - 持久卷：`rm-postgres-data` 具名卷保存数据（`down -v` 才会删除）；
+#   - 凭据：POSTGRES_USER / POSTGRES_PASSWORD / SESSION_SECRET **必须由环境变量提供**；
+#   - 依赖顺序：api `depends_on: postgres: condition: service_healthy`——库没就绪就不启动 API；
+#   - API 认证门禁：开发档位的 api **不注入 DATABASE_URL**，因为只要解析出 DATABASE_URL，
+#     启动期持久化边界就要求「已 attest 的 SQL 执行器 + 认证依赖就绪」，会话存储切片落地前
+#     带库启动会按设计 fail-closed（这是安全边界，不是配置错误）。带库启动属生产/集成演练，
+#     见 docker-compose.prod.yml 与 README「边界」一节。
+# ============================================================================
+
+name: researcher-manager
+
+networks:
+  # 所有服务（api ↔ postgres）都接在这个显式网络上；不依赖 Compose 隐式默认网络
+  rm-internal:
+    driver: bridge
+
+volumes:
+  # 具名卷：容器重建/`down` 都不会丢数据，只有 `down -v` 显式删除
+  rm-postgres-data:
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      # 凭据全部来自环境变量，没有 `:-默认值`：未提供时 Compose 直接报错（fail-closed）
+      POSTGRES_USER: "${POSTGRES_USER:?POSTGRES_USER 未设置：请 cp .env.docker.example .env.docker 填写后用 --env-file 启动}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未设置：请 cp .env.docker.example .env.docker 填写后用 --env-file 启动}"
+      # 库名不是凭据，允许默认；可用 POSTGRES_DB 覆盖
+      POSTGRES_DB: "${POSTGRES_DB:-researcher_manager}"
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    networks:
+      - rm-internal
+    ports:
+      # 默认发布到 55432，避开宿主机已装的 5432；集成测试从宿主机经此端口连接
+      - "${POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - rm-postgres-data:/var/lib/postgresql/data
+      # 首次初始化时额外创建集成测试库（库名含 test，集成测试的 fail-closed 前置）
+      - ./db/docker/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # 用 $$ 转义：由容器内的值展开，避免宿主机插值造成的口径漂移
+      test: ["CMD-SHELL", 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      NODE_ENV: development
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      # 容器内必须监听 0.0.0.0（默认 127.0.0.1 只在容器内可见，端口映射拿不到）
+      API_HOST: "0.0.0.0"
+      API_PORT: "3000"
+      API_PREFIX: "${API_PREFIX:-/api/v1}"
+      # 容器内主机名不是回环地址，TLS 档位必须**显式**声明（安全默认值是 require）；
+      # 本地开发库仅在本机网络内，显式 disable 只在本文件（本地档）使用
+      DATABASE_SSL_MODE: disable
+      # 会话密钥没有默认值：示例文件里也只是占位符，真实值由本机生成
+      SESSION_SECRET: "${SESSION_SECRET:?SESSION_SECRET 未设置：请 cp .env.docker.example .env.docker 填写（至少 32 字节随机值）}"
+      AI_PROVIDER: "${AI_PROVIDER:-mock}"
+      AI_MATCHING_ENABLED: "${AI_MATCHING_ENABLED:-false}"
+    networks:
+      - rm-internal
+    ports:
+      - "${API_PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        # 关键：等 postgres 健康再启动 api，而不是「容器进程起来了」就算就绪
+        condition: service_healthy
+    healthcheck:
+      # 与镜像 HEALTHCHECK 同一份探针（跟随 API_PREFIX，不硬编码路径）
+      test: ["CMD", "node", "scripts/docker-healthcheck.mjs"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
