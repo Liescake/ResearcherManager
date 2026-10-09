@@ -332,9 +332,9 @@ describe('未装配 Postgres adapter 边界：磁盘自动枚举 + 登记表 + �
     ].sort();
     expect(discovered).toHaveLength(registered.length);
     expect(discovered).toEqual(registered);
-    // 12 个 adapter：11 个未装配 + 1 个已绑定（statistics）
+    // 12 个 adapter：10 个未装配 + 2 个已绑定（auth=会话存储、statistics=本人统计聚合读）
     expect(POSTGRES_ADAPTER_REGISTRY).toHaveLength(10);
-    expect(POSTGRES_BOUND_SLICE_REGISTRY.map((item) => item.id)).toEqual(['statistics']);
+    expect(POSTGRES_BOUND_SLICE_REGISTRY.map((item) => item.id)).toEqual(['auth', 'statistics']);
     // 枚举口径必须由后缀唯一决定：任何名字不以该后缀结尾的 adapter 都不在门禁范围内
     for (const file of discovered) {
       expect(file.endsWith(POSTGRES_ADAPTER_FILE_SUFFIX)).toBe(true);
@@ -349,7 +349,7 @@ describe('未装配 Postgres adapter 边界：磁盘自动枚举 + 登记表 + �
     expect(report.checkedAdapters).toEqual(
       [...POSTGRES_ADAPTER_REGISTRY, ...POSTGRES_BOUND_SLICE_REGISTRY].map((item) => item.id),
     );
-    expect(report.exemptedModules).toEqual(['auth']);
+    expect(report.exemptedModules).toEqual([]);
   });
 
   it('断言版在真实数据上不抛错（供后续接入启动期闸门复用）', async () => {

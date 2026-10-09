@@ -149,6 +149,7 @@ describe('readMigrationDirectory：与仓库真实迁移对齐', () => {
       '0003_join_applications.sql',
       '0004_achievements.sql',
       '0005_ai_match_records.sql',
+      '0006_sessions.sql',
     ]);
     expect(descriptors.map((item) => item.version)).toEqual([
       '0001',
@@ -156,9 +157,17 @@ describe('readMigrationDirectory：与仓库真实迁移对齐', () => {
       '0003',
       '0004',
       '0005',
+      '0006',
     ]);
     // 全部迁移都必须是「可回滚」：四位序号迁移由 DROP TABLE IF EXISTS 恢复
-    expect(descriptors.map((item) => item.reversible)).toEqual([true, true, true, true, true]);
+    expect(descriptors.map((item) => item.reversible)).toEqual([
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+    ]);
     // 与 CI 静态门禁同源：文件内容必须真的可解析
     expect(
       readFileSync(join(repoRoot, 'db', 'migrations', '0001_bootstrap.sql'), 'utf8'),
@@ -174,6 +183,10 @@ describe('readMigrationDirectory：与仓库真实迁移对齐', () => {
         new RegExp(`CREATE\\s+TABLE\\s+IF\\s+NOT\\s+EXISTS\\s+${table}\\s*\\(`, 'u'),
       );
     }
+    // 会话存储切片的表同样必须**真的**由迁移建出来，而不是只在注释里登记
+    expect(readFileSync(join(repoRoot, 'db', 'migrations', '0006_sessions.sql'), 'utf8')).toMatch(
+      /CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+sessions\s*\(/u,
+    );
   });
 });
 

@@ -20,6 +20,16 @@ import {
  *    此时**不能**退化成「按已知角色继续」，只能整体拒绝。
  *
  * 本类不做授权判定：资源级判定仍由 `AuthorizationGuard` 负责。
+ *
+ * ## 存储边界的两种失败必须区分
+ * - **票据对不上主体**（不存在 / 已撤销 / 已过期 / 主体不合法）→ `undefined` → 401；
+ * - **存储读不出来**（连接失败、SQL 失败、行契约被破坏）→ 由 `SessionStore.findSession` 抛出，
+ *   本方法**不吞**这些异常：挂上 `catch` 退化成 `undefined` 会把数据库故障伪装成「全部用户未登录」。
+ *   原始异常文本的脱敏职责在存储层（adapter 只抛不含驱动原文的 `EXECUTOR_FAILURE`）。
+ *
+ * ## 为什么异步
+ * 生产会话存储是 PostgreSQL，读取是一次 I/O。同步签名会迫使持久化实现引入进程内缓存
+ * （即「主体其实来自本地副本，而不是服务端存储」），那正好会破坏本文件第 2 条性质。
  */
 @Injectable()
 export class BearerSessionSubjectResolver implements SessionSubjectResolver {
@@ -29,10 +39,12 @@ export class BearerSessionSubjectResolver implements SessionSubjectResolver {
     return this.store.capabilities;
   }
 
-  resolveSubject(authorizationHeader: string | undefined): AuthorizationSubject | undefined {
+  async resolveSubject(
+    authorizationHeader: string | undefined,
+  ): Promise<AuthorizationSubject | undefined> {
     const sessionId = extractSessionId(authorizationHeader);
     if (!sessionId) return undefined;
-    return normalizeSubject(this.store.findSession(sessionId));
+    return normalizeSubject(await this.store.findSession(sessionId));
   }
 }
 

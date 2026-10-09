@@ -1,12 +1,12 @@
 /**
- * 跨 adapter 持久化边界登记表与判定器（**未装配 Postgres adapter 的唯一事实来源**）。
+ * 跨 adapter 持久化边界登记表与判定器（**已落地 Postgres 切片的唯一事实来源**）。
  *
  * ## 为什么需要这一层
- * `modules/**\/*.postgres-repository.ts` 的十一个 PostgreSQL adapter 目前全部是「已写好但
+ * `modules/**\/*.postgres-repository.ts` 的十个 PostgreSQL adapter 目前是「已写好但
  * **未装配**」的实现：它们不参与依赖注入、不进入任何业务 Module 的 provider、不引入任何驱动
  * 依赖，能力声明固定为 `backend = postgres` / `persistent = true` / `productionReady = false`。
  * 每个 adapter 自己的 spec 只能证明「本 adapter 没被装配」，**无法回答跨 adapter 的问题**：
- * 新增了第十二个 adapter 但忘了登记、两个 adapter 争抢同一个模块、登记表指向了不存在的文件、
+ * 新增了第十一个 adapter 但忘了登记、两个 adapter 争抢同一个模块、登记表指向了不存在的文件、
  * 有人偷偷把 adapter 写进 provider 或引入 `pg` —— 这些都必须由一道**跨 adapter 的门禁**发现。
  *
  * 因此这里做三件事：
@@ -56,7 +56,7 @@ export interface PostgresAdapterDescriptor {
 }
 
 /**
- * 十一个未装配 Postgres adapter 的登记表（按模块名字母序，便于人工比对）。
+ * 十个未装配 Postgres adapter 的登记表（按模块名字母序，便于人工比对）。
  *
  * 新增 adapter 时**必须同时**在此登记：门禁会拿磁盘枚举结果与这张表做双向比对，
  * 只加文件不登记（`ADAPTER_FILE_NOT_REGISTERED`）与只登记不加文件（`REGISTERED_FILE_MISSING`）
@@ -158,8 +158,15 @@ export const POSTGRES_ADAPTER_REGISTRY: readonly PostgresAdapterDescriptor[] = [
 /**
  * **已绑定**的持久化切片：adapter 已经进入业务 Module 的 provider（经工厂构造），因此
  * 「未装配」那一组规则（不得被 Module 引用）对它们**不成立** —— 但必须换成另一组同样可机器
- * 判定的规则，而不是简单地放行：
+ * 判定的规则，而不是简单地放行。
  *
+ * 两个切片：
+ * - `auth`：会话存储（`SESSION_STORE`）。「是否配置数据库」决定绑定哪个实现；未配置时绑定内存基线，
+ *   配置时绑定 PostgreSQL 实现（延迟建连，见 `modules/auth/session-store.postgres-repository.ts`）。
+ *   因此 `auth.module.ts` 里出现的是**工厂导出名**，而不是 adapter 类名；
+ * - `statistics`：本人统计聚合读（`SELF_STATISTICS_REPOSITORY`），同样的「按是否配置数据库分流」。
+ *
+ * 规则：
  * 1. adapter 文件仍然必须在磁盘上存在，且不得 import / 转发另一个 `*.postgres-repository`；
  * 2. 能力声明仍是 `backend = postgres`、`persistent = true`、`productionReady = false`
  *    （本阶段尚未取得 attest 证据，不得声称生产可用）；
@@ -189,6 +196,17 @@ export interface PostgresBoundSliceDescriptor {
 
 export const POSTGRES_BOUND_SLICE_REGISTRY: readonly PostgresBoundSliceDescriptor[] = [
   {
+    id: 'auth',
+    module: 'auth',
+    file: 'modules/auth/session-store.postgres-repository.ts',
+    capabilitiesExport: 'POSTGRES_SESSION_STORE_CAPABILITIES',
+    assertExport: 'assertPostgresSessionStoreCapabilities',
+    repositoryClass: 'PostgresSessionStore',
+    moduleFile: 'modules/auth/auth.module.ts',
+    token: 'SESSION_STORE',
+    factoryExport: 'createLazyPostgresSessionStore',
+  },
+  {
     id: 'statistics',
     module: 'statistics',
     file: 'modules/statistics/statistics.postgres-repository.ts',
@@ -204,6 +222,11 @@ export const POSTGRES_BOUND_SLICE_REGISTRY: readonly PostgresBoundSliceDescripto
 /**
  * 有持久化端口但**尚未**落地 Postgres adapter 的模块（必须给出理由，不允许悄悄缺席）。
  * 登记项与磁盘状态无关：门禁只要求「没 adapter 就必须有理由」，有理由也会被复核是否陈旧。
+ *
+ * 当前为空集：`PERSISTENCE_BINDINGS` 里的每个业务模块都已经有登记在
+ * `POSTGRES_ADAPTER_REGISTRY`（未装配）或 `POSTGRES_BOUND_SLICE_REGISTRY`（已绑定）的 adapter。
+ * 空集是有意义的断言 —— 一旦某个模块新增了持久化端口却既没有 adapter 也没有理由，
+ * 门禁会以 `PERSISTENCE_PORT_WITHOUT_ADAPTER` 直接失败。
  */
 export interface PostgresAdapterExemption {
   readonly module: string;
@@ -212,14 +235,7 @@ export interface PostgresAdapterExemption {
   readonly reason: string;
 }
 
-export const POSTGRES_ADAPTER_EXEMPTIONS: readonly PostgresAdapterExemption[] = [
-  {
-    module: 'auth',
-    token: 'SESSION_STORE',
-    reason:
-      '会话存储 adapter 未落地：会话后端选型（数据库会话表 vs 独立会话存储）与驱动引入属于「启用数据库」那一步，本切片不预判；因此 auth 模块暂时只在登记表里出现端口、不出现 adapter',
-  },
-];
+export const POSTGRES_ADAPTER_EXEMPTIONS: readonly PostgresAdapterExemption[] = [];
 
 /**
  * **已授权引入**的 PostgreSQL 驱动包（本阶段：官方 `pg` 驱动 + 其类型声明）。
