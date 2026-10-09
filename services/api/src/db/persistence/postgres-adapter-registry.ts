@@ -2,10 +2,10 @@
  * 跨 adapter 持久化边界登记表与判定器（**已落地 Postgres 切片的唯一事实来源**）。
  *
  * ## 为什么需要这一层
- * `modules/**\/*.postgres-repository.ts` 的十二个 PostgreSQL adapter 分成两组：七个是「已写好但
+ * `modules/**\/*.postgres-repository.ts` 的十二个 PostgreSQL adapter 分成两组：六个是「已写好但
  * **未装配**」的实现（它们不参与依赖注入、不进入任何业务 Module 的 provider、不引入任何驱动
  * 依赖，能力声明固定为 `backend = postgres` / `persistent = true` / `productionReady = false`），
- * 五个已按「是否配置数据库」绑定到端口（见下 `POSTGRES_BOUND_SLICE_REGISTRY`）。
+ * 六个已按「是否配置数据库」绑定到端口（见下 `POSTGRES_BOUND_SLICE_REGISTRY`）。
  * 每个 adapter 自己的 spec 只能证明「本 adapter 的装配状态」，**无法回答跨 adapter 的问题**：
  * 新增了第十一个 adapter 但忘了登记、两个 adapter 争抢同一个模块、登记表指向了不存在的文件、
  * 有人偷偷把 adapter 写进 provider 或引入 `pg` —— 这些都必须由一道**跨 adapter 的门禁**发现。
@@ -57,7 +57,7 @@ export interface PostgresAdapterDescriptor {
 }
 
 /**
- * 七个未装配 Postgres adapter 的登记表（按模块名字母序，便于人工比对）。
+ * 六个未装配 Postgres adapter 的登记表（按模块名字母序，便于人工比对）。
  *
  * 新增 adapter 时**必须同时**在此登记：门禁会拿磁盘枚举结果与这张表做双向比对，
  * 只加文件不登记（`ADAPTER_FILE_NOT_REGISTERED`）与只登记不加文件（`REGISTERED_FILE_MISSING`）
@@ -110,15 +110,6 @@ export const POSTGRES_ADAPTER_REGISTRY: readonly PostgresAdapterDescriptor[] = [
     moduleFile: 'modules/matching/matching.module.ts',
   },
   {
-    id: 'memberships',
-    module: 'memberships',
-    file: 'modules/memberships/applications.postgres-repository.ts',
-    capabilitiesExport: 'POSTGRES_APPLICATION_REPOSITORY_CAPABILITIES',
-    assertExport: 'assertPostgresApplicationRepositoryCapabilities',
-    repositoryClass: 'PostgresApplicationRepository',
-    moduleFile: 'modules/memberships/memberships.module.ts',
-  },
-  {
     id: 'notifications',
     module: 'notifications',
     file: 'modules/notifications/notifications.postgres-repository.ts',
@@ -134,7 +125,7 @@ export const POSTGRES_ADAPTER_REGISTRY: readonly PostgresAdapterDescriptor[] = [
  * 「未装配」那一组规则（不得被 Module 引用）对它们**不成立** —— 但必须换成另一组同样可机器
  * 判定的规则，而不是简单地放行。
  *
- * 五个切片：
+ * 六个切片：
  * - `auth`：会话存储（`SESSION_STORE`）。「是否配置数据库」决定绑定哪个实现；未配置时绑定内存基线，
  *   配置时绑定 PostgreSQL 实现（延迟建连，见 `modules/auth/session-store.postgres-repository.ts`）。
  *   因此 `auth.module.ts` 里出现的是**工厂导出名**，而不是 adapter 类名；
@@ -145,6 +136,12 @@ export const POSTGRES_ADAPTER_REGISTRY: readonly PostgresAdapterDescriptor[] = [
  *   未配置数据库时内存基线，配置时 PostgreSQL 实现（延迟建连，见
  *   `modules/education/education-records.postgres-repository.ts`）；单条读取把归属下推进 SQL
  *   （`findById(recordId, ownerUserId)`），因此「不存在」与「他人记录」统一为 404、不可探测；
+ * - `memberships`：入组申请存储（`APPLICATION_REPOSITORY`，即入组申请学生自服务切片）。分流口径
+ *   与 auth 完全一致：未配置数据库时内存基线，配置时 PostgreSQL 实现（延迟建连，见
+ *   `modules/memberships/applications.postgres-repository.ts` 的
+ *   `createLazyPostgresApplicationRepository`）；单条读取同样把归属下推进 SQL
+ *   （`findById(applicationId, ownerUserId)`），因此「不存在」与「他人申请」统一为 404、不可探测，
+ *   而授权（`membership:self:*` + `SELF`）在 service 里**先于任何仓储访问**；
  * - `profiles`：学生画像存储（`PROFILE_REPOSITORY`）。分流口径与 auth 完全一致：同一份纯函数
  *   `resolveAppDatabaseConfig` + 可选注入的 `SQL_CONNECTION_FACTORY`，未配置数据库时内存基线，
  *   配置时 PostgreSQL 实现（延迟建连，见 `modules/profiles/student-profile.postgres-repository.ts`）；
@@ -159,7 +156,7 @@ export const POSTGRES_ADAPTER_REGISTRY: readonly PostgresAdapterDescriptor[] = [
  *    只改其中一处即 fail-closed；
  * 5. adapter 源文件不得 import 任何驱动（含已授权的 `pg`）：驱动只允许出现在
  *    `db/postgres/` 驱动层；
- * 6. 其余七个 adapter 继续留在 `POSTGRES_ADAPTER_REGISTRY`（未装配组），两组互斥。
+ * 6. 其余六个 adapter 继续留在 `POSTGRES_ADAPTER_REGISTRY`（未装配组），两组互斥。
  */
 export interface PostgresBoundSliceDescriptor {
   /** 稳定 id */
@@ -211,6 +208,17 @@ export const POSTGRES_BOUND_SLICE_REGISTRY: readonly PostgresBoundSliceDescripto
     moduleFile: 'modules/education/education.module.ts',
     token: 'EDUCATION_RECORD_REPOSITORY',
     factoryExport: 'createLazyPostgresEducationRecordRepository',
+  },
+  {
+    id: 'memberships',
+    module: 'memberships',
+    file: 'modules/memberships/applications.postgres-repository.ts',
+    capabilitiesExport: 'POSTGRES_APPLICATION_REPOSITORY_CAPABILITIES',
+    assertExport: 'assertPostgresApplicationRepositoryCapabilities',
+    repositoryClass: 'PostgresApplicationRepository',
+    moduleFile: 'modules/memberships/memberships.module.ts',
+    token: 'APPLICATION_REPOSITORY',
+    factoryExport: 'createLazyPostgresApplicationRepository',
   },
   {
     id: 'profiles',

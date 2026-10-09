@@ -22,8 +22,8 @@ import {
 } from './applications.contract';
 import type {
   Application,
+  ApplicationRepository,
   ApplicationRepositoryCapabilities,
-  AsyncApplicationRepository,
 } from './applications.port';
 import {
   APPLICATION_REPOSITORY_BACKEND_POSTGRES,
@@ -52,8 +52,8 @@ import {
  *
  * 覆盖用户要求的五类补充测试与两条交付边界：
  * - **repository 契约**：能力声明（persistent=true / productionReady=false）、列 ↔ 读取契约字段
- *   一一对应、审核内部列必须被公开视图裁剪、未被装配到 `MembershipsModule`、不引驱动/ORM、
- *   `join_applications` 尚未转为迁移；异步契约与同步端口方法集对应（`findById` 的主体参数是
+ *   一一对应、审核内部列必须被公开视图裁剪、**经工厂绑定到 `MembershipsModule`**、不引驱动/ORM、
+ *   `join_applications` 已由迁移 0003 建立；端口是**单一异步契约**（`findById` 的主体参数是
  *   刻意且已文档化的归属隔离强化）；
  * - **参数化 SQL 与固定标识符**：客户端可控值只出现在参数里，SQL 文本只由模块常量构成
  *   （语句里没有任何引号 / 分号 / 注释符，因此不存在字面量注入面）；
@@ -89,8 +89,11 @@ const MEMBERSHIPS_DIR = resolve(process.cwd(), 'src', 'modules', 'memberships');
 const ADAPTER_PATH = resolve(MEMBERSHIPS_DIR, 'applications.postgres-repository.ts');
 const PORT_PATH = resolve(MEMBERSHIPS_DIR, 'applications.port.ts');
 const MODULE_PATH = resolve(MEMBERSHIPS_DIR, 'memberships.module.ts');
-const ADAPTER_CLASS = 'PostgresApplicationRepository';
-const ADAPTER_MODULE = 'applications.postgres-repository';
+/**
+ * adapter **类名**的独立引用（词边界）：工厂导出名 `createLazyPostgresApplicationRepository`
+ * 把它作为后缀包含在内，因此不能用「子串出现」来判定「某文件引用了 adapter 类」。
+ */
+const ADAPTER_CLASS_REFERENCE = /\bPostgresApplicationRepository\b/u;
 
 interface RecordedCall {
   readonly sql: string;
@@ -439,12 +442,12 @@ describe('PostgreSQL 入组申请仓储：repository 契约与能力声明', () 
     expect([...mutable, ...immutable].sort()).toEqual([...POSTGRES_APPLICATION_COLUMNS].sort());
   });
 
-  it('实现的是异步仓储契约（Promise 语义），未被绑定为同步端口', async () => {
+  it('实现的是运行时端口契约（Promise 语义 + 归属感知取数）', async () => {
     const { repository, executor } = repoWith(
       { rows: [rowFromRecord()], rowCount: 1 },
       { rows: [], rowCount: 0 },
     );
-    const port: AsyncApplicationRepository = repository;
+    const port: ApplicationRepository = repository;
 
     expect(port.capabilities).toEqual(POSTGRES_APPLICATION_REPOSITORY_CAPABILITIES);
     const created = port.create(APPLICATION);
@@ -465,39 +468,36 @@ describe('PostgreSQL 入组申请仓储：repository 契约与能力声明', () 
     expect(source).not.toContain('@nestjs');
   });
 
-  it('异步契约与同步端口方法集对应，两处刻意签名差异都写在契约注释里', () => {
+  it('端口是**单一异步契约**（收敛完成：不再并存同步端口），两处刻意签名差异都写在契约注释里', () => {
     const source = readFileSync(PORT_PATH, 'utf8');
-    const asyncStart = source.indexOf('export interface AsyncApplicationRepository {');
-    const asyncEnd = source.indexOf('/** DI 令牌：入组申请仓储 */');
-    expect(asyncStart).toBeGreaterThan(-1);
-    expect(asyncEnd).toBeGreaterThan(asyncStart);
-    const asyncBlock = source.slice(asyncStart, asyncEnd);
+    const portStart = source.indexOf('export interface ApplicationRepository {');
+    const portEnd = source.indexOf('/** DI 令牌：入组申请仓储 */');
+    expect(portStart).toBeGreaterThan(-1);
+    expect(portEnd).toBeGreaterThan(portStart);
+    const portBlock = source.slice(portStart, portEnd);
 
-    expect(asyncBlock).toContain('create(application: Application): Promise<Application>;');
-    expect(asyncBlock).toContain('listByUserId(userId: string): Promise<readonly Application[]>;');
-    expect(asyncBlock).toContain(
+    expect(portBlock).toContain('create(application: Application): Promise<Application>;');
+    expect(portBlock).toContain('listByUserId(userId: string): Promise<readonly Application[]>;');
+    expect(portBlock).toContain(
       'listByUserAndGroup(userId: string, groupId: string): Promise<readonly Application[]>;',
     );
-    expect(asyncBlock).toContain('save(application: Application): Promise<Application>;');
+    expect(portBlock).toContain('save(application: Application): Promise<Application>;');
     // 单条读取必须携带服务端主体（否则就不存在「他人记录不出库」的路径）——刻意差异 1
-    expect(asyncBlock).toContain(
+    expect(portBlock).toContain(
       'findById(applicationId: string, ownerUserId: string): Promise<Application | undefined>;',
     );
-    expect(asyncBlock).toContain('ownerUserId');
-    // 分页窗口属于后续切片：异步契约不得预置用不上的参数
-    expect(asyncBlock).not.toMatch(/\b(?:window|limit|offset|page|cursor)\b/iu);
+    expect(portBlock).toContain('ownerUserId');
+    // 分页窗口属于后续切片：端口不得预置用不上的参数
+    expect(portBlock).not.toMatch(/\b(?:window|limit|offset|page|cursor)\b/iu);
     // 刻意差异 2：`save` 的归属取自记录（记录由 service 从存储记录构造），契约里写明
-    expect(asyncBlock).toContain('归属下推进 SQL');
+    expect(portBlock).toContain('归属下推进 SQL');
 
-    // 同步端口仍是同步的（本切片只新增并存的异步契约，一字未改运行时绑定）
-    expect(source).toContain('export interface ApplicationRepository {');
-    expect(source).toContain('create(application: Application): Application;');
-    expect(source).toContain('findById(applicationId: string): Application | undefined;');
-    expect(source).toContain('listByUserId(userId: string): readonly Application[];');
-    expect(source).toContain(
-      'listByUserAndGroup(userId: string, groupId: string): readonly Application[];',
-    );
-    expect(source).toContain('save(application: Application): Application;');
+    // 收敛事实：只剩这一份契约 —— 同步端口与并存的异步契约都不再是 interface 声明
+    expect(source).not.toContain('export interface AsyncApplicationRepository');
+    expect(source).not.toContain('create(application: Application): Application;');
+    expect(source).not.toContain('findById(applicationId: string): Application | undefined;');
+    expect(source).not.toContain('listByUserId(userId: string): readonly Application[];');
+    expect(source).not.toContain('save(application: Application): Application;');
   });
 });
 
@@ -1812,31 +1812,34 @@ describe('PostgreSQL 入组申请仓储：公开视图与错误信息（不泄�
   });
 });
 
-describe('PostgreSQL 入组申请仓储：未装配、无驱动依赖、与 schema 边界对齐', () => {
-  it('MembershipsModule 仍只绑定内存基线（本 adapter 未被装配）', () => {
+describe('PostgreSQL 入组申请仓储：已接入运行时绑定、无驱动依赖、与 schema 边界对齐', () => {
+  it('MembershipsModule 经工厂绑定本 adapter（唯一换绑点；未配置数据库时才落到内存基线）', () => {
     const content = readFileSync(MODULE_PATH, 'utf8');
 
-    expect(content).not.toContain(ADAPTER_CLASS);
-    expect(content).not.toContain(ADAPTER_MODULE);
+    // 换绑事实由「端口令牌 + 工厂导出名 + 配置分流函数」三项同时成立，
+    // 登记表 `POSTGRES_BOUND_SLICE_REGISTRY` 就是按这些项做机器判定的
+    expect(content).toContain('APPLICATION_REPOSITORY');
+    expect(content).toContain('createLazyPostgresApplicationRepository');
+    expect(content).toContain('resolveAppDatabaseConfig');
+    // 未配置数据库时的回落实现仍在模块里（分流，而不是「永远内存」）
     expect(content).toContain('InMemoryApplicationRepository');
-    expect(content).toContain(
-      '{ provide: APPLICATION_REPOSITORY, useExisting: InMemoryApplicationRepository }',
-    );
+    // 装配只发生在模块的工厂里：adapter 类名不得作为 provider 出现
+    expect(content).not.toMatch(ADAPTER_CLASS_REFERENCE);
+    expect(content).not.toContain('useExisting');
   });
 
-  it('持久化登记与数据库模块都不引用本 adapter（端口登记表仍按令牌判定）', () => {
+  it('登记表 / 数据库模块 / 端口文件都不 import 本 adapter（装配只发生在 memberships.module.ts 的工厂里）', () => {
     for (const relative of [
       join('src', 'db', 'persistence-bindings.ts'),
       join('src', 'db', 'database.module.ts'),
       join('src', 'db', 'ports', 'sql-executor.port.ts'),
       join('src', 'modules', 'memberships', 'applications.port.ts'),
       join('src', 'app.module.ts'),
-      join('src', 'startup-assembly.spec.ts'),
     ]) {
       const content = readApiFile(relative);
       // 端口文件只在注释里以「示例路径」提到 adapter 模块文件名，这不构成装配；任何 import /
       // provider 引用（类名或模块路径）都必须为零
-      expect(content).not.toContain(ADAPTER_CLASS);
+      expect(content).not.toMatch(ADAPTER_CLASS_REFERENCE);
       expect(content).not.toMatch(
         /(?:from\s+['"][^'"]*applications\.postgres-repository['"]|require\(\s*['"][^'"]*applications\.postgres-repository['"]\s*\))/u,
       );
@@ -1880,7 +1883,7 @@ describe('PostgreSQL 入组申请仓储：未装配、无驱动依赖、与 sche
     );
   });
 
-  it('工作区依赖里没有 pg / ORM 包', () => {
+  it('工作区依赖里没有未授权的 pg 族 / ORM 包（官方 pg 驱动已授权，仅限驱动层）', () => {
     for (const relative of [join('services', 'api', 'package.json'), 'package.json']) {
       const manifest = JSON.parse(readFileSync(join(REPO_ROOT, relative), 'utf8')) as {
         dependencies?: Record<string, string>;
@@ -1892,7 +1895,7 @@ describe('PostgreSQL 入组申请仓储：未装配、无驱动依赖、与 sche
       ];
       for (const name of names) {
         expect(
-          /^(?:pg|pg-pool|pg-promise|postgres|prisma|@prisma\/client|typeorm|kysely|drizzle-orm|sequelize|@mikro-orm\/core)$/u.test(
+          /^(?:pg-pool|pg-native|pg-promise|postgres|slonik|prisma|@prisma\/client|typeorm|kysely|drizzle-orm|drizzle-kit|sequelize|@mikro-orm\/core)$/u.test(
             name,
           ),
         ).toBe(false);
@@ -1900,47 +1903,63 @@ describe('PostgreSQL 入组申请仓储：未装配、无驱动依赖、与 sche
     }
   });
 
-  it('join_applications 尚未转为迁移：与 productionReady=false 及验证清单第 3 项配对', () => {
+  it('join_applications 已由迁移 0003 建立（已装配但未完成验证，productionReady 保持 false）', () => {
     const migrations = readdirSync(join(REPO_ROOT, 'db', 'migrations'));
-    expect(migrations.some((file) => file.includes('application'))).toBe(false);
+    expect(migrations).toContain('0003_join_applications.sql');
 
+    const sql = readFileSync(
+      join(REPO_ROOT, 'db', 'migrations', '0003_join_applications.sql'),
+      'utf8',
+    );
+    // 建表语句必须真的存在，而不是像 bootstrap 那样只在注释里登记
+    expect(sql).toMatch(/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+join_applications\s*\(/iu);
+    // 列清单里的每一列都必须在迁移里有定义（列清单 ↔ schema 单向核对）
+    for (const column of POSTGRES_APPLICATION_COLUMNS) {
+      expect(sql).toMatch(
+        new RegExp(
+          `\\b${column}\\s+(?:uuid|smallint|integer|varchar|timestamptz|jsonb|boolean)\\b`,
+          'u',
+        ),
+      );
+    }
+    // 统计聚合读按归属过滤：user_id 必须被索引
+    expect(sql).toMatch(/CREATE\s+INDEX[\s\S]*?\(\s*user_id/iu);
+
+    // 草案目录里仍然没有 join_applications（本切片直接落迁移，不落草案）
     const drafts = readdirSync(join(REPO_ROOT, 'db', 'schema-drafts'));
     expect(drafts.some((file) => file.includes('application'))).toBe(false);
 
-    // bootstrap 迁移只在注释里登记了这张表，没有任何 CREATE TABLE join_applications
-    const bootstrap = readFileSync(
-      join(REPO_ROOT, 'db', 'migrations', '0001_bootstrap.sql'),
-      'utf8',
-    );
-    expect(bootstrap).toContain('join_applications');
-    expect(bootstrap).not.toMatch(/CREATE\s+TABLE[^;]*join_applications/iu);
-    expect(bootstrap).toContain('主键 UUID');
-    expect(bootstrap).toContain('created_at / updated_at');
-
+    // 表已建 ≠ 已装配：能力声明仍不得声称生产可用
     expect(POSTGRES_APPLICATION_REPOSITORY_CAPABILITIES.productionReady).toBe(false);
     expect(POSTGRES_APPLICATION_REPOSITORY_VERIFICATION_STEPS).toContain(
       'join-applications-schema-draft-created-and-promoted-to-migration',
     );
   });
 
-  it('内存基线仍是同步契约的实现者（本切片不改动它）', () => {
+  it('内存基线实现**同一份异步端口**，且归属隔离口径与数据库实现一致', () => {
     const source = readApiFile(
       join('src', 'modules', 'memberships', 'applications.in-memory-repository.ts'),
     );
     expect(source).toContain('implements ApplicationRepository');
-    expect(source).not.toContain(ADAPTER_CLASS);
+    expect(source).not.toMatch(ADAPTER_CLASS_REFERENCE);
     expect(source).toContain('persistent: false');
     expect(source).toContain('productionReady: false');
+    // 异步端口：方法都是 async；单条读取必须按（资源 ID, 服务端主体）双命中返回
+    expect(source).toContain('async findById(');
+    expect(source).toContain('ownerUserId');
+    expect(source).toContain('record.userId !== ownerUserId');
   });
 
-  it('同步端口契约未被改成异步（本切片只新增并存的异步契约）', () => {
+  it('端口已收敛为异步契约（运行时不再有同步签名可依赖）', () => {
     const source = readApiFile(join('src', 'modules', 'memberships', 'applications.port.ts'));
     expect(source).toContain('export interface ApplicationRepository {');
-    expect(source).toContain('create(application: Application): Application;');
-    expect(source).toContain('findById(applicationId: string): Application | undefined;');
-    expect(source).toContain('save(application: Application): Application;');
-    expect(source).toContain('export interface AsyncApplicationRepository {');
+    expect(source).toContain('create(application: Application): Promise<Application>;');
+    expect(source).toContain(
+      'findById(applicationId: string, ownerUserId: string): Promise<Application | undefined>;',
+    );
     expect(source).toContain('save(application: Application): Promise<Application>;');
+    expect(source).not.toContain('export interface AsyncApplicationRepository {');
+    expect(source).not.toContain('create(application: Application): Application;');
   });
 
   it('adapter 的公开面覆盖能力、验证清单、列清单与状态机逆映射（供上层与运维机器判定）', () => {
@@ -1964,6 +1983,7 @@ describe('PostgreSQL 入组申请仓储：未装配、无驱动依赖、与 sche
     expect(source).toContain('export class PostgresApplicationRepositoryError');
     expect(source).toContain('export function assertPostgresApplicationRepositoryCapabilities');
     expect(source).toContain('export function applicationStatusPredecessors');
+    expect(source).toContain('export function createLazyPostgresApplicationRepository');
     expect(source).toContain('export type PostgresApplicationRepositoryErrorCode');
     // 能力声明与自检都必须以「未验证不得生产」的措辞自证
     expect(source).toContain('productionReady: false');

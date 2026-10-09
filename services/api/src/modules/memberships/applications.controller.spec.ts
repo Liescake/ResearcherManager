@@ -1,7 +1,7 @@
 import 'reflect-metadata';
 import { randomUUID } from 'node:crypto';
 import { request } from 'node:http';
-import { Logger, Module } from '@nestjs/common';
+import { ForbiddenException, Logger, Module } from '@nestjs/common';
 import type { INestApplication } from '@nestjs/common';
 import { APP_FILTER, APP_INTERCEPTOR, NestFactory } from '@nestjs/core';
 import {
@@ -25,6 +25,7 @@ import { loadEnv } from '../../config/env';
 import { AccessControlModule } from '../access-control/access-control.module';
 import { AuthModule } from '../auth/auth.module';
 import { InMemorySessionStore } from '../auth/session-store.in-memory';
+import { SESSION_STORE } from '../auth/session-subject.port';
 import type { RuoYiAuthzAdapter } from '../ruoyi-adapter/ruoyi-adapter.port';
 import { RUOYI_AUTHZ_ADAPTER } from '../ruoyi-adapter/ruoyi-adapter.port';
 import {
@@ -33,11 +34,12 @@ import {
   APPLICATION_SLICE_KIND,
 } from './applications.contract';
 import { ApplicationsController } from './applications.controller';
+import { AuthorizationGuard } from '../access-control/authorization-guard';
 import { InMemoryApplicationRepository } from './applications.in-memory-repository';
-import type { Application } from './applications.port';
+import type { Application, ApplicationRepository } from './applications.port';
 import { APPLICATION_REPOSITORY } from './applications.port';
 import { ApplicationsService } from './applications.service';
-import { MembershipsModule } from './memberships.module';
+import { createApplicationRepository, MembershipsModule } from './memberships.module';
 
 /**
  * 入组申请切片（`/me/applications`）的真实 HTTP 回归：
@@ -89,7 +91,30 @@ interface TestApp {
   readonly app: INestApplication;
   readonly baseUrl: string;
   readonly store: InMemorySessionStore;
-  readonly repository: InMemoryApplicationRepository;
+  readonly repository: ApplicationRepositoryFixture;
+}
+
+/**
+ * 测试夹具（**只服务于本 spec 的调用点**，不是生产代码）：仓储端口现在是异步 + 归属感知的，
+ * 夹具把两件事固定下来，断言仍然打在真实端口实例（`APPLICATION_REPOSITORY` 令牌上的实现）上：
+ * 1. 写入与取数都必须 `await`（未配置数据库时端口上是内存基线，语义与 PostgreSQL 实现一致）；
+ * 2. `findById` 默认按夹具归属主体取数（生产路径必须显式给服务端主体，见 `applications.service.ts`）。
+ */
+interface ApplicationRepositoryFixture {
+  readonly port: ApplicationRepository;
+  create(application: Application): Promise<Application>;
+  findById(applicationId: string, ownerUserId?: string): Promise<Application | undefined>;
+  listByUserId(userId: string): Promise<readonly Application[]>;
+}
+
+function fixtureOf(port: ApplicationRepository): ApplicationRepositoryFixture {
+  return {
+    port,
+    create: (application) => port.create(application),
+    findById: (applicationId, ownerUserId = 'u-student-1') =>
+      port.findById(applicationId, ownerUserId),
+    listByUserId: (userId) => port.listByUserId(userId),
+  };
 }
 
 /** 启动真实应用并注入会话夹具（内存基线的显式 seed，不做隐式全局状态） */
@@ -99,7 +124,7 @@ async function startApplicationsApp(): Promise<TestApp> {
   await app.listen(0, '127.0.0.1');
   startedApps.push(app);
 
-  const store = app.get(InMemorySessionStore);
+  const store = app.get<InMemorySessionStore>(SESSION_STORE);
   store.seed({
     sessionId: SESSION_STUDENT_1,
     subject: { userId: 'u-student-1', roles: [Role.Student] },
@@ -124,7 +149,7 @@ async function startApplicationsApp(): Promise<TestApp> {
     app,
     baseUrl: `${await app.getUrl()}/api/v1`,
     store,
-    repository: app.get(InMemoryApplicationRepository),
+    repository: fixtureOf(app.get<ApplicationRepository>(APPLICATION_REPOSITORY)),
   };
 }
 
@@ -242,7 +267,7 @@ describe('入组申请：成功路径（真实 HTTP + 统一响应信封）', ()
       status: ApplicationStatus.Pending,
     });
 
-    const stored = repository.listByUserId('u-student-1');
+    const stored = await repository.listByUserId('u-student-1');
     expect(stored).toHaveLength(1);
     expect(stored[0]?.userId).toBe('u-student-1');
     expect(stored[0]?.id).toBe(data.id);
@@ -262,7 +287,7 @@ describe('入组申请：成功路径（真实 HTTP + 统一响应信封）', ()
 
   it('本人列表：只返回本人申请、按创建顺序、且不泄露他人记录与审核内部字段', async () => {
     const { baseUrl, repository } = await startApplicationsApp();
-    const mine = repository.create(
+    const mine = await repository.create(
       fixtureApplication({
         userId: 'u-student-1',
         note: '本人备注明文',
@@ -273,10 +298,10 @@ describe('入组申请：成功路径（真实 HTTP + 统一响应信封）', ()
         status: ApplicationStatus.Rejected,
       }),
     );
-    const secondMine = repository.create(
+    const secondMine = await repository.create(
       fixtureApplication({ userId: 'u-student-1', groupId: GROUP_OTHER }),
     );
-    const others = repository.create(
+    const others = await repository.create(
       fixtureApplication({ userId: 'u-student-2', note: '他人备注明文' }),
     );
 
@@ -308,7 +333,7 @@ describe('入组申请：成功路径（真实 HTTP + 统一响应信封）', ()
 
   it('本人撤回：200、状态推进为 withdrawn、更新时间由服务端刷新；再次撤回 409 不再变更状态', async () => {
     const { app, baseUrl, repository } = await startApplicationsApp();
-    const created = repository.create(fixtureApplication({ userId: 'u-student-1' }));
+    const created = await repository.create(fixtureApplication({ userId: 'u-student-1' }));
     const adapter = app.get<RuoYiAuthzAdapter>(RUOYI_AUTHZ_ADAPTER);
     const checkAuthorization = vi.spyOn(adapter, 'checkAuthorization');
 
@@ -322,7 +347,7 @@ describe('入组申请：成功路径（真实 HTTP + 统一响应信封）', ()
     expect(data.id).toBe(created.id);
     expect(data.status).toBe(ApplicationStatus.Withdrawn);
     expect(data.updatedAt).not.toBe(created.updatedAt);
-    expect(repository.findById(created.id)?.status).toBe(ApplicationStatus.Withdrawn);
+    expect((await repository.findById(created.id))?.status).toBe(ApplicationStatus.Withdrawn);
 
     // 两次 SELF 判定：第一次以会话主体（先于存储访问），第二次以存储归属（纵深防御）
     expect(checkAuthorization).toHaveBeenNthCalledWith(
@@ -349,7 +374,7 @@ describe('入组申请：成功路径（真实 HTTP + 统一响应信封）', ()
     });
     expect(again.status).toBe(409);
     expect(again.body.error?.code).toBe('STATE_TRANSITION_INVALID');
-    expect(repository.findById(created.id)?.status).toBe(ApplicationStatus.Withdrawn);
+    expect((await repository.findById(created.id))?.status).toBe(ApplicationStatus.Withdrawn);
   });
 
   it('同一小组未终态申请重复提交：409 CONFLICT，且只落库一条', async () => {
@@ -369,14 +394,14 @@ describe('入组申请：成功路径（真实 HTTP + 统一响应信封）', ()
     expect(duplicated.status).toBe(409);
     expect(duplicated.body.data).toBeNull();
     expect(duplicated.body.error?.code).toBe('CONFLICT');
-    expect(repository.listByUserId('u-student-1')).toHaveLength(1);
+    expect(await repository.listByUserId('u-student-1')).toHaveLength(1);
     // 错误响应不回显既有申请的 ID
     expect(duplicated.text).not.toContain(String((first.body.data as { id: string }).id));
   });
 
   it('终态申请不占用「未终态唯一」约束：撤回后可以再次提交同组申请', async () => {
     const { baseUrl, repository } = await startApplicationsApp();
-    const withdrawn = repository.create(
+    const withdrawn = await repository.create(
       fixtureApplication({ userId: 'u-student-1', status: ApplicationStatus.Withdrawn }),
     );
 
@@ -386,8 +411,8 @@ describe('入组申请：成功路径（真实 HTTP + 统一响应信封）', ()
     });
 
     expect(res.status).toBe(201);
-    expect(repository.listByUserId('u-student-1')).toHaveLength(2);
-    expect(repository.findById(withdrawn.id)?.status).toBe(ApplicationStatus.Withdrawn);
+    expect(await repository.listByUserId('u-student-1')).toHaveLength(2);
+    expect((await repository.findById(withdrawn.id))?.status).toBe(ApplicationStatus.Withdrawn);
   });
 });
 
@@ -419,7 +444,7 @@ describe('入组申请：输入拒绝（400 VALIDATION_FAILED，不落库）', (
     expect(res.body.error?.code).toBe('VALIDATION_FAILED');
     expect(res.body.error?.requestId).toBeTruthy();
     expect(issuesOf(res.body).length).toBeGreaterThan(0);
-    expect(repository.listByUserId('u-student-1')).toHaveLength(0);
+    expect(await repository.listByUserId('u-student-1')).toHaveLength(0);
   });
 
   it('客户端伪造审核状态/归属/角色/范围/组声明一律 400，且没有任何记录被写入', async () => {
@@ -477,14 +502,14 @@ describe('入组申请：输入拒绝（400 VALIDATION_FAILED，不落库）', (
     for (const key of unexpectedKeys) {
       expect(messages.some((message) => message.includes(key))).toBe(true);
     }
-    expect(repository.listByUserId('u-student-1')).toHaveLength(0);
+    expect(await repository.listByUserId('u-student-1')).toHaveLength(0);
     // 伪造的归属没有被采纳为「写入目标」
-    expect(repository.listByUserId('u-victim-1')).toHaveLength(0);
+    expect(await repository.listByUserId('u-victim-1')).toHaveLength(0);
   });
 
   it('撤回：非法申请 ID → 400；请求体带字段（含 status 声明）→ 400，且状态不变', async () => {
     const { baseUrl, repository } = await startApplicationsApp();
-    const created = repository.create(fixtureApplication({ userId: 'u-student-1' }));
+    const created = await repository.create(fixtureApplication({ userId: 'u-student-1' }));
 
     const malformed = await call(baseUrl, 'POST', '/me/applications/not-a-uuid/withdraw', {
       headers: bearer(SESSION_STUDENT_1),
@@ -501,7 +526,7 @@ describe('入组申请：输入拒绝（400 VALIDATION_FAILED，不落库）', (
     const messages = issuesOf(withBody.body).map((issue) => issue.message);
     expect(messages.some((message) => message.includes('status'))).toBe(true);
     expect(messages.some((message) => message.includes('decision'))).toBe(true);
-    expect(repository.findById(created.id)?.status).toBe(ApplicationStatus.Pending);
+    expect((await repository.findById(created.id))?.status).toBe(ApplicationStatus.Pending);
   });
 });
 
@@ -535,16 +560,16 @@ describe('入组申请：认证边界 401（fail-closed）', () => {
 
   it('未认证的写请求（创建/撤回）同样 401，且不产生记录、不变更既有状态', async () => {
     const { baseUrl, repository } = await startApplicationsApp();
-    const created = repository.create(fixtureApplication({ userId: 'u-student-1' }));
+    const created = await repository.create(fixtureApplication({ userId: 'u-student-1' }));
 
     const create = await call(baseUrl, 'POST', '/me/applications', { body: validCreateBody });
     expect(create.status).toBe(401);
     expect(create.body.error?.code).toBe('UNAUTHENTICATED');
-    expect(repository.listByUserId('u-student-1')).toHaveLength(1);
+    expect(await repository.listByUserId('u-student-1')).toHaveLength(1);
 
     const withdraw = await call(baseUrl, 'POST', `/me/applications/${created.id}/withdraw`);
     expect(withdraw.status).toBe(401);
-    expect(repository.findById(created.id)?.status).toBe(ApplicationStatus.Pending);
+    expect((await repository.findById(created.id))?.status).toBe(ApplicationStatus.Pending);
   });
 });
 
@@ -569,8 +594,8 @@ describe('入组申请：越权 403（AuthorizationGuard + 服务端资源判定
       expect(write.body.error?.code).toBe('FORBIDDEN');
     }
 
-    expect(repository.listByUserId('u-leader-1')).toHaveLength(0);
-    expect(repository.listByUserId('u-admin-1')).toHaveLength(0);
+    expect(await repository.listByUserId('u-leader-1')).toHaveLength(0);
+    expect(await repository.listByUserId('u-admin-1')).toHaveLength(0);
   });
 
   it('授权先于业务校验：无权限主体的非法请求体也只得到 403（不泄露字段级反馈）', async () => {
@@ -587,9 +612,9 @@ describe('入组申请：越权 403（AuthorizationGuard + 服务端资源判定
     expect(res.text).not.toContain('status');
   });
 
-  it('跨主体撤回：403，第二次判定入参来自**存储归属**而不是请求/会话，且不泄露内容', async () => {
+  it('跨主体撤回：404（归属下推进仓储谓词，他人记录不出库，与「不存在」不可区分），且不泄露内容', async () => {
     const { app, baseUrl, repository } = await startApplicationsApp();
-    const others = repository.create(
+    const others = await repository.create(
       fixtureApplication({ userId: 'u-student-1', note: '他人申请备注明文' }),
     );
     const adapter = app.get<RuoYiAuthzAdapter>(RUOYI_AUTHZ_ADAPTER);
@@ -599,13 +624,18 @@ describe('入组申请：越权 403（AuthorizationGuard + 服务端资源判定
       headers: bearer(SESSION_STUDENT_2),
     });
 
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(404);
     expect(res.body.data).toBeNull();
-    expect(res.body.error?.code).toBe('FORBIDDEN');
+    expect(res.body.error?.code).toBe('NOT_FOUND');
+    // 与「不存在」完全同一文案：申请人无法据此判断该 ID 是否属于他人
+    expect(res.body.error?.message).toBe('目标申请不存在或不可见');
     expect(res.text).not.toContain('他人申请备注明文');
-    expect(repository.findById(others.id)?.status).toBe(ApplicationStatus.Pending);
+    expect(res.text).not.toContain(others.id);
+    expect((await repository.findById(others.id))?.status).toBe(ApplicationStatus.Pending);
 
-    // 第一次：会话主体自身（先于存储访问）；第二次：存储记录归属（纵深防御）
+    // 只有**一次** SELF 判定（以会话主体，先于仓库访问）：归属已在仓库谓词里生效，
+    // 服务端不会「先取他人记录、再指望上层复核」——第二次判定只在仓储违约时才触发（见下一组用例）
+    expect(checkAuthorization).toHaveBeenCalledTimes(1);
     expect(checkAuthorization).toHaveBeenNthCalledWith(
       1,
       { userId: 'u-student-2', roles: [Role.Student] },
@@ -615,18 +645,9 @@ describe('入组申请：越权 403（AuthorizationGuard + 服务端资源判定
         resourceUserId: 'u-student-2',
       },
     );
-    expect(checkAuthorization).toHaveBeenNthCalledWith(
-      2,
-      { userId: 'u-student-2', roles: [Role.Student] },
-      {
-        permission: PermissionPoint.MembershipSelfWithdraw,
-        scope: DataScope.Self,
-        resourceUserId: 'u-student-1',
-      },
-    );
   });
 
-  it('不存在的申请 404（与 403 区分开）', async () => {
+  it('不存在的申请 404（与授权拒绝 403 区分开）', async () => {
     const { baseUrl } = await startApplicationsApp();
 
     const missing = await call(baseUrl, 'POST', `/me/applications/${randomUUID()}/withdraw`, {
@@ -639,7 +660,7 @@ describe('入组申请：越权 403（AuthorizationGuard + 服务端资源判定
 
   it('管理员撤回他人申请：403（先授权，再判存在性）', async () => {
     const { baseUrl, repository } = await startApplicationsApp();
-    const created = repository.create(fixtureApplication({ userId: 'u-student-1' }));
+    const created = await repository.create(fixtureApplication({ userId: 'u-student-1' }));
 
     const res = await call(baseUrl, 'POST', `/me/applications/${created.id}/withdraw`, {
       headers: bearer(SESSION_ADMIN_1),
@@ -647,7 +668,69 @@ describe('入组申请：越权 403（AuthorizationGuard + 服务端资源判定
 
     expect(res.status).toBe(403);
     expect(res.body.error?.code).toBe('FORBIDDEN');
-    expect(repository.findById(created.id)?.status).toBe(ApplicationStatus.Pending);
+    expect((await repository.findById(created.id))?.status).toBe(ApplicationStatus.Pending);
+  });
+});
+
+/**
+ * 纵深防御回归（**故意违约的仓储替身**）：端口契约要求「归属下推进取数」，但 service 不能只依赖
+ * 「仓储一定守约」——取到记录后必须再按**存储给出的归属**做一次 SELF 判定。这里只替换仓储，
+ * 授权判定仍走真实的 `AuthorizationGuard` + 真实适配器，因此该分支的入参来源是可机器核对的。
+ */
+describe('入组申请：仓储违约时的纵深防御（403，不回流他人记录）', () => {
+  it('仓储返回他人归属的记录：第二次 SELF 判定以**存储归属**为入参并拒绝，403 且不泄露内容', async () => {
+    const { app } = await startApplicationsApp();
+    const adapter = app.get<RuoYiAuthzAdapter>(RUOYI_AUTHZ_ADAPTER);
+    const checkAuthorization = vi.spyOn(adapter, 'checkAuthorization');
+
+    const foreign = fixtureApplication({ userId: 'u-victim-9', note: '他人记录备注明文' });
+    const broken: ApplicationRepository = {
+      capabilities: { backend: 'broken-test-double', persistent: false, productionReady: false },
+      create: async (application) => application,
+      // 违约：不按归属过滤，只按资源 ID 返回（内存基线与 PostgreSQL adapter 都不允许）
+      findById: async () => ({ ...foreign }),
+      listByUserId: async () => [],
+      listByUserAndGroup: async () => [],
+      save: async (application) => application,
+    };
+    const service = new ApplicationsService(new AuthorizationGuard(adapter), broken);
+
+    let captured: unknown;
+    try {
+      await service.withdrawMyApplication(
+        { userId: 'u-student-1', roles: [Role.Student] },
+        foreign.id,
+        undefined,
+      );
+    } catch (error) {
+      captured = error;
+    }
+
+    expect(captured).toBeInstanceOf(ForbiddenException);
+    expect((captured as ForbiddenException).getStatus()).toBe(403);
+    expect((captured as Error).message).not.toContain('他人记录备注明文');
+    expect((captured as Error).message).not.toContain('u-victim-9');
+
+    // 两次判定都在端口上：第一次以会话主体（先于仓储访问），第二次以存储归属（纵深防御）
+    expect(checkAuthorization).toHaveBeenCalledTimes(2);
+    expect(checkAuthorization).toHaveBeenNthCalledWith(
+      1,
+      { userId: 'u-student-1', roles: [Role.Student] },
+      {
+        permission: PermissionPoint.MembershipSelfWithdraw,
+        scope: DataScope.Self,
+        resourceUserId: 'u-student-1',
+      },
+    );
+    expect(checkAuthorization).toHaveBeenNthCalledWith(
+      2,
+      { userId: 'u-student-1', roles: [Role.Student] },
+      {
+        permission: PermissionPoint.MembershipSelfWithdraw,
+        scope: DataScope.Self,
+        resourceUserId: 'u-victim-9',
+      },
+    );
   });
 });
 
@@ -658,7 +741,7 @@ describe('入组申请：状态只能由服务端状态机推进', () => {
     { label: '已完成', status: ApplicationStatus.Completed },
   ])('$label 的申请再撤回 → 409 STATE_TRANSITION_INVALID，状态不变', async ({ status }) => {
     const { baseUrl, repository } = await startApplicationsApp();
-    const created = repository.create(fixtureApplication({ userId: 'u-student-1', status }));
+    const created = await repository.create(fixtureApplication({ userId: 'u-student-1', status }));
 
     const res = await call(baseUrl, 'POST', `/me/applications/${created.id}/withdraw`, {
       headers: bearer(SESSION_STUDENT_1),
@@ -667,7 +750,7 @@ describe('入组申请：状态只能由服务端状态机推进', () => {
     expect(res.status).toBe(409);
     expect(res.body.data).toBeNull();
     expect(res.body.error?.code).toBe('STATE_TRANSITION_INVALID');
-    expect(repository.findById(created.id)?.status).toBe(status);
+    expect((await repository.findById(created.id))?.status).toBe(status);
   });
 
   it('契约回归：pending 是状态机中唯一的初始状态，创建只能落在 pending', async () => {
@@ -694,7 +777,7 @@ describe('入组申请：未知枚举 fail-closed（存储层异常不得当正�
   it('存储记录的 status 为未登记枚举 → 列表/撤回 500，且不把未知值/字段取值泄露给调用方', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startApplicationsApp();
-    const corrupted = repository.create(
+    const corrupted = await repository.create(
       fixtureApplication({
         userId: 'u-student-1',
         status: 'unknown_status' as ApplicationStatus,
@@ -722,10 +805,10 @@ describe('入组申请：未知枚举 fail-closed（存储层异常不得当正�
   it('存储记录时间戳非法 / 类型未登记 → 500（读取契约包含时间格式与枚举闭集）', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startApplicationsApp();
-    repository.create(
+    await repository.create(
       fixtureApplication({ userId: 'u-student-1', createdAt: '2026-01-01 00:00:00' }),
     );
-    repository.create(
+    await repository.create(
       fixtureApplication({ userId: 'u-student-1', kind: 'leave_x' as ApplicationKind }),
     );
 
@@ -764,20 +847,40 @@ describe('统一响应信封', () => {
 });
 
 describe('切片装配与既有路由回归', () => {
-  it('MembershipsModule 只注册本切片的控制器与服务，并把仓储端口显式绑到内存基线', () => {
+  it('MembershipsModule 只注册本切片的控制器与服务，并通过工厂把仓储端口按配置分流', () => {
     const providers = (Reflect.getMetadata('providers', MembershipsModule) ?? []) as unknown[];
     const controllers = (Reflect.getMetadata('controllers', MembershipsModule) ?? []) as unknown[];
     const moduleImports = (Reflect.getMetadata('imports', MembershipsModule) ?? []) as unknown[];
 
     expect(controllers).toEqual([ApplicationsController]);
     expect(providers).toContain(ApplicationsService);
-    expect(providers).toContainEqual({
-      provide: APPLICATION_REPOSITORY,
-      useExisting: InMemoryApplicationRepository,
-    });
+    // 换绑点是一个 factory provider（未配置数据库 → 内存基线；已配置 → PostgreSQL 实现），
+    // 因此端口令牌与「可选注入执行器工厂」都必须出现在 provider 列表里；
+    // 内存实现**不再**是独立 provider（否则生产环境实例化时它自身就会抛错，且会出现两份状态）。
+    expect(providers).toContainEqual(
+      expect.objectContaining({
+        provide: APPLICATION_REPOSITORY,
+        inject: [expect.any(String), expect.objectContaining({ optional: true })],
+      }),
+    );
+    expect(providers).not.toContain(InMemoryApplicationRepository);
+    expect(typeof createApplicationRepository).toBe('function');
+    expect(createApplicationRepository.length).toBe(2);
     // 依赖方向：认证（auth）与授权（access-control）各自只经端口/服务暴露
     expect(moduleImports).toContain(AuthModule);
     expect(moduleImports).toContain(AccessControlModule);
+  });
+
+  it('未配置数据库：端口上就是内存基线（同一实例，可显式 seed）', async () => {
+    const { app } = await startApplicationsApp();
+
+    const onPort = app.get<ApplicationRepository>(APPLICATION_REPOSITORY);
+    expect(onPort).toBeInstanceOf(InMemoryApplicationRepository);
+    expect(onPort.capabilities).toEqual({
+      backend: 'in-memory-baseline',
+      persistent: false,
+      productionReady: false,
+    });
   });
 
   it('内存基线如实声明非持久化，并在生产环境拒绝构造（不用内存冒充生产存储）', () => {
@@ -821,6 +924,7 @@ describe('切片装配与既有路由回归', () => {
       'apiPort',
       'apiPrefix',
       'databaseConfigured',
+      'dependencyGate',
       'nodeEnv',
     ]);
 

@@ -45,32 +45,32 @@ export class ApplicationsController {
   ) {}
 
   @Get()
-  listMyApplications(
+  async listMyApplications(
     @Headers('authorization') authorization: string | undefined,
-  ): ApplicationView[] {
-    return this.applications.listMyApplications(requireSubject(this.sessions, authorization));
+  ): Promise<ApplicationView[]> {
+    return this.applications.listMyApplications(await requireSubject(this.sessions, authorization));
   }
 
   @Post()
-  createMyApplication(
+  async createMyApplication(
     @Headers('authorization') authorization: string | undefined,
     @Body() body: unknown,
-  ): ApplicationView {
+  ): Promise<ApplicationView> {
     return this.applications.createMyApplication(
-      requireSubject(this.sessions, authorization),
+      await requireSubject(this.sessions, authorization),
       body,
     );
   }
 
   @Post(':applicationId/withdraw')
   @HttpCode(HttpStatus.OK)
-  withdrawMyApplication(
+  async withdrawMyApplication(
     @Headers('authorization') authorization: string | undefined,
     @Param('applicationId') applicationId: string,
     @Body() body: unknown,
-  ): ApplicationView {
+  ): Promise<ApplicationView> {
     return this.applications.withdrawMyApplication(
-      requireSubject(this.sessions, authorization),
+      await requireSubject(this.sessions, authorization),
       applicationId,
       body,
     );

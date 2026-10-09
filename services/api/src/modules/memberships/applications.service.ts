@@ -37,19 +37,26 @@ import type { Application, ApplicationRepository } from './applications.port';
  * - `GET  /me/applications`                        本人申请列表（`membership:self:create`，见下方口径说明）
  * - `POST /me/applications/{applicationId}/withdraw` 撤回本人待审核申请（`membership:self:withdraw`）
  *
- * 五条硬约束：
+ * 六条硬约束：
  * 1. **主体与资源归属都来自服务端**：`userId` 取自会话主体，`status` 由共享状态机写入，
  *    `kind` 是服务端常量；客户端提交的 `status`/`reviewStatus`/`userId`/`roles`/`scope`/`groupIds`
  *    既不能进入判定，也不能落库——它们由输入闭集直接拒绝（400），不是静默剥离。
- * 2. **授权先于任何存储访问**：三条路由都先经 `AuthorizationGuard`（其下是
+ * 2. **授权先于任何存储访问、也先于任何输入校验**：三条路由都先经 `AuthorizationGuard`（其下是
  *    `RUOYI_AUTHZ_ADAPTER` 端口 → canonical 谓词），拒绝即 403；`scope` 恒为服务端常量 `SELF`，
  *    `resourceUserId` 取会话主体。未授权主体既观察不到申请是否存在，也拿不到字段级校验反馈。
+ *    端口在本切片收敛为**异步**（见 `applications.port.ts`）：每个取数/写回点都必须 `await`，
+ *    而 `await` 之前只允许出现授权判定与输入闭集校验 —— 「未授权就碰仓储」「先读后判」不再是
+ *    能被同步返回掩盖的顺序错误。
  * 3. **请求字段闭集**：创建只接受共享 `joinApplicationInputSchema` 的字段（`groupId`/`note`），
  *    撤回不接受任何请求体字段，唯一输入是路径里的申请 ID。
- * 4. **状态只能由服务端状态机推进**：创建固定落在 `pending`；撤回必须满足
+ * 4. **归属隔离在存储层**：单条读取把服务端主体一起下推进 SQL（`findById(id, ownerUserId)`），
+ *    因此**他人的申请根本不出库**，对申请人与「不存在」不可区分（404）；取到记录后再按
+ *    **存储给出的归属**复核一次（纵深防御：异常仓储 / 横向越权 / 数据被外部改写时 403，
+ *    与授权拒绝同一文案、同一条端口路径）。
+ * 5. **状态只能由服务端状态机推进**：创建固定落在 `pending`；撤回必须满足
  *    `pending -> withdrawn`，否则抛 `StateTransitionError`（由统一异常过滤器映射为
  *    409 `STATE_TRANSITION_INVALID`），重复撤回不会产生第二次状态变化。
- * 5. **输出前再校验一次**：存储记录必须满足读取契约（枚举闭集 + ISO 时间戳），违反者按
+ * 6. **输出前再校验一次**：存储记录必须满足读取契约（枚举闭集 + ISO 时间戳），违反者按
  *    服务端缺陷 500 处理；对外视图不含 `userId` 与审核人/审核意见/审核时间。
  *
  * 读取口径（`GET /me/applications` 的权限点）：
@@ -57,15 +64,23 @@ import type { Application, ApplicationRepository } from './applications.port';
  * 只有 `create`/`withdraw` 两点，没有 self-read 点。本切片在闭集目录内选取 `membership:self:create`
  * 作为「本人申请自服务」能力的读取侧门控点：
  * - 它对学生角色默认授予（`DEFAULT_ROLE_PERMISSIONS`），因此本人列表对申请人是可用的；
- * - 缺该点的角色（如普通管理员/小组负责人）得到 403，而不是「认证即可读」，
- *   保证读取路径同样经过端口判定、fail-closed；
+ * - 缺该点的角色（如普通管理员/小组负责人，即 `/admin/applications*` 审核侧的角色）得到 403，
+ *   而不是「认证即可读」，保证读取路径同样经过端口判定、fail-closed；审核侧不复用本切片的
+ *   任何路由与仓储取数口径（见 `applications.port.ts`）；
  * - 由于闭集目录不允许臆造权限点（新增 `membership:self:read` 需要权限目录版本升级并同步
  *   公开契约夹具 `services/ruoyi-api/contracts`），本切片**不新增权限点**，并把该口径写入报告
  *   与 README 作为后续版本项。
  *
+ * 判定顺序（撤回，被测试固定）：无有效会话 → 401（认证边界，见 controller）；授权拒绝 → 403；
+ * 路径 ID 非法 → 400；申请不存在**或属于他人** → 404（归属下推进 SQL，两者不可区分）；
+ * 存储归属与主体不一致（异常仓储） → 403（同一文案）；存储记录违反读取契约 → 500；
+ * 状态机不允许该转移 → 409；请求体带字段 → 400。
+ *
  * 本切片不做（明确留给后续切片）：小组存在性与招募状态校验（需要 `groups` 仓储端口）、
  * 审核（`membership:review:group` / `membership:review:global`）、退组申请、成员关系联动、
- * 结果通知、幂等键与审计落库、列表分页/排序/过滤。
+ * 结果通知、幂等键与审计落库、列表分页/排序/过滤；`save` 的 `TRANSITION_REJECTED`（并发重复撤回
+ * 的存储层拒绝）映射为 409 也未在本切片接入（已登记在
+ * `POSTGRES_APPLICATION_REPOSITORY_VERIFICATION_STEPS`）。
  */
 @Injectable()
 export class ApplicationsService {
@@ -77,13 +92,17 @@ export class ApplicationsService {
   ) {}
 
   /** 本人申请列表：先做集合级 SELF 判定，再按服务端主体取数 */
-  listMyApplications(subject: AuthorizationSubject): ApplicationView[] {
+  async listMyApplications(subject: AuthorizationSubject): Promise<ApplicationView[]> {
     this.authorizeSelf(subject, PermissionPoint.MembershipSelfCreate);
-    return this.repository.listByUserId(subject.userId).map((record) => this.toView(record));
+    const records = await this.repository.listByUserId(subject.userId);
+    return records.map((record) => this.toView(record));
   }
 
   /** 创建本人入组申请：归属、类型、审核状态全部由服务端决定 */
-  createMyApplication(subject: AuthorizationSubject, body: unknown): ApplicationView {
+  async createMyApplication(
+    subject: AuthorizationSubject,
+    body: unknown,
+  ): Promise<ApplicationView> {
     this.authorizeSelf(subject, PermissionPoint.MembershipSelfCreate);
 
     // 输入闭集 → 字段级校验（共享 zod schema）：未知枚举、缺 groupId、非 UUID 小组、
@@ -93,16 +112,15 @@ export class ApplicationsService {
 
     // 数据约束：同一用户同一小组只能有一个未终态的入组申请（docs/P2-权限目录与状态机.md §3）。
     // 终态判定复用共享状态机的终态集合，仓储只按字段过滤、不理解业务语义。
-    const pending = this.repository
-      .listByUserAndGroup(subject.userId, input.groupId)
-      .filter((record) => !isApplicationTerminal(record.status));
+    const existing = await this.repository.listByUserAndGroup(subject.userId, input.groupId);
+    const pending = existing.filter((record) => !isApplicationTerminal(record.status));
     if (pending.length > 0) {
       // 不返回既有申请的 ID/内容：重复提交者不需要通过错误响应获得他人可见的申请标识
       throw new ConflictException('该小组已有未完成的入组申请，请勿重复提交');
     }
 
     const now = new Date().toISOString();
-    const created = this.repository.create({
+    const created = await this.repository.create({
       id: randomUUID(),
       userId: subject.userId,
       groupId: input.groupId,
@@ -120,19 +138,18 @@ export class ApplicationsService {
   /**
    * 撤回本人待审核申请。
    *
-   * 判定顺序（被测试固定）：无有效会话 → 401（认证边界，见 controller）；授权拒绝 → 403；
-   * 路径 ID 非法 → 400；申请不存在 → 404；存储归属与主体不一致 → 403（同一文案）；
-   * 存储记录违反读取契约 → 500；状态机不允许该转移 → 409；请求体带字段 → 400。
-   * 其中授权排在最前：无权主体拿不到任何关于「申请是否存在」或「字段是否合法」的信息。
+   * 授权（`membership:self:withdraw` + `SELF`）与请求体闭集都在**任何仓储访问之前**完成；
+   * 单条读取把服务端主体下推进 SQL，因此「他人的申请」与「不存在」在存储层就是同一种结果
+   * （`undefined` → 404），申请人无法据此探测他人资源是否存在。
    *
    * `body` 只是需要被 fail-closed 拒绝的「不应存在之物」：撤回的唯一输入是路径中的申请 ID，
    * 因此它作为显式参数传入（服务是单例，绝不保存任何请求级状态），不参与任何业务判定。
    */
-  withdrawMyApplication(
+  async withdrawMyApplication(
     subject: AuthorizationSubject,
     applicationId: string,
     body: unknown,
-  ): ApplicationView {
+  ): Promise<ApplicationView> {
     this.authorizeSelf(subject, PermissionPoint.MembershipSelfWithdraw);
 
     // 撤回不接受请求体：唯一输入是路径参数
@@ -140,12 +157,12 @@ export class ApplicationsService {
     // 路径参数用共享 schema 校验（applicationId 必须是 UUID），非法即 400
     const { applicationId: id } = withdrawApplicationInputSchema.parse({ applicationId });
 
-    const record = this.repository.findById(id);
+    const record = await this.repository.findById(id, subject.userId);
     if (!record) {
       throw new NotFoundException('目标申请不存在或不可见');
     }
 
-    // 纵深防御：取数后**再按存储给出的归属**做一次同样的 SELF 判定（异常仓储 / 横向越权 /
+    // 纵深防御：取到记录后**再按存储给出的归属**做一次同样的 SELF 判定（异常仓储 / 横向越权 /
     // 数据被外部改写）。归属不可读时按空串处理，SELF 谓词必然拒绝 → 403；
     // 该 403 与授权拒绝走同一条端口路径、同一个文案，调用方无法据此区分原因。
     this.authorizeSelf(
@@ -159,7 +176,7 @@ export class ApplicationsService {
     // 一律 409 STATE_TRANSITION_INVALID，客户端无法通过重复请求改写结果。
     assertApplicationTransition(stored.status, ApplicationStatus.Withdrawn);
 
-    const withdrawn = this.repository.save(
+    const withdrawn = await this.repository.save(
       toWithdrawnApplication(stored, new Date().toISOString()),
     );
     return this.toView(withdrawn);

@@ -334,13 +334,14 @@ describe('未装配 Postgres adapter 边界：磁盘自动枚举 + 登记表 + �
     ].sort();
     expect(discovered).toHaveLength(registered.length);
     expect(discovered).toEqual(registered);
-    // 12 个 adapter：7 个未装配 + 5 个已绑定（auth=会话存储、achievements=成果存储、
-    // education=升学记录存储、profiles=学生画像、statistics=本人统计聚合读）
-    expect(POSTGRES_ADAPTER_REGISTRY).toHaveLength(7);
+    // 12 个 adapter：6 个未装配 + 6 个已绑定（auth=会话存储、achievements=成果存储、
+    // education=升学记录存储、memberships=入组申请存储、profiles=学生画像、statistics=本人统计聚合读）
+    expect(POSTGRES_ADAPTER_REGISTRY).toHaveLength(6);
     expect(POSTGRES_BOUND_SLICE_REGISTRY.map((item) => item.id)).toEqual([
       'auth',
       'achievements',
       'education',
+      'memberships',
       'profiles',
       'statistics',
     ]);

@@ -11,30 +11,35 @@ import { parseStoredApplication, storedApplicationSchema } from './applications.
 import {
   APPLICATION_REPOSITORY_BACKEND_POSTGRES,
   type Application,
+  type ApplicationRepository,
   type ApplicationRepositoryCapabilities,
-  type AsyncApplicationRepository,
 } from './applications.port';
 
 /**
- * 入组申请的 **PostgreSQL 仓储 adapter（首个可验证实现，未接入运行时）**。
+ * 入组申请的 **PostgreSQL 仓储 adapter（已接入运行时运行路径）**。
+ *
+ * ## 装配位置（唯一换绑点）
+ * `memberships.module.ts` 的 `createApplicationRepository` 按「是否解析出 `DATABASE_URL`」分流：
+ * 未配置 → 内存基线；已配置 → 本文件的 `createLazyPostgresApplicationRepository`（**延迟建连**）。
+ * 因此「数据库已配置但执行器未 attest / 依赖未就绪」由启动期门禁给出**结构化违规**
+ * （`SQL_CONNECTION_FACTORY[SQL_EXECUTOR_VERIFICATION_FAILED]`、
+ * `APPLICATION_REPOSITORY[DEPENDENCY_NOT_VERIFIED]`），而不是在这里变成一个连接错误。
  *
  * ## 交付边界（本切片刻意不做的事）
- * - **不绑定**到 `MembershipsModule`：模块仍然只绑定内存基线 `InMemoryApplicationRepository`
- *   （provider 列表与 DI 令牌一字未改），运行时行为与本切片之前逐字节一致（有回归断言，
- *   见同名 spec）；
  * - **不引入** `pg` / Prisma / TypeORM 等驱动或 ORM 依赖：本文件只依赖驱动无关的
  *   `SqlExecutor` 端口（`db/ports/sql-executor.port.ts`），真实执行器由消费方在「启用数据库」
- *   那一步显式提供；
+ *   那一步显式提供（驱动只允许出现在 `db/postgres/` 驱动层，见 `postgres-adapter-boundary.spec.ts`）；
  * - **不声称生产可用**：能力声明固定为 `backend = postgres`、`persistent = true`、
- *   `productionReady = false`。在引入经评估的驱动、完成对真实 PostgreSQL 的集成验证、并把
- *   `join_applications` 从字段字典落成 schema 草案 → 迁移之前，生产启动会被
- *   `PersistenceBoundaryService` 拒绝（`productionReady !== true` 即违规）。
+ *   `productionReady = false`。未完成 `POSTGRES_APPLICATION_REPOSITORY_VERIFICATION_STEPS`
+ *   全部门禁前，生产启动会被 `DependencyReadinessService` 判
+ *   `APPLICATION_REPOSITORY[DEPENDENCY_NOT_VERIFIED]` 拒绝（`productionReady !== true` 即违规），
+ *   即「生产配置数据库但依赖不就绪」是 fail-closed，不会带着未验证后端上线。
  *
- * ## 为什么先有异步契约
- * 现有 `ApplicationRepository`（`applications.port.ts`）是同步接口；把运行时端口改成 Promise 是
- * 跨模块契约变更（service / controller / 既有 spec 必须一起改），必须与真实驱动引入在同一片
- * 切片完成。因此本文件实现 `AsyncApplicationRepository`（Promise 版，语义与内存基线完全一致），
- * 让「SQL 与映射是否正确」可以在**没有驱动、也没有数据库**的情况下被离线验证。
+ * ## 运行时端口的异步收敛
+ * 上一片切片把运行时端口（`ApplicationRepository`）保持同步、另立异步契约
+ * `AsyncApplicationRepository` 离线验证 adapter。本切片完成收敛：端口只剩一份异步契约，
+ * 本文件实现`ApplicationRepository`（Promise 语义与内存基线完全一致），并由
+ * `createLazyPostgresApplicationRepository` 按配置绑定 —— 装配阶段一次都不碰数据库。
  *
  * ## 与内存基线的语义对应（逐条可核对）
  * | 内存基线 | 本 adapter |
@@ -830,7 +835,7 @@ function assertWriteRoundTrip(requested: Application, stored: Application): void
  * 因此「执行器被换掉 / 被降级」或「能力声明被改写」都会 fail-closed，而不是静默继续。
  * 本类**不是** Nest provider（不带任何 Nest 装饰器），也未在任何模块中注册。
  */
-export class PostgresApplicationRepository implements AsyncApplicationRepository {
+export class PostgresApplicationRepository implements ApplicationRepository {
   readonly capabilities: ApplicationRepositoryCapabilities =
     POSTGRES_APPLICATION_REPOSITORY_CAPABILITIES;
 
@@ -1086,4 +1091,78 @@ export class PostgresApplicationRepository implements AsyncApplicationRepository
       ['status'],
     );
   }
+}
+
+/**
+ * **延迟建连**的 PostgreSQL 入组申请仓储（模块换绑用的唯一工厂）。
+ *
+ * 「延迟」是安全性质，不是性能优化：装配阶段不建立任何连接，因此「数据库已配置但执行器
+ * 未 attest / 依赖未就绪」不会被一次连接尝试掩盖，而由启动期门禁判成结构化违规
+ * （`SQL_CONNECTION_FACTORY[SQL_EXECUTOR_VERIFICATION_FAILED]`、
+ * `APPLICATION_REPOSITORY[DEPENDENCY_NOT_VERIFIED]`）。连接只在**首次真正读写**时建立并被复用；
+ * 建立失败不缓存失败结果（下一次调用会重试），避免一次瞬时故障把整个进程钉死为不可用。
+ *
+ * 存储 ID 域与严格写入契约**先判、再建连**：非 UUID 的主体 / 小组 / 资源 ID / 待写记录都不会
+ * 触发任何数据库连接，错误码与直接调用 adapter 完全一致（读 `INVALID_SUBJECT`；
+ * 谓词无法正确回答时 `INVALID_IDENTIFIER`；写 `INVALID_RECORD`）。
+ *
+ * `findById` 的域外查询键（非 UUID 资源 ID）按 adapter 的口径**直接返回 `undefined`**
+ * （「该主体名下不存在此申请」是确定结论，不是服务端缺陷），同样不建连；但主体必须先过
+ * 存储 ID 域校验——否则「无法判定归属」会被读成「不存在」。
+ *
+ * 能力声明与 adapter 同一份常量（`productionReady` 恒为 false），并在每次使用前经
+ * `assertPostgresApplicationRepositoryCapabilities` 自检：不完成验证清单就声称生产可用会在这里
+ * 立刻 fail-closed。
+ */
+export function createLazyPostgresApplicationRepository(
+  resolveExecutor: () => Promise<SqlExecutor>,
+  capabilities: ApplicationRepositoryCapabilities = POSTGRES_APPLICATION_REPOSITORY_CAPABILITIES,
+): ApplicationRepository {
+  assertPostgresApplicationRepositoryCapabilities(capabilities);
+
+  let pending: Promise<SqlExecutor> | undefined;
+  const executor = (): Promise<SqlExecutor> => {
+    if (pending === undefined) {
+      pending = resolveExecutor().catch((error: unknown) => {
+        pending = undefined;
+        throw error;
+      });
+    }
+    return pending;
+  };
+
+  return {
+    capabilities,
+    async create(application: Application): Promise<Application> {
+      // 严格记录契约（含存储 ID 域）先判、再建连：非法写入不触发任何数据库连接
+      const writable = assertWritableRecord(application);
+      const resolved = await executor();
+      return new PostgresApplicationRepository(resolved).create(writable);
+    },
+    async findById(applicationId: string, ownerUserId: string): Promise<Application | undefined> {
+      // 两个标识都在进 SQL 之前判定；域外资源 ID 由 adapter 判为「不存在」而不是服务端缺陷
+      const ownerId = requireSubject(ownerUserId);
+      if (!isStorageUuid(applicationId)) {
+        return undefined;
+      }
+      const resolved = await executor();
+      return new PostgresApplicationRepository(resolved).findById(applicationId, ownerId);
+    },
+    async listByUserId(userId: string): Promise<readonly Application[]> {
+      const ownerId = requireSubject(userId);
+      const resolved = await executor();
+      return new PostgresApplicationRepository(resolved).listByUserId(ownerId);
+    },
+    async listByUserAndGroup(userId: string, groupId: string): Promise<readonly Application[]> {
+      const ownerId = requireSubject(userId);
+      const targetGroupId = requireFilterIdentifier(groupId, 'groupId');
+      const resolved = await executor();
+      return new PostgresApplicationRepository(resolved).listByUserAndGroup(ownerId, targetGroupId);
+    },
+    async save(application: Application): Promise<Application> {
+      const writable = assertWritableRecord(application);
+      const resolved = await executor();
+      return new PostgresApplicationRepository(resolved).save(writable);
+    },
+  };
 }
