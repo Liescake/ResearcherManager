@@ -34,6 +34,9 @@ import {
   APPLICATION_SLICE_KIND,
 } from './applications.contract';
 import { ApplicationsController } from './applications.controller';
+import { ApplicationReviewsController } from './application-reviews.controller';
+import { APPLICATION_REVIEW_REPOSITORY } from './application-reviews.port';
+import { ApplicationReviewsService } from './application-reviews.service';
 import { AuthorizationGuard } from '../access-control/authorization-guard';
 import { InMemoryApplicationRepository } from './applications.in-memory-repository';
 import type { Application, ApplicationRepository } from './applications.port';
@@ -852,8 +855,11 @@ describe('切片装配与既有路由回归', () => {
     const controllers = (Reflect.getMetadata('controllers', MembershipsModule) ?? []) as unknown[];
     const moduleImports = (Reflect.getMetadata('imports', MembershipsModule) ?? []) as unknown[];
 
-    expect(controllers).toEqual([ApplicationsController]);
+    expect(controllers).toEqual([ApplicationsController, ApplicationReviewsController]);
     expect(providers).toContain(ApplicationsService);
+    // 审核端是**同一模块内的独立授权切片**：有自己的服务与**自己的换绑工厂**，
+    // 不复用申请人端端口（SELF 归属谓词 vs GROUP/GLOBAL 范围谓词）。
+    expect(providers).toContain(ApplicationReviewsService);
     // 换绑点是一个 factory provider（未配置数据库 → 内存基线；已配置 → PostgreSQL 实现），
     // 因此端口令牌与「可选注入执行器工厂」都必须出现在 provider 列表里；
     // 内存实现**不再**是独立 provider（否则生产环境实例化时它自身就会抛错，且会出现两份状态）。
@@ -866,6 +872,13 @@ describe('切片装配与既有路由回归', () => {
     expect(providers).not.toContain(InMemoryApplicationRepository);
     expect(typeof createApplicationRepository).toBe('function');
     expect(createApplicationRepository.length).toBe(2);
+    // 审核端的换绑工厂同样是 factory provider（独立令牌，独立注入执行器工厂）
+    expect(providers).toContainEqual(
+      expect.objectContaining({
+        provide: APPLICATION_REVIEW_REPOSITORY,
+        inject: [expect.any(String), expect.objectContaining({ optional: true })],
+      }),
+    );
     // 依赖方向：认证（auth）与授权（access-control）各自只经端口/服务暴露
     expect(moduleImports).toContain(AuthModule);
     expect(moduleImports).toContain(AccessControlModule);

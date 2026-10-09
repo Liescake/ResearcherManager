@@ -14,6 +14,13 @@ import {
   type ApplicationRepository,
   type ApplicationRepositoryCapabilities,
 } from './applications.port';
+import {
+  ApplicationReviewConflictError,
+  assertNonEmptyReviewScope,
+  type ApplicationReviewRepository,
+  type ApplicationReviewRepositoryCapabilities,
+  type ApplicationReviewScope,
+} from './application-reviews.port';
 
 /**
  * 入组申请的 **PostgreSQL 仓储 adapter（已接入运行时运行路径）**。
@@ -242,6 +249,7 @@ export type PostgresApplicationRepositoryErrorCode =
   | 'CONFLICT'
   | 'IDENTITY_MISMATCH'
   | 'OWNER_VIOLATION'
+  | 'OUT_OF_SCOPE'
   | 'NOT_FOUND'
   | 'TRANSITION_REJECTED';
 
@@ -1163,6 +1171,354 @@ export function createLazyPostgresApplicationRepository(
       const writable = assertWritableRecord(application);
       const resolved = await executor();
       return new PostgresApplicationRepository(resolved).save(writable);
+    },
+  };
+}
+
+// ===========================================================================
+// 入组申请**团队审核端**（同一张 `join_applications` 表，隔离谓词方向相反）
+// ===========================================================================
+//
+// 为什么审核端 adapter 与申请人端 adapter 在**同一个文件**里（而不是另起
+// `application-reviews.postgres-repository.ts`）：`postgres-adapter-boundary` 门禁的结构决定了
+// 一个模块只能有一个持久化适配切片 —— 登记项的 `module` 同时钉住**目录**（`modules/<module>/`）
+// 与**模块文件**（`modules/<module>/<module>.module.ts`），并且 `PERSISTENCE_PORT_ADAPTER_DUPLICATED`
+// 明确拒绝「同一模块登记多个 adapter」。因此第二个 adapter 文件无论怎么登记都会失败。
+// 这恰好也是本切片的要求：**复用现有 Postgres adapter**。
+//
+// 复用止于**存储机制**（表名、列清单、行契约、映射、执行器校验、往返复核），
+// **不复用申请人端端口**（`ApplicationRepository`）：那一组方法的每条谓词都以 `user_id` 为归属锚，
+// 而审核端的隔离依据是服务端解析的 `group_id` 范围。两套谓词在**同一个文件里也各自独立**，
+// 因为「谁的隔离谓词」由端口签名决定，而不是由文件决定。
+//
+// 范围下推（审核端独有的安全性质）：
+// | 方法 | global | groups |
+// |---|---|---|
+// | `listForReview` | 全表 + `ORDER BY` | `WHERE group_id = ANY($1::uuid[])` |
+// | `findForReview` | `WHERE id = $1` | `WHERE id = $1 AND group_id = ANY($2::uuid[])` |
+// | `saveReviewed` | `WHERE id = $1 AND status::text = ANY($n)` | `… AND group_id = $2::uuid AND status::text = ANY($m)` |
+//
+// 因此范围外的记录**既不出库也不可写**：拿范围外记录的 ID 去读得到 `undefined`
+// （与「不存在」不可区分），去写命中 0 行并抛审核冲突。
+//
+// fail-closed 的显式拒绝：空小组范围在**拼 SQL 之前**被拒绝（绝不退化成「没有 WHERE ⇒ 全表」）；
+// 范围/主体/审核人必须是规范小写形非空 UUID；行契约与写入契约沿用同一份严格判定。
+
+/** 审核端仓储能力：持久但**未验证**，因此生产环境仍会被持久化边界守卫拦下 */
+export const POSTGRES_APPLICATION_REVIEW_REPOSITORY_CAPABILITIES: ApplicationReviewRepositoryCapabilities =
+  Object.freeze({
+    backend: APPLICATION_REPOSITORY_BACKEND_POSTGRES,
+    persistent: true,
+    productionReady: false,
+  });
+
+/**
+ * 转成生产可用前必须完成的验证清单（与申请人端共用同一批证据，外加审核端特有的两项）：
+ * 1. 驱动依赖经评估后引入；
+ * 2. 对真实 PostgreSQL 的集成测试：迁移 0003 建表、按小组范围取数与排序、
+ *    **范围外记录不可读/不可写**、并发两次审核只有一个能命中条件写入；
+ * 3. 会话主体（含**审查人**自身）收敛为 UUID：当前基线是 `u-student-1` 这类安全 ID，
+ *    不满足存储 ID 域，审核写入的 `reviewed_by_user_id` 会因此被拒绝；
+ * 4. `group_id` 前导索引：迁移 0003 只建了 `(user_id, created_at, id)` 与 `(user_id, group_id)`，
+ *    对「按小组范围列出申请」不是最优路径。本切片**不改迁移**（复用 0003 是前提），
+ *    因此登记为后续迁移项，而不是在这里悄悄加一个索引；
+ * 5. 成功后把 `productionReady` 改为 true，并同步删除能力自检。
+ */
+export const POSTGRES_APPLICATION_REVIEW_REPOSITORY_VERIFICATION_STEPS = [
+  'driver-dependency-evaluated',
+  'integration-tests-against-real-postgres',
+  'reviewer-and-subject-user-ids-converged-to-uuid',
+  'group-leading-index-added-by-follow-up-migration',
+  'production-ready-capability-flipped-with-evidence',
+] as const;
+
+/** 能力自检：**未验证的实现不得声称生产可用**（任何环境都执行） */
+export function assertPostgresApplicationReviewRepositoryCapabilities(
+  capabilities: ApplicationReviewRepositoryCapabilities = POSTGRES_APPLICATION_REVIEW_REPOSITORY_CAPABILITIES,
+): void {
+  const issues: string[] = [];
+  if (capabilities.backend !== APPLICATION_REPOSITORY_BACKEND_POSTGRES) {
+    issues.push('backend');
+  }
+  if (capabilities.persistent !== true) {
+    issues.push('persistent');
+  }
+  if (capabilities.productionReady !== false) {
+    issues.push('productionReady');
+  }
+  if (issues.length > 0) {
+    throw new PostgresApplicationRepositoryError(
+      'CAPABILITY_MISDECLARED',
+      `PostgreSQL 审核仓储能力声明不符（backend 必须是 ${APPLICATION_REPOSITORY_BACKEND_POSTGRES}、persistent=true、productionReady=false）：未完成验证前不得声称生产可用`,
+      issues,
+    );
+  }
+}
+
+/** 审核写入的 `SET` 片段（占位符从 `setOffset` 起；global 的 WHERE 占 1 个，groups 占 2 个） */
+function reviewUpdateSetList(setOffset: number): string {
+  return POSTGRES_APPLICATION_MUTABLE_COLUMNS.map(
+    (column, index) => `${column} = $${index + setOffset}${COLUMN_PARAMETER_CASTS[column] ?? ''}`,
+  ).join(', ');
+}
+
+/**
+ * 状态谓词：`status::text = ANY($n::text[])`。
+ * `status` 是列引用而非值，因此对列做 `::text` 转换，让谓词与列类型无关，同时不影响 `id` 主键索引命中。
+ */
+function reviewStatusPredicate(parameterIndex: number): string {
+  return `status::text = ANY($${parameterIndex}::text[])`;
+}
+
+/** 审核端可变列数：占位符编号由它派生，避免数量漂移 */
+const REVIEW_MUTABLE_COLUMN_COUNT = POSTGRES_APPLICATION_MUTABLE_COLUMNS.length;
+
+/** 全表列表（global 范围：**唯一**不加范围谓词的语句） */
+const SELECT_REVIEW_ALL_SQL = `SELECT ${COLUMN_LIST}
+  FROM ${TABLE_IDENTIFIER}
+  ${ORDER_BY}`;
+
+/** 按小组范围列表：小组集合走 `= ANY($1::uuid[])` 绑定，范围下推进 SQL */
+const SELECT_REVIEW_BY_GROUPS_SQL = `SELECT ${COLUMN_LIST}
+  FROM ${TABLE_IDENTIFIER}
+  WHERE group_id = ANY($1::uuid[])
+  ${ORDER_BY}`;
+
+/** 按 ID 全表读取（global 范围） */
+const SELECT_REVIEW_BY_ID_SQL = `SELECT ${COLUMN_LIST}
+  FROM ${TABLE_IDENTIFIER}
+  WHERE id = $1::uuid`;
+
+/** 按 ID + 小组范围读取：范围外记录不可能命中 */
+const SELECT_REVIEW_BY_ID_IN_GROUPS_SQL = `SELECT ${COLUMN_LIST}
+  FROM ${TABLE_IDENTIFIER}
+  WHERE id = $1::uuid AND group_id = ANY($2::uuid[])`;
+
+/** 审核条件写入（global）：id + 状态前驱 */
+const UPDATE_REVIEW_SQL = `UPDATE ${TABLE_IDENTIFIER}
+  SET ${reviewUpdateSetList(2)}
+  WHERE id = $1::uuid AND ${reviewStatusPredicate(REVIEW_MUTABLE_COLUMN_COUNT + 2)}
+  RETURNING ${COLUMN_LIST}`;
+
+/** 审核条件写入（groups）：id + 小组范围 + 状态前驱 */
+const UPDATE_REVIEW_IN_GROUPS_SQL = `UPDATE ${TABLE_IDENTIFIER}
+  SET ${reviewUpdateSetList(3)}
+  WHERE id = $1::uuid AND group_id = $2::uuid AND ${reviewStatusPredicate(REVIEW_MUTABLE_COLUMN_COUNT + 3)}
+  RETURNING ${COLUMN_LIST}`;
+
+/**
+ * 范围 → SQL 参数（**唯一的范围解析点**）。
+ *
+ * 空小组范围在这里、**在构造任何 SQL 之前**被拒绝：这是审核端最重要的 fail-closed 边界，
+ * 因为 SQL 里 `= ANY(ARRAY[]::uuid[])` 天然返回空集，但一旦有人用「数组为空就省掉 WHERE」
+ * 来「优化」，空范围就会静默变成全量。
+ */
+function reviewScopeGroupParameters(scope: ApplicationReviewScope): readonly string[] {
+  assertNonEmptyReviewScope(scope);
+  if (scope.kind === 'global') {
+    return [];
+  }
+  return scope.groupIds.map((groupId, index) =>
+    requireStorageUuid(
+      groupId,
+      'INVALID_IDENTIFIER',
+      '审核范围里的小组 ID 必须落在存储 ID 域内（合法且非空的规范小写 UUID）：非 UUID 的 groupId 不得进入 SQL',
+      `groupIds[${index}]`,
+    ),
+  );
+}
+
+/** 审核写入的可变列取值（顺序与 `reviewUpdateSetList` 完全一致） */
+function reviewMutableValues(record: Application): readonly unknown[] {
+  const values: Record<(typeof POSTGRES_APPLICATION_MUTABLE_COLUMNS)[number], unknown> = {
+    note: optionalText(record.note ?? null) ?? null,
+    status: record.status,
+    reviewed_by_user_id: optionalText(record.reviewedByUserId ?? null) ?? null,
+    review_comment: optionalText(record.reviewComment ?? null) ?? null,
+    reviewed_at: optionalText(record.reviewedAt ?? null) ?? null,
+    updated_at: record.updatedAt,
+  };
+  return POSTGRES_APPLICATION_MUTABLE_COLUMNS.map((column) => values[column]);
+}
+
+/** 范围内单行读取：0 行 → `undefined`（与「不存在」不可区分）；多行 → 主键唯一性被破坏 */
+function reviewSingleRow(rows: readonly unknown[], scope: string): unknown {
+  if (rows.length === 0) return undefined;
+  if (rows.length > 1) {
+    throw new PostgresApplicationRepositoryError(
+      'RESULT_SET_VIOLATION',
+      `单行读取返回了多行（${scope}）：主键查询不可能多行，按服务端缺陷处理`,
+      [scope],
+    );
+  }
+  return rows[0];
+}
+
+/**
+ * 审核端 PostgreSQL 实现（范围内读写）。
+ * 存储机制（表名/列清单/行契约/映射/执行器校验/往返复核）与申请人端**同一份**；
+ * 隔离谓词（`group_id` 范围）是审核端独有的。
+ */
+export class PostgresApplicationReviewRepository implements ApplicationReviewRepository {
+  readonly capabilities: ApplicationReviewRepositoryCapabilities;
+
+  private readonly executor: SqlExecutor;
+
+  constructor(
+    executor: SqlExecutor,
+    capabilities: ApplicationReviewRepositoryCapabilities = POSTGRES_APPLICATION_REVIEW_REPOSITORY_CAPABILITIES,
+  ) {
+    assertPostgresApplicationReviewRepositoryCapabilities(capabilities);
+    this.executor = assertUsableExecutor(executor);
+    this.capabilities = capabilities;
+  }
+
+  async listForReview(scope: ApplicationReviewScope): Promise<readonly Application[]> {
+    const groupIds = reviewScopeGroupParameters(scope);
+    const result =
+      scope.kind === 'groups'
+        ? await this.executor.query(SELECT_REVIEW_BY_GROUPS_SQL, [groupIds])
+        : await this.executor.query(SELECT_REVIEW_ALL_SQL);
+    return rowsOf(result).map((row) => mapRow(row));
+  }
+
+  async findForReview(
+    applicationId: string,
+    scope: ApplicationReviewScope,
+  ): Promise<Application | undefined> {
+    const groupIds = reviewScopeGroupParameters(scope);
+    // 域外资源 ID 按「不存在」处理（确定结论），但范围必须先合法
+    if (!isStorageUuid(applicationId)) {
+      return undefined;
+    }
+    const result =
+      scope.kind === 'groups'
+        ? await this.executor.query(SELECT_REVIEW_BY_ID_IN_GROUPS_SQL, [applicationId, groupIds])
+        : await this.executor.query(SELECT_REVIEW_BY_ID_SQL, [applicationId]);
+    const row = reviewSingleRow(rowsOf(result), 'findForReview');
+    if (row === undefined) {
+      return undefined;
+    }
+    const stored = mapRow(row);
+    // 纵深防御：即便 SQL 谓词被改坏，也复核一次范围归属
+    if (scope.kind === 'groups' && !groupIds.includes(stored.groupId)) {
+      throw new PostgresApplicationRepositoryError(
+        'OUT_OF_SCOPE',
+        '单条读取返回了审核范围外的记录：范围谓词失效，按服务端缺陷处理',
+        ['group_id'],
+      );
+    }
+    return stored;
+  }
+
+  async saveReviewed(
+    application: Application,
+    scope: ApplicationReviewScope,
+  ): Promise<Application> {
+    const writable = assertWritableRecord(application);
+    const groupIds = reviewScopeGroupParameters(scope);
+
+    if (
+      writable.status === undefined ||
+      applicationStatusPredecessors(writable.status).length === 0
+    ) {
+      // 目标状态不是任何状态的合法后继（例如把申请改回 pending）：宁可拒绝也不写
+      throw new PostgresApplicationRepositoryError(
+        'INVALID_RECORD',
+        '审核目标状态不是任何合法前驱的后继，拒绝写入',
+        ['status'],
+      );
+    }
+    const predecessors = applicationStatusPredecessors(writable.status);
+    const values = reviewMutableValues(writable);
+
+    const result =
+      scope.kind === 'groups'
+        ? await this.executor.query(UPDATE_REVIEW_IN_GROUPS_SQL, [
+            writable.id,
+            groupIds[0],
+            ...values,
+            predecessors,
+          ])
+        : await this.executor.query(UPDATE_REVIEW_SQL, [writable.id, ...values, predecessors]);
+
+    const rows = rowsOf(result);
+    if (rows.length > 1) {
+      throw new PostgresApplicationRepositoryError(
+        'RESULT_SET_VIOLATION',
+        '审核写入影响了多行：主键条件写入不可能多行，按服务端缺陷处理',
+        ['rowCount'],
+      );
+    }
+    if (rows.length === 0) {
+      // 未产生任何写入。实践中就是状态竞争（service 只在「刚刚在范围内成功读到该记录」后调用本方法）；
+      // 抛审核冲突类型，由 service 映射为 409，而不是冒泡成 500。
+      throw new ApplicationReviewConflictError(
+        `审核写入未命中任何行（申请 ${writable.id}）：记录不在范围内、不存在，或当前状态已不是目标状态的合法前驱（scope=${scope.kind}）`,
+      );
+    }
+
+    const stored = mapRow(rows[0]);
+    assertWriteRoundTrip(writable, stored);
+    return stored;
+  }
+}
+
+/**
+ * **延迟建连**的 PostgreSQL 审核仓储（模块换绑用的唯一工厂）。
+ *
+ * 「延迟」是安全性质，不是性能优化：装配阶段不建立任何连接，因此「数据库已配置但执行器
+ * 未 attest / 依赖未就绪」不会被一次连接尝试掩盖，而由启动期依赖就绪门禁判成结构化违规。
+ * 连接只在**首次真正读写**时建立并被复用；建立失败不缓存失败结果（下一次调用会重试）。
+ *
+ * 存储 ID 域与空范围校验**先判、再建连**：非法范围/标识不会触发任何数据库连接，
+ * 错误码与直接调用 adapter 完全一致。
+ */
+export function createLazyPostgresApplicationReviewRepository(
+  resolveExecutor: () => Promise<SqlExecutor>,
+  capabilities: ApplicationReviewRepositoryCapabilities = POSTGRES_APPLICATION_REVIEW_REPOSITORY_CAPABILITIES,
+): ApplicationReviewRepository {
+  assertPostgresApplicationReviewRepositoryCapabilities(capabilities);
+
+  let pending: Promise<SqlExecutor> | undefined;
+  const executor = (): Promise<SqlExecutor> => {
+    if (pending === undefined) {
+      pending = resolveExecutor().catch((error: unknown) => {
+        pending = undefined;
+        throw error;
+      });
+    }
+    return pending;
+  };
+
+  return {
+    capabilities,
+    async listForReview(scope: ApplicationReviewScope): Promise<readonly Application[]> {
+      reviewScopeGroupParameters(scope);
+      return new PostgresApplicationReviewRepository(await executor(), capabilities).listForReview(
+        scope,
+      );
+    },
+    async findForReview(
+      applicationId: string,
+      scope: ApplicationReviewScope,
+    ): Promise<Application | undefined> {
+      reviewScopeGroupParameters(scope);
+      return new PostgresApplicationReviewRepository(await executor(), capabilities).findForReview(
+        applicationId,
+        scope,
+      );
+    },
+    async saveReviewed(
+      application: Application,
+      scope: ApplicationReviewScope,
+    ): Promise<Application> {
+      assertWritableRecord(application);
+      reviewScopeGroupParameters(scope);
+      return new PostgresApplicationReviewRepository(await executor(), capabilities).saveReviewed(
+        application,
+        scope,
+      );
     },
   };
 }

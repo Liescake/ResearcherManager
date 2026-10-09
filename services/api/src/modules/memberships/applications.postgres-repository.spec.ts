@@ -1846,7 +1846,7 @@ describe('PostgreSQL 入组申请仓储：已接入运行时绑定、无驱动�
     }
   });
 
-  it('adapter 不引入任何数据库驱动 / ORM 依赖（依赖面是固定的五个说明符）', () => {
+  it('adapter 不引入任何数据库驱动 / ORM 依赖（依赖面是固定的六个说明符）', () => {
     const source = readFileSync(ADAPTER_PATH, 'utf8');
     const forbidden = new Set([
       'pg',
@@ -1879,6 +1879,11 @@ describe('PostgreSQL 入组申请仓储：已接入运行时绑定、无驱动�
         '../../db/ports/sql-executor.port',
         './applications.contract',
         './applications.port',
+        // 审核端端口：审核仓储实现与申请人端实现**同文件**（门禁规定一个模块只能有一个
+        // 持久化适配切片），但仍是各自独立的端口，因此这里多出一个**端口**说明符
+        // —— 不是驱动，也不是另一个 adapter（同模块 adapter 之间互相 import 会被
+        // postgres-adapter-boundary 判为转发并拒绝）。
+        './application-reviews.port',
       ]),
     );
   });
