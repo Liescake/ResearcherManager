@@ -4,13 +4,14 @@ import type { MatchingRecommendationItem, MatchingRequestStatus } from '@rm/shar
 /**
  * 匹配（matching）切片的两个**显式可替换端口**与存储实体。
  *
- * 为什么是端口：P4/P5 尚未引入数据库（迁移计划见 `db/migrations/`），但业务切片不能因此
- * 把「进程内 Map」当成生产存储。这里把两类依赖显式化：
+ * 为什么是端口：业务切片不能把「进程内 Map」当成生产存储。这里把两类依赖显式化：
  *
  * 1. `MatchingRepository`（匹配请求持久化，对应 `ai_match_records`）：
- *    默认绑定内存基线 `InMemoryMatchingRepository`，它如实声明 `persistent = false`、
- *    `productionReady = false`，并在 `NODE_ENV=production` 下拒绝构造；引入 PostgreSQL 时
- *    只需换绑 DI 令牌 `MATCHING_REPOSITORY`，service/controller 不改动；
+ *    **异步 + 授权边界**契约（`MatchingAccessScope` 随每次访问传入）。未配置数据库时绑定内存基线
+ *    `InMemoryMatchingRepository`（如实声明 `persistent = false`、`productionReady = false`，
+ *    并在 `NODE_ENV=production` 下拒绝构造）；已配置数据库时由模块换绑工厂绑定
+ *    `createLazyPostgresMatchingRepository`（延迟建连，生产准入由启动期依赖就绪门禁判定）。
+ *    两种后端同语义，因此「切换到数据库」与「回退到内存基线」都不改动 service / controller；
  * 2. `MatchingFeatureSource`（**特征最小化与召回**边界）：
  *    只返回「已脱敏的最小特征 + 候选小组」。本切片默认绑定内存基线
  *    `InMemoryMatchingFeatureSource`（同样 `productionReady = false` 且生产拒绝构造），
@@ -62,15 +63,22 @@ export interface MatchingRepositoryCapabilities {
   readonly productionReady: boolean;
 }
 
+/**
+ * 匹配请求仓储端口（**运行时唯一取用点**，`MATCHING_REPOSITORY`）。
+ *
+ * 形状是「异步 + 授权边界」：四个方法都要求 `MatchingAccessScope`，因此不存在
+ * 「只传 `userId` 就绕过小组边界」的调用形态；两个后端（内存基线 / PostgreSQL adapter）
+ * 必须语义一致。把它设计成 Promise 之后，绑定哪个后端不再影响 service / controller 的形状。
+ */
 export interface MatchingRepository {
   readonly capabilities: MatchingRepositoryCapabilities;
   /** 写入一条已由 service 补齐归属、状态、摘要与时间戳的记录（入口恒为 `pending`） */
-  create(request: MatchingRequest): MatchingRequest;
+  create(request: MatchingRequest, scope: MatchingAccessScope): Promise<MatchingRequest>;
   /** 按 id 覆盖写入（状态机推进用）；id 不存在属服务端缺陷，必须报错而不是静默插入 */
-  save(request: MatchingRequest): MatchingRequest;
-  findById(requestId: string): MatchingRequest | undefined;
+  save(request: MatchingRequest, scope: MatchingAccessScope): Promise<MatchingRequest>;
+  findById(requestId: string, scope: MatchingAccessScope): Promise<MatchingRequest | undefined>;
   /** 只按归属主体取数：调用方必须是已授权访问该主体资源的服务端代码 */
-  listByUserId(userId: string): readonly MatchingRequest[];
+  listByUserId(scope: MatchingAccessScope): Promise<readonly MatchingRequest[]>;
 }
 
 /**
@@ -116,13 +124,13 @@ export interface MatchingAccessScope {
 }
 
 /**
- * **异步仓储契约**（数据库形状的 repository 端口，与 `MatchingRepository` 同语义）。
+ * **异步仓储契约的历史名**（`AsyncMatchingRepository`）：现在它是 `MatchingRepository` 的别名。
  *
- * 为什么与 `MatchingRepository` 并存、而不是把它直接改成异步：后者是当前运行时绑定
- * （内存基线，同步返回）。把它改成 Promise 是**跨模块契约变更**（service / controller 与既有
- * spec 必须一起改），只能与「引入经评估的数据库驱动 + 集成验证」在同一片切片完成。在那之前，
- * 数据库 adapter 按本契约实现并单独验证，运行时绑定一动不动，因此「切换到数据库」与
- * 「回退到内存基线」都仍然是可以整步执行 / 整步回退的操作。
+ * 历史事实：本端口原先按「同步端口（内存基线）+ 异步契约（数据库形状，尚未接入）」并存设计，
+ * 「同步 → 异步」的迁移与「接入经评估的数据库驱动 + 集成验证」被刻意绑定在同一片切片。
+ * 本切片完成的正是那次迁移：**运行时端口 `MatchingRepository` 自身已经是异步 + 授权边界的形状**，
+ * 因此「绑定 PostgreSQL 实现」与「回退到内存基线」都可以在不改动 service / controller 的前提下
+ * 整步执行、整步回退。保留本名字是为了让既有 adapter 与其离线 spec 使用的契约名继续有效。
  *
  * 实现者（当前只有 `matching.postgres-repository.ts`）必须满足与内存基线**完全相同**的语义
  * （含「同 ID 重复写入视为服务端缺陷、不得静默覆盖」与「覆盖写入未知 ID 必须显式抛错」），
@@ -130,7 +138,7 @@ export interface MatchingAccessScope {
  * 1. **授权边界随每次访问传入**：四个方法都要求 `MatchingAccessScope`（服务端 subject + 已授权小组
  *    集合），因此不存在「只传 `userId` 就绕过小组边界」的调用形态。仓储**不做授权判定**，
  *    只校验传入的边界是否被满足；边界本身由 `AuthorizationGuard` 与召回来源负责。
- *    `listByUserId` 的方法名沿用同步端口，取数主体改由 `scope.ownerUserId` 承载。
+ *    `listByUserId` 的方法名沿用历史命名，取数主体由 `scope.ownerUserId` 承载。
  * 2. **归属只来自服务端**：`userId` 既是写入记录的归属，也是取数主体；仓储不生成、不覆盖归属，
  *    并复核「返回记录的归属 === 本次访问的归属」，不一致即判服务端缺陷（`OWNER_VIOLATION`）。
  * 3. **存储 ID 域**：`userId`、记录 `id` 与推荐结果里的 `groupId` 都必须落在
@@ -142,17 +150,7 @@ export interface MatchingAccessScope {
  * 5. **每条返回记录都必须能被读取契约校验**：未知列、未知枚举、坏形状、状态与条数矛盾、
  *    推荐理由里出现个人标识，一律按服务端缺陷抛错；高敏感内容与归属**绝不**进入错误消息与日志。
  */
-export interface AsyncMatchingRepository {
-  readonly capabilities: MatchingRepositoryCapabilities;
-  /** 写入入口记录（状态恒为入口态、推荐为空）；同 ID 冲突必须显式抛错，不得静默覆盖 */
-  create(request: MatchingRequest, scope: MatchingAccessScope): Promise<MatchingRequest>;
-  /** 覆盖写入状态机推进结果；ID 不存在或不属于该主体都必须显式抛错，不得退化成插入 */
-  save(request: MatchingRequest, scope: MatchingAccessScope): Promise<MatchingRequest>;
-  /** 未命中返回 `undefined`（不抛错）：只返回同时命中记录 ID 与**服务端主体归属**的记录 */
-  findById(requestId: string, scope: MatchingAccessScope): Promise<MatchingRequest | undefined>;
-  /** 只按归属主体取数：调用方必须是已授权访问该主体资源的服务端代码 */
-  listByUserId(scope: MatchingAccessScope): Promise<readonly MatchingRequest[]>;
-}
+export type AsyncMatchingRepository = MatchingRepository;
 
 /** 召回与特征最小化后端的能力声明 */
 export interface MatchingSourceCapabilities {

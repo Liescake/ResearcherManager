@@ -45,6 +45,7 @@ import {
   POSTGRES_MATCHING_REQUEST_FIELDS,
   POSTGRES_MATCHING_REPOSITORY_CAPABILITIES,
   POSTGRES_MATCHING_REPOSITORY_VERIFICATION_STEPS,
+  POSTGRES_MATCHING_REPOSITORY_VERIFIED_STEPS,
   POSTGRES_MATCHING_REVIEW_COLUMNS,
   POSTGRES_MATCHING_TABLE,
   POSTGRES_MATCHING_VIEW_EXCLUDED_COLUMNS,
@@ -110,7 +111,8 @@ const PORT_PATH = resolve(MATCHING_DIR, 'matching.port.ts');
 const MODULE_PATH = resolve(MATCHING_DIR, 'matching.module.ts');
 const IN_MEMORY_PATH = resolve(MATCHING_DIR, 'matching.in-memory-repository.ts');
 const ADAPTER_CLASS = 'PostgresMatchingRepository';
-const ADAPTER_MODULE = 'matching.postgres-repository';
+/** 整词匹配的类名（createLazyPostgresMatchingRepository 这类工厂名**不算**直接引用类名） */
+const ADAPTER_CLASS_PATTERN = /\bPostgresMatchingRepository\b/u;
 
 interface RecordedCall {
   readonly sql: string;
@@ -566,33 +568,51 @@ describe('PostgreSQL 匹配仓储：能力声明、字段闭集与交付边界',
     }
   });
 
-  it('端口已新增并存的异步契约与后端标识，同步端口签名一字未改', () => {
+  it('端口已是「异步 + 授权边界」形状，异步契约名保留为别名，并给出后端标识与存储 ID 域', () => {
     const source = readFileSync(PORT_PATH, 'utf8');
-    expect(source).toContain('export interface AsyncMatchingRepository {');
+    expect(source).toContain('export type AsyncMatchingRepository = MatchingRepository;');
     expect(source).toContain('export const MATCHING_REPOSITORY_BACKEND_POSTGRES');
     expect(source).toContain('export const MATCHING_REPOSITORY_STORAGE_ID_DOMAIN');
     expect(source).toContain('export interface MatchingAccessScope {');
 
-    // 同步端口（当前运行时绑定）不得被改成异步
-    const syncPort = source.slice(
+    // 运行时端口自身就是异步 + 携带授权边界的形状（本切片完成的「同步 → 异步」迁移）
+    const runtimePort = source.slice(
       source.indexOf('export interface MatchingRepository {'),
-      source.indexOf('export interface AsyncMatchingRepository {'),
+      source.indexOf('export type AsyncMatchingRepository = MatchingRepository;'),
     );
-    expect(syncPort).not.toContain(': Promise');
-    expect(syncPort).toContain('create(request: MatchingRequest): MatchingRequest;');
-    expect(syncPort).toContain('listByUserId(userId: string): readonly MatchingRequest[];');
-
-    // 异步契约：四个方法都要求携带服务端授权边界
-    const asyncPort = source.slice(source.indexOf('export interface AsyncMatchingRepository {'));
-    expect(asyncPort).toContain('create(request: MatchingRequest, scope: MatchingAccessScope)');
-    expect(asyncPort).toContain('save(request: MatchingRequest, scope: MatchingAccessScope)');
-    expect(asyncPort).toContain(
+    expect(runtimePort).toContain('create(request: MatchingRequest, scope: MatchingAccessScope)');
+    expect(runtimePort).toContain('save(request: MatchingRequest, scope: MatchingAccessScope)');
+    expect(runtimePort).toContain(
       'findById(requestId: string, scope: MatchingAccessScope): Promise<MatchingRequest | undefined>;',
     );
-    expect(asyncPort).toContain('listByUserId(scope: MatchingAccessScope)');
-    expect(asyncPort).toContain('Promise<MatchingRequest>');
-    expect(asyncPort).toContain('Promise<MatchingRequest | undefined>');
-    expect(asyncPort).toContain('Promise<readonly MatchingRequest[]>');
+    expect(runtimePort).toContain('listByUserId(scope: MatchingAccessScope)');
+    expect(runtimePort).toContain('Promise<MatchingRequest>');
+    expect(runtimePort).toContain('Promise<MatchingRequest | undefined>');
+    expect(runtimePort).toContain('Promise<readonly MatchingRequest[]>');
+    // 不再存在「同步、只按 userId 取数」的旧调用形态：授权边界是四个方法的必填参数
+    expect(source).not.toContain('create(request: MatchingRequest): MatchingRequest;');
+    expect(source).not.toContain('listByUserId(userId: string)');
+  });
+
+  it('已验证步骤是验证清单的子集，且清单未全部完成时不得声称生产可用（自检强制）', () => {
+    const declared = new Set<string>(POSTGRES_MATCHING_REPOSITORY_VERIFICATION_STEPS);
+    expect(POSTGRES_MATCHING_REPOSITORY_VERIFIED_STEPS.length).toBeGreaterThan(0);
+    for (const step of POSTGRES_MATCHING_REPOSITORY_VERIFIED_STEPS) {
+      expect(declared.has(step)).toBe(true);
+    }
+    // 仍有两项未完成：存储 ID 域收敛与生产可用翻转
+    const verified = new Set<string>(POSTGRES_MATCHING_REPOSITORY_VERIFIED_STEPS);
+    const pending = POSTGRES_MATCHING_REPOSITORY_VERIFICATION_STEPS.filter(
+      (step) => !verified.has(step),
+    );
+    expect(pending).toEqual([
+      'session-subject-and-recommendation-group-ids-converged-to-uuid',
+      'production-ready-capability-flipped-with-evidence',
+    ]);
+    expect(POSTGRES_MATCHING_REPOSITORY_CAPABILITIES.productionReady).toBe(false);
+
+    // 自检对「全部完成却仍声明未验证」与「尚有未完成却声称生产可用」都 fail-closed
+    expect(() => assertPostgresMatchingRepositoryCapabilities()).not.toThrow();
   });
 
   it('adapter 的公开面覆盖能力、验证清单、列清单、内部列与裁剪事实（供上层与运维机器判定）', () => {
@@ -1810,7 +1830,7 @@ describe('PostgreSQL 匹配仓储：AI 输入最小化、去标识化与公开�
     const memory: MatchingRepository = new InMemoryMatchingRepository({
       NODE_ENV: 'test',
     } as unknown as ConstructorParameters<typeof InMemoryMatchingRepository>[0]);
-    const inMemory = memory.create(PENDING);
+    const inMemory = await memory.create(PENDING, SCOPE);
 
     const { repository } = repoWith({ rows: [rowFromRecord(PENDING)], rowCount: 1 });
     const persisted = await repository.create(PENDING, SCOPE);
@@ -1820,19 +1840,24 @@ describe('PostgreSQL 匹配仓储：AI 输入最小化、去标识化与公开�
   });
 });
 
-describe('PostgreSQL 匹配仓储：未装配、无驱动依赖、与 schema 边界对齐', () => {
-  it('MatchingModule 仍只绑定内存基线（本 adapter 未被装配）', () => {
+describe('PostgreSQL 匹配仓储：已按 DATABASE_URL 装配、无驱动依赖、与 schema 边界对齐', () => {
+  it('MatchingModule 经换绑工厂引用本 adapter：已配置数据库 ⇒ PostgreSQL，未配置 ⇒ 内存基线', () => {
     const content = readFileSync(MODULE_PATH, 'utf8');
 
-    expect(content).not.toContain(ADAPTER_CLASS);
-    expect(content).not.toContain(ADAPTER_MODULE);
+    expect(content).toContain('createMatchingRepository');
+    expect(content).toContain('createLazyPostgresMatchingRepository');
+    expect(content).toContain('resolveAppDatabaseConfig');
+    expect(content).toContain('MATCHING_REPOSITORY');
+    // 内存基线仍然只作为「未配置数据库」分支的实现被引用，不再是端口 provider
     expect(content).toContain('InMemoryMatchingRepository');
-    expect(content).toContain(
+    expect(content).not.toContain(
       '{ provide: MATCHING_REPOSITORY, useExisting: InMemoryMatchingRepository }',
     );
+    // adapter 类名不直接出现在模块里：换绑只经工厂导出
+    expect(content).not.toMatch(ADAPTER_CLASS_PATTERN);
   });
 
-  it('持久化登记、数据库模块与启动装配都不引用本 adapter（端口登记表仍按令牌判定）', () => {
+  it('持久化登记、数据库模块与启动装配按令牌判定，不硬编码 adapter 类名', () => {
     for (const relative of [
       join('src', 'db', 'persistence-bindings.ts'),
       join('src', 'db', 'database.module.ts'),
@@ -1842,22 +1867,25 @@ describe('PostgreSQL 匹配仓储：未装配、无驱动依赖、与 schema 边
       join('src', 'startup-assembly.spec.ts'),
     ]) {
       const content = readApiFile(relative);
-      expect(content).not.toContain(ADAPTER_CLASS);
+      expect(content).not.toMatch(ADAPTER_CLASS_PATTERN);
       expect(content).not.toMatch(
         /(?:from\s+['"][^'"]*matching\.postgres-repository['"]|require\(\s*['"][^'"]*matching\.postgres-repository['"]\s*\))/u,
       );
     }
-    // 登记表里匹配端口仍按令牌登记，且没有把 adapter 类名写进任何绑定
+    // 登记表里匹配端口仍按令牌登记
     const bindings = readApiFile(join('src', 'db', 'persistence-bindings.ts'));
     expect(bindings).toContain('MATCHING_REPOSITORY');
     expect(bindings).toContain('匹配记录存储');
   });
 
-  it('内存基线仍是同步契约的实现者（本切片不改动它，也不切换内存 provider）', () => {
+  it('内存基线实现异步 + 授权边界的运行时端口，且如实声明非持久 / 不可用于生产', async () => {
     const source = readFileSync(IN_MEMORY_PATH, 'utf8');
     expect(source).toContain('implements MatchingRepository');
-    expect(source).not.toContain(ADAPTER_CLASS);
-    expect(source).not.toContain(ADAPTER_MODULE);
+    expect(source).not.toMatch(ADAPTER_CLASS_PATTERN);
+    // 内存基线不 import adapter 模块（换绑发生在 Module 的工厂里，不发生在实现里）
+    expect(source).not.toMatch(
+      /(?:from\s+['"][^'"]*matching\.postgres-repository['"]|require\(\s*['"][^'"]*matching\.postgres-repository['"]\s*\))/u,
+    );
     expect(source).toContain('persistent: false');
     expect(source).toContain('productionReady: false');
 
@@ -1869,9 +1897,10 @@ describe('PostgreSQL 匹配仓储：未装配、无驱动依赖、与 schema 边
       persistent: false,
       productionReady: false,
     });
-    expect(memory.create(PENDING)).toEqual(PENDING);
-    expect(memory.findById(REQUEST_ID)).toEqual(PENDING);
-    expect(memory.listByUserId(OWNER_ID)).toEqual([PENDING]);
+    // 入口记录（推荐为空）在已授权小组集合下可正常往返
+    await expect(memory.create(PENDING, SCOPE)).resolves.toEqual(PENDING);
+    await expect(memory.findById(REQUEST_ID, SCOPE)).resolves.toEqual(PENDING);
+    await expect(memory.listByUserId(SCOPE)).resolves.toEqual([PENDING]);
   });
 
   it('adapter 不引入任何数据库驱动 / ORM 依赖（依赖面是固定的六个说明符）', () => {
@@ -1912,7 +1941,7 @@ describe('PostgreSQL 匹配仓储：未装配、无驱动依赖、与 schema 边
     );
   });
 
-  it('工作区依赖里没有 pg / ORM 包', () => {
+  it('工作区依赖里没有未授权的 pg 族 / ORM 包（官方 pg 驱动已授权，仅限驱动层）', () => {
     for (const relative of [join('services', 'api', 'package.json'), 'package.json']) {
       const manifest = JSON.parse(readFileSync(join(REPO_ROOT, relative), 'utf8')) as {
         dependencies?: Record<string, string>;
@@ -1924,7 +1953,7 @@ describe('PostgreSQL 匹配仓储：未装配、无驱动依赖、与 schema 边
       ];
       for (const name of names) {
         expect(
-          /^(?:pg|pg-pool|pg-promise|postgres|prisma|@prisma\/client|typeorm|kysely|drizzle-orm|sequelize|@mikro-orm\/core)$/u.test(
+          /^(?:pg-pool|pg-native|pg-promise|postgres|slonik|prisma|@prisma\/client|typeorm|kysely|drizzle-orm|drizzle-kit|sequelize|@mikro-orm\/core)$/u.test(
             name,
           ),
         ).toBe(false);
@@ -1932,7 +1961,7 @@ describe('PostgreSQL 匹配仓储：未装配、无驱动依赖、与 schema 边
     }
   });
 
-  it('ai_match_records 尚未转为迁移或草案：与 productionReady=false 及验证清单第 3 项配对', () => {
+  it('ai_match_records 已由迁移 0005 建立（adapter 按配置装配，productionReady 保持 false）', () => {
     const bootstrap = readFileSync(
       join(REPO_ROOT, 'db', 'migrations', '0001_bootstrap.sql'),
       'utf8',
@@ -1940,14 +1969,35 @@ describe('PostgreSQL 匹配仓储：未装配、无驱动依赖、与 schema 边
     // 占位清单里已经登记该表（因此本 adapter 的表名不是凭空发明）
     expect(bootstrap).toContain(POSTGRES_MATCHING_TABLE);
 
+    const sql = readFileSync(
+      join(REPO_ROOT, 'db', 'migrations', '0005_ai_match_records.sql'),
+      'utf8',
+    );
+    // 建表语句必须真的存在，而不是只在注释里登记
+    expect(sql).toMatch(
+      new RegExp(
+        `CREATE\\s+TABLE\\s+IF\\s+NOT\\s+EXISTS\\s+${POSTGRES_MATCHING_TABLE}\\s*\\(`,
+        'u',
+      ),
+    );
+    // 列清单里的每一列都必须在迁移里有定义（列清单 ↔ schema 单向核对）
+    for (const column of POSTGRES_MATCHING_COLUMNS) {
+      expect(sql).toMatch(
+        new RegExp(
+          `\\b${column}\\s+(?:uuid|smallint|integer|varchar|timestamptz|jsonb|boolean)\\b`,
+          'u',
+        ),
+      );
+    }
+    // 统计聚合读按归属过滤：user_id 必须被索引
+    expect(sql).toMatch(/CREATE\s+INDEX[\s\S]*?\(\s*user_id/iu);
+
+    // 草案目录里仍然没有 ai_match_records（本切片直接落迁移，不落草案）
     const draftDir = join(REPO_ROOT, 'db', 'schema-drafts');
     expect(readdirSync(draftDir).some((file) => file.includes(POSTGRES_MATCHING_TABLE))).toBe(
       false,
     );
-    const migrationDir = join(REPO_ROOT, 'db', 'migrations');
-    expect(readdirSync(migrationDir).some((file) => file.includes(POSTGRES_MATCHING_TABLE))).toBe(
-      false,
-    );
+
     expect(POSTGRES_MATCHING_REPOSITORY_VERIFICATION_STEPS).toContain(
       'ai-match-records-schema-draft-created-and-promoted-to-migration',
     );

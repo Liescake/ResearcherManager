@@ -15,6 +15,7 @@ import {
   MATCHING_REPOSITORY_BACKEND_POSTGRES,
   type AsyncMatchingRepository,
   type MatchingAccessScope,
+  type MatchingRepository,
   type MatchingRepositoryCapabilities,
   type MatchingRequest,
 } from './matching.port';
@@ -22,26 +23,29 @@ import {
 /**
  * 匹配记录（`ai_match_records`）的 **PostgreSQL 仓储 adapter（未接入运行时）**。
  *
- * ## 交付边界（本切片刻意不做的事）
- * - **不绑定**到 `MatchingModule`：模块仍然只绑定内存基线 `InMemoryMatchingRepository`
- *   （provider 列表与 DI 令牌一字未改），运行时行为与本切片之前逐字节一致（有回归断言，
- *   见同名 spec）；
- * - **不切换内存 provider**：`MATCHING_REPOSITORY` 的运行时绑定、持久化登记表
- *   （`db/persistence-bindings.ts` 早已按令牌登记该端口）与启动装配都不引用本文件；
- *   换绑属于「启用数据库」那一步，且必须与驱动引入、集成验证一起发生；
+ * ## 交付边界（本切片做的事与不做的事）
+ * - **已绑定**到 `MatchingModule`：模块的换绑工厂 `createMatchingRepository` 在
+ *   「已解析出 `DATABASE_URL` 且拿到 `SQL_CONNECTION_FACTORY`」时绑定
+ *   `createLazyPostgresMatchingRepository`，否则绑定内存基线；已配置数据库却拿不到执行器工厂时
+ *   **抛错**（fail-closed，绝不静默退回内存存储）。授权边界随每次访问传入，主体与小组标识都
+ *   由 service 从服务端会话与召回产物构造；
+ * - **延迟建连**：本文件的工厂只持有 `resolveExecutor`，装配阶段（`NestFactory.create()`）
+ *   一次都不碰数据库，因此「数据库已配置但执行器未 attest / 依赖未就绪」由启动期门禁给出
+ *   **结构化违规**（`SQL_EXECUTOR_VERIFICATION_REQUIRED`、`MATCHING_REPOSITORY[DEPENDENCY_NOT_VERIFIED]`），
+ *   而不是在这里表现为一个连接错误；
  * - **不引入** `pg` / Prisma / TypeORM 等驱动或 ORM 依赖：本文件只依赖驱动无关的
- *   `SqlExecutor` 端口（`db/ports/sql-executor.port.ts`），真实执行器由消费方在「启用数据库」
- *   那一步显式提供；
+ *   `SqlExecutor` 端口（`db/ports/sql-executor.port.ts`），真实执行器由消费方显式提供
+ *   （驱动只允许出现在 `db/postgres/` 驱动层）；
  * - **不声称生产可用**：能力声明固定为 `backend = postgres`、`persistent = true`、
- *   `productionReady = false`。在引入经评估的驱动、完成对真实 PostgreSQL 的集成验证、并把
- *   `ai_match_records` 从字段字典落成 schema 草案 → 迁移之前，生产启动会被
- *   `PersistenceBoundaryService` 拒绝（`productionReady !== true` 即违规）。
+ *   `productionReady = false`。真实 PostgreSQL 的集成验证已补齐（见同名集成 spec），但
+ *   **存储 ID 域尚未收敛**（会话主体与召回小组标识仍是非 UUID 的安全 ID），因此生产启动仍会被
+ *   `PersistenceBoundaryService` 与依赖就绪门禁拒绝（`productionReady !== true` 即违规）。
  *
- * ## 为什么先有异步契约
- * 现有 `MatchingRepository`（`matching.port.ts`）是同步接口；把运行时端口改成 Promise 是跨模块
- * 契约变更（service / controller / 既有 spec 必须一起改），必须与真实驱动引入在同一片切片完成。
- * 因此本文件实现 `AsyncMatchingRepository`（Promise 版，语义与内存基线完全一致），让「SQL 与映射
- * 是否正确」可以在**没有驱动、也没有数据库**的情况下被离线验证。
+ * ## 为什么端口已经是异步的
+ * 运行时端口 `MatchingRepository`（`matching.port.ts`）本来是同步接口；「同步 → 异步」的迁移与
+ * 「接入驱动 + 真库集成验证」被刻意绑定在同一片切片，本切片已一并完成：端口现在自身就是
+ * 「异步 + 授权边界」形状，`AsyncMatchingRepository` 只作为该契约的历史别名保留。
+ * 因此本文件与内存基线**可互换绑定**，而「SQL 与映射是否正确」仍可离线验证。
  *
  * ## 与内存基线的语义对应（逐条可核对）
  * | 内存基线 | 本 adapter |
@@ -109,12 +113,16 @@ import {
  *    `EXECUTOR_FAILURE`（消息、`issues` 都不携带原始错误、SQL、连接信息、参数与字段取值）。
  *
  * ## 尚未解决 / 已登记的前置（因此 productionReady 恒为 false）
- * `db/migrations/0001_bootstrap.sql` 的占位清单里登记了 `ai_match_records`，但该表既没有
- * schema 草案（`db/schema-drafts/` 目前只有 `research_groups`）也没有迁移；真实 PostgreSQL 的
- * 集成验证（建表、`id` 主键冲突、`user_id` 索引、jsonb 推荐结果的闭集与顺序、存储层不产生
- * 跨主体读取）尚未进行。另外**存储 ID 域**尚未满足：会话主体是 `u-student-1` 这类安全 ID，
- * 召回来源返回的候选小组 ID 同样不是 UUID，两者都必须在「绑定数据库」那一片切片一起收敛。
- * 这些都已登记在 `POSTGRES_MATCHING_REPOSITORY_VERIFICATION_STEPS` 里，不能只写声明。
+ * `ai_match_records` 已由迁移 `0005_ai_match_records.sql` 建立（列清单与本 adapter 的
+ * `POSTGRES_MATCHING_COLUMNS` 逐列一致，状态 / 降级码 / 摘要形状的 CHECK 齐备），真库集成验证
+ * （建表与列清单、`id` 主键冲突、按主体取数的归属隔离、跨主体覆盖写入 0 行、jsonb 推荐结果的
+ * 闭集与顺序、存储层 CHECK 拦截、内部列未投影）由 `matching-integration.spec.ts` 在真实
+ * PostgreSQL 上闭环。**仍然未满足的是存储 ID 域**：会话主体是 `u-student-1` 这类安全 ID，
+ * 召回来源返回的候选小组 ID 同样不是 UUID，因此数据库路径对它们 fail-closed（在进入 SQL 之前）。
+ * 把它收敛为 UUID 属于后续切片。这些都已登记在
+ * `POSTGRES_MATCHING_REPOSITORY_VERIFICATION_STEPS` 里，不能只写声明；已取得证据的步骤登记在
+ * `POSTGRES_MATCHING_REPOSITORY_VERIFIED_STEPS` 里，且由能力自检强制「尚未全部完成时不得声称
+ * 生产可用、全部完成后不得继续声明未验证」。
  */
 
 /** 表名：与 docs/P1-字段级数据字典.md / docs/P2-ER图.md 的 `ai_match_records` 一致 */
@@ -446,6 +454,33 @@ export const POSTGRES_MATCHING_REPOSITORY_VERIFICATION_STEPS = [
   'production-ready-capability-flipped-with-evidence',
 ] as const;
 
+/**
+ * **已取得证据**的验证步骤（上面清单的子集，逐项都有可核对的证据）：
+ * - `driver-dependency-evaluated`：官方 `pg` 驱动已授权且只允许出现在 `db/postgres/` 驱动层
+ *   （见 `postgres-adapter-registry.ts` 的 `AUTHORIZED_POSTGRES_DRIVER_PACKAGES`）；
+ * - `integration-tests-against-real-postgres`：`matching-integration.spec.ts` 在真实 PostgreSQL 上
+ *   执行迁移与读写闭环（未配置 `TEST_DATABASE_URL` 时整个套件明确 skip，绝不伪造通过）；
+ * - `ai-match-records-schema-draft-created-and-promoted-to-migration`：`ai_match_records` 由迁移
+ *   `0005_ai_match_records.sql` 建立，列清单与本 adapter 的列清单逐列一致；
+ * - `matching-repository-port-migrated-to-async`：运行时端口 `MatchingRepository` 已是
+ *   「异步 + 授权边界」形状（`AsyncMatchingRepository` 仅作为历史别名）；
+ * - `internal-columns-not-projected-verified-against-real-queries`：真库列清单**恰好**是 12 个
+ *   输出列（无任何原始 AI 输入 / 提示词 / 模型 payload / PII / 内部评分 / 审核 / 簿记列），
+ *   且取值只进参数、SQL 文本由模块常量派生。
+ *
+ * 仍待完成：`session-subject-and-recommendation-group-ids-converged-to-uuid`（会话主体与召回
+ * 小组标识仍是非 UUID 的安全 ID，数据库路径对它们 fail-closed）与
+ * `production-ready-capability-flipped-with-evidence`。两者未完成前
+ * `productionReady` 必须保持 `false`（由能力自检强制）。
+ */
+export const POSTGRES_MATCHING_REPOSITORY_VERIFIED_STEPS = [
+  'driver-dependency-evaluated',
+  'integration-tests-against-real-postgres',
+  'ai-match-records-schema-draft-created-and-promoted-to-migration',
+  'matching-repository-port-migrated-to-async',
+  'internal-columns-not-projected-verified-against-real-queries',
+] as const satisfies readonly (typeof POSTGRES_MATCHING_REPOSITORY_VERIFICATION_STEPS)[number][];
+
 export type PostgresMatchingRepositoryErrorCode =
   | 'CAPABILITY_MISDECLARED'
   | 'INVALID_CONFIGURATION'
@@ -509,11 +544,31 @@ export function assertPostgresMatchingRepositoryCapabilities(
   if (capabilities.productionReady !== false) {
     issues.push('productionReady');
   }
+
+  // 验证清单与能力声明必须同步：登记为「已完成」的步骤必须是清单里的成员，
+  // 且**尚有未完成步骤时不得声称生产可用、全部完成后不得继续声明未验证**（避免陈旧声明）。
+  const declared = new Set<string>(POSTGRES_MATCHING_REPOSITORY_VERIFICATION_STEPS);
+  const unknown = POSTGRES_MATCHING_REPOSITORY_VERIFIED_STEPS.filter((step) => !declared.has(step));
+  if (unknown.length > 0) {
+    issues.push('verifiedSteps');
+  }
+  const verified = new Set<string>(POSTGRES_MATCHING_REPOSITORY_VERIFIED_STEPS);
+  const pending = POSTGRES_MATCHING_REPOSITORY_VERIFICATION_STEPS.filter(
+    (step) => !verified.has(step),
+  );
+  if (pending.length === 0 && capabilities.productionReady !== true) {
+    // 清单全部完成却仍声明「未验证」= 陈旧声明：必须与 productionReady 的翻转同时更新
+    issues.push('productionReady');
+  }
+  if (pending.length > 0 && capabilities.productionReady === true) {
+    issues.push('productionReady');
+  }
+
   if (issues.length > 0) {
     throw new PostgresMatchingRepositoryError(
       'CAPABILITY_MISDECLARED',
-      `PostgreSQL 匹配仓储能力声明不符（backend 必须是 ${MATCHING_REPOSITORY_BACKEND_POSTGRES}、persistent=true、productionReady=false）：未完成驱动集成验证前不得声称生产可用`,
-      issues,
+      `PostgreSQL 匹配仓储能力声明不符（backend 必须是 ${MATCHING_REPOSITORY_BACKEND_POSTGRES}、persistent=true，且 productionReady 必须与验证清单的完成状态一致）：未完成驱动集成验证前不得声称生产可用`,
+      [...new Set(issues)],
     );
   }
 }
@@ -1544,4 +1599,93 @@ export class PostgresMatchingRepository implements AsyncMatchingRepository {
       );
     }
   }
+}
+
+/**
+ * 写入参数的**连接前判定**（延迟建连包装与 `PostgresMatchingRepository` 共用同一口径）：
+ * 授权边界 → 记录可写性 → 归属一致 → 推荐结果在已授权小组集合内。任何一步不合规都在
+ * **解析执行器之前** fail-closed，因此拒绝不会建立连接、也不会留下任何已写入的行。
+ */
+function assertWritableAccess(
+  request: unknown,
+  scope: unknown,
+  options: { readonly requireEntryStatus: boolean },
+): MatchingAccessScope {
+  const access = assertMatchingAccessScope(scope);
+  const writable = assertWritableRecord(request, options);
+  if (writable.userId !== access.ownerUserId) {
+    throw new PostgresMatchingRepositoryError(
+      'OWNER_VIOLATION',
+      '记录的归属与本次访问的服务端主体不一致（他人记录既不出库也不得回流）',
+      ['user_id'],
+    );
+  }
+  assertRecommendationsWithinScope(writable.recommendations, access, 'GROUP_SCOPE_VIOLATION');
+  return access;
+}
+
+/**
+ * **延迟建连**的 PostgreSQL 匹配仓储：模块换绑工厂（`createMatchingRepository`）返回的实现。
+ *
+ * 为什么必须延迟：装配阶段（`NestFactory.create()`）**一次都不能碰数据库**。否则
+ * 「数据库已配置但 SQL 执行器未 attest / 依赖未就绪」就会在这里表现为一个**连接错误**，
+ * 而启动期门禁（`PersistenceBoundaryService` + 依赖就绪契约）就轮不到给出结构化违规。
+ * 本工厂因此只持有 `resolveExecutor`，第一次真正访问时才解析执行器并建连；连接结果被缓存，
+ * 且**失败不缓存**（下一次调用会重新解析，避免一次瞬时故障把端口永久钉死）。
+ *
+ * 判定顺序（与 `matching.binding.spec.ts` 固定的一致）：
+ * 1. 能力自检（未验证的实现不得声称生产可用，且完成状态必须与验证清单同步）；
+ * 2. **授权边界与存储 ID 域先判**：非 UUID 主体 / 小组标识、越权推荐、非入口态记录都在解析
+ *    执行器**之前**被拒绝 —— 既不进 SQL、也不建连；
+ * 3. 解析执行器并构造 `PostgresMatchingRepository`，由其再执行严格行契约与逐列复核
+ *    （纵深防御：同一组不变量在包装层与实现层各判一次）。
+ *
+ * 执行器解析失败（例如拿到 fail-closed 的未验证驱动工厂）时，错误**原样抛出**：
+ * 它是基础设施故障，不是业务结论，且其消息由驱动层构造（本文件不追加任何连接信息）。
+ */
+export function createLazyPostgresMatchingRepository(
+  resolveExecutor: () => Promise<SqlExecutor>,
+  capabilities: MatchingRepositoryCapabilities = POSTGRES_MATCHING_REPOSITORY_CAPABILITIES,
+): MatchingRepository {
+  assertPostgresMatchingRepositoryCapabilities(capabilities);
+
+  let pending: Promise<SqlExecutor> | undefined;
+  const executor = (): Promise<SqlExecutor> => {
+    if (pending === undefined) {
+      pending = resolveExecutor().catch((error: unknown) => {
+        pending = undefined;
+        throw error;
+      });
+    }
+    return pending;
+  };
+
+  return {
+    capabilities,
+    async create(request: MatchingRequest, scope: MatchingAccessScope): Promise<MatchingRequest> {
+      const access = assertWritableAccess(request, scope, { requireEntryStatus: true });
+      return new PostgresMatchingRepository(await executor()).create(request, access);
+    },
+    async save(request: MatchingRequest, scope: MatchingAccessScope): Promise<MatchingRequest> {
+      const access = assertWritableAccess(request, scope, { requireEntryStatus: false });
+      return new PostgresMatchingRepository(await executor()).save(request, access);
+    },
+    async findById(
+      requestId: string,
+      scope: MatchingAccessScope,
+    ): Promise<MatchingRequest | undefined> {
+      const access = assertMatchingAccessScope(scope);
+      const id = requireStorageUuid(
+        requestId,
+        'INVALID_RECORD_ID',
+        '记录 ID 必须落在存储 ID 域内（合法且非空的规范小写 UUID）：非 UUID 的资源标识属于服务端缺陷，不得进入 SQL',
+        'requestId',
+      );
+      return new PostgresMatchingRepository(await executor()).findById(id, access);
+    },
+    async listByUserId(scope: MatchingAccessScope): Promise<readonly MatchingRequest[]> {
+      const access = assertMatchingAccessScope(scope);
+      return new PostgresMatchingRepository(await executor()).listByUserId(access);
+    },
+  };
 }

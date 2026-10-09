@@ -57,45 +57,56 @@ export interface PostgresAdapterDescriptor {
 }
 
 /**
- * 两个未装配 Postgres adapter 的登记表（按模块名字母序，便于人工比对）。
+ * **尚未装配** Postgres adapter 的登记表（按模块名字母序，便于人工比对）。
  *
  * 新增 adapter 时**必须同时**在此登记：门禁会拿磁盘枚举结果与这张表做双向比对，
  * 只加文件不登记（`ADAPTER_FILE_NOT_REGISTERED`）与只登记不加文件（`REGISTERED_FILE_MISSING`）
  * 都会失败。
  *
- * 合规切片已从本组移到 `POSTGRES_BOUND_SLICE_REGISTRY`（它的 `COMPLIANCE_REPOSITORY`
- * 现在按「是否配置 `DATABASE_URL`」换绑），因此这里只剩导出与匹配两个切片。
+ * 当前为**空集**：合规、导出与匹配三个切片先后从本组移到 `POSTGRES_BOUND_SLICE_REGISTRY`
+ * （`COMPLIANCE_REPOSITORY` / `EXPORT_REPOSITORY` / `MATCHING_REPOSITORY` 现在都按
+ * 「是否配置 `DATABASE_URL`」换绑）。空集本身是有意义的断言：一旦新增未装配 adapter 却忘了登记，
+ * 门禁会以 `ADAPTER_FILE_NOT_REGISTERED` 直接失败。
  */
-export const POSTGRES_ADAPTER_REGISTRY: readonly PostgresAdapterDescriptor[] = [
-  {
-    id: 'exports',
-    module: 'exports',
-    file: 'modules/exports/exports.postgres-repository.ts',
-    capabilitiesExport: 'POSTGRES_EXPORT_REPOSITORY_CAPABILITIES',
-    assertExport: 'assertPostgresExportRepositoryCapabilities',
-    repositoryClass: 'PostgresExportRepository',
-    moduleFile: 'modules/exports/exports.module.ts',
-  },
-  {
-    id: 'matching',
-    module: 'matching',
-    file: 'modules/matching/matching.postgres-repository.ts',
-    capabilitiesExport: 'POSTGRES_MATCHING_REPOSITORY_CAPABILITIES',
-    assertExport: 'assertPostgresMatchingRepositoryCapabilities',
-    repositoryClass: 'PostgresMatchingRepository',
-    moduleFile: 'modules/matching/matching.module.ts',
-  },
-];
+export const POSTGRES_ADAPTER_REGISTRY: readonly PostgresAdapterDescriptor[] = [];
 
 /**
  * **已绑定**的持久化切片：adapter 已经进入业务 Module 的 provider（经工厂构造），因此
  * 「未装配」那一组规则（不得被 Module 引用）对它们**不成立** —— 但必须换成另一组同样可机器
  * 判定的规则，而不是简单地放行。
  *
- * 十个切片：
+ * 十一个切片：
  * - `auth`：会话存储（`SESSION_STORE`）。「是否配置数据库」决定绑定哪个实现；未配置时绑定内存基线，
  *   配置时绑定 PostgreSQL 实现（延迟建连，见 `modules/auth/session-store.postgres-repository.ts`）。
  *   因此 `auth.module.ts` 里出现的是**工厂导出名**，而不是 adapter 类名；
+ * - `matching`：匹配记录存储（`MATCHING_REPOSITORY`，发起本人匹配请求 / 本人列表与状态）。
+ *   分流口径与 auth 完全一致：同一份纯函数 `resolveAppDatabaseConfig` + 可选注入的
+ *   `SQL_CONNECTION_FACTORY`，未配置数据库时内存基线，配置时 PostgreSQL 实现（延迟建连，见
+ *   `modules/matching/matching.postgres-repository.ts` 的 `createLazyPostgresMatchingRepository`，
+ *   表 `ai_match_records` 由迁移 `0005` 建立）。授权（`matching:self:request` + `SELF`）在 service 里
+ *   **先于任何字段校验与仓储访问**；归属只来自服务端会话主体（客户端 `userId` / `status` /
+ *   `groupId` / `recommendations` 既不进判定也不进 SQL），adapter 把归属下推进 SQL
+ *   （`WHERE user_id = $1::uuid`）并在返回行上逐条复核归属，记录里的推荐小组一旦越出
+ *   `MatchingAccessScope.authorizedGroupIds`（服务端召回产物 ∪ 会话主体小组集合）即
+ *   `GROUP_SCOPE_VIOLATION` fail-closed（不静默过滤）。落库内容只有脱敏输入的 sha256 摘要、
+ *   受控状态与推荐结果白名单四字段（`groupId` / `score` / `reason` / `advice`）：原始 AI 输入、
+ *   特征快照、提示词、模型 payload、PII、内部评分与审核字段**都不在列清单里**（`SELECT` 显式列清单
+ *   + 严格行契约）。**已登记前置**：`ai_match_records.id / user_id` 与推荐里的 `groupId` 是 `uuid`，
+ *   而会话基线的 `userId` 形如 `u-student-1`、召回小组标识同样不是 UUID，因此数据库路径对它们
+ *   fail-closed（`INVALID_SUBJECT` / `INVALID_RECORD`，且在**解析执行器之前**判定，不建立任何连接）；
+ * - `exports`：导出请求存储（`EXPORT_REPOSITORY`，本人导出请求的状态读 / 创建 / 完成）。分流口径与
+ *   auth 完全一致：同一份纯函数 `resolveAppDatabaseConfig` + 可选注入的 `SQL_CONNECTION_FACTORY`，
+ *   未配置数据库时内存基线，配置时 PostgreSQL 实现（延迟建连，见
+ *   `modules/exports/exports.postgres-repository.ts` 的 `createLazyPostgresExportRepository`，
+ *   表 `export_jobs` 由迁移 `0013` 建立）。授权（入口 `profile:self:read` + `SELF`，再按资源映射到
+ *   该资源的本人读取点）在 service 里**先于任何字段校验与仓储访问**；归属只来自服务端会话主体
+ *   （客户端 `userId` / `status` / `fileUrl` / `path` / `artifactId` 既不进判定也不进 SQL），
+ *   adapter 把归属下推进 SQL（`WHERE requester_id = $1::uuid`）并在返回行上逐条复核归属。
+ *   **已登记前置**：`export_jobs.id / requester_id / artifact_id` 是 `uuid`，而会话基线的
+ *   `userId` 形如 `u-student-1`，因此数据库路径对非 UUID 主体 fail-closed（`INVALID_SUBJECT`，
+ *   且在**解析执行器之前**判定，不建立任何连接）。落库内容只有受控状态与服务端生成的短引用：
+ *   文件名 / 路径 / 下载地址 / 签名地址 / 存储 key / 对象 key / 文件体 / 内部资源快照 / 筛选条件 /
+ *   原始错误文本与存储侧簿记列**都不在**列清单里（`SELECT` 显式列清单 + 严格行契约）；
  * - `compliance`：合规状态存储（`COMPLIANCE_REPOSITORY`，本人合规状态的只读取数）。分流口径与
  *   auth 完全一致：同一份纯函数 `resolveAppDatabaseConfig` + 可选注入的 `SQL_CONNECTION_FACTORY`，
  *   未配置数据库时内存基线，配置时 PostgreSQL 实现（延迟建连，见
@@ -154,7 +165,8 @@ export const POSTGRES_ADAPTER_REGISTRY: readonly PostgresAdapterDescriptor[] = [
  *    只改其中一处即 fail-closed；
  * 5. adapter 源文件不得 import 任何驱动（含已授权的 `pg`）：驱动只允许出现在
  *    `db/postgres/` 驱动层；
- * 6. 其余两个 adapter 继续留在 `POSTGRES_ADAPTER_REGISTRY`（未装配组），两组互斥。
+ * 6. `POSTGRES_ADAPTER_REGISTRY`（未装配组）当前为空集：`PERSISTENCE_BINDINGS` 里的每个
+ *    业务持久化端口都已绑定到「按是否配置数据库分流」的实现，两组互斥。
  */
 export interface PostgresBoundSliceDescriptor {
   /** 稳定 id */
@@ -195,6 +207,28 @@ export const POSTGRES_BOUND_SLICE_REGISTRY: readonly PostgresBoundSliceDescripto
     moduleFile: 'modules/compliance/compliance.module.ts',
     token: 'COMPLIANCE_REPOSITORY',
     factoryExport: 'createLazyPostgresComplianceRepository',
+  },
+  {
+    id: 'exports',
+    module: 'exports',
+    file: 'modules/exports/exports.postgres-repository.ts',
+    capabilitiesExport: 'POSTGRES_EXPORT_REPOSITORY_CAPABILITIES',
+    assertExport: 'assertPostgresExportRepositoryCapabilities',
+    repositoryClass: 'PostgresExportRepository',
+    moduleFile: 'modules/exports/exports.module.ts',
+    token: 'EXPORT_REPOSITORY',
+    factoryExport: 'createLazyPostgresExportRepository',
+  },
+  {
+    id: 'matching',
+    module: 'matching',
+    file: 'modules/matching/matching.postgres-repository.ts',
+    capabilitiesExport: 'POSTGRES_MATCHING_REPOSITORY_CAPABILITIES',
+    assertExport: 'assertPostgresMatchingRepositoryCapabilities',
+    repositoryClass: 'PostgresMatchingRepository',
+    moduleFile: 'modules/matching/matching.module.ts',
+    token: 'MATCHING_REPOSITORY',
+    factoryExport: 'createLazyPostgresMatchingRepository',
   },
   {
     id: 'audit',

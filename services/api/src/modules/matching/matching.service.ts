@@ -37,7 +37,12 @@ import {
   MATCHING_FEATURE_SOURCE,
   MATCHING_REPOSITORY,
 } from './matching.port';
-import type { MatchingFeatureSource, MatchingRepository, MatchingRequest } from './matching.port';
+import type {
+  MatchingAccessScope,
+  MatchingFeatureSource,
+  MatchingRepository,
+  MatchingRequest,
+} from './matching.port';
 
 /**
  * 匹配切片（P7 最小垂直切片，学生自服务部分）：
@@ -85,11 +90,13 @@ export class MatchingService {
   ) {}
 
   /** 本人匹配请求列表与状态：先做集合级 SELF 判定，再按服务端主体取数 */
-  listMyMatchingRequests(subject: AuthorizationSubject): MatchingRequestView[] {
+  async listMyMatchingRequests(subject: AuthorizationSubject): Promise<MatchingRequestView[]> {
     this.authorizeSelf(subject);
-    return this.repository
-      .listByUserId(subject.userId)
-      .map((record) => this.toView(record, subject.userId));
+    // 取数边界 = 服务端主体 + 服务端已授权可见的小组集合（本次召回产物 ∪ 会话主体的小组集合）。
+    // 仓储把主体下推进 SQL，并对记录里的越权小组 fail-closed（不静默过滤）。
+    const scope = this.accessScope(subject, this.features.loadBundle(subject.userId));
+    const records = await this.repository.listByUserId(scope);
+    return records.map((record) => this.toView(record, subject.userId));
   }
 
   /** 发起本人匹配请求：归属、状态、摘要与版本都由服务端决定，请求体只提供可选的画像版本 */
@@ -109,22 +116,26 @@ export class MatchingService {
     const modelVersion = resolveModelVersion(this.env, this.provider);
     const bundle = this.features.loadBundle(subject.userId);
     const inputSnapshotHash = computeInputSnapshotHash(bundle ?? EMPTY_FEATURE_SNAPSHOT);
+    const scope = this.accessScope(subject, bundle);
     const now = new Date().toISOString();
 
     // 3. 入口记录：状态恒为 pending，结果为空；此时不得声称结果来自模型
-    const created = this.repository.create({
-      id: randomUUID(),
-      userId: subject.userId,
-      status: MATCHING_REQUEST_ENTRY_STATUS,
-      ...(input.profileVersion !== undefined ? { profileVersion: input.profileVersion } : {}),
-      inputSnapshotHash,
-      recommendations: [],
-      modelVersion,
-      promptVersion: MATCHING_PROMPT_VERSION,
-      fallbackUsed: true,
-      createdAt: now,
-      updatedAt: now,
-    });
+    const created = await this.repository.create(
+      {
+        id: randomUUID(),
+        userId: subject.userId,
+        status: MATCHING_REQUEST_ENTRY_STATUS,
+        ...(input.profileVersion !== undefined ? { profileVersion: input.profileVersion } : {}),
+        inputSnapshotHash,
+        recommendations: [],
+        modelVersion,
+        promptVersion: MATCHING_PROMPT_VERSION,
+        fallbackUsed: true,
+        createdAt: now,
+        updatedAt: now,
+      },
+      scope,
+    );
 
     const outcome = await this.runMatching(bundle, modelVersion);
 
@@ -132,14 +143,17 @@ export class MatchingService {
     //    这里会以 STATE_TRANSITION_INVALID（409）拒绝，而不是覆盖既有结果
     assertMatchingRequestTransition(created.status, outcome.status);
 
-    const saved = this.repository.save({
-      ...created,
-      status: outcome.status,
-      recommendations: [...outcome.recommendations],
-      fallbackUsed: outcome.fallbackUsed,
-      ...(outcome.degradationCode ? { degradationCode: outcome.degradationCode } : {}),
-      updatedAt: new Date().toISOString(),
-    });
+    const saved = await this.repository.save(
+      {
+        ...created,
+        status: outcome.status,
+        recommendations: [...outcome.recommendations],
+        fallbackUsed: outcome.fallbackUsed,
+        ...(outcome.degradationCode ? { degradationCode: outcome.degradationCode } : {}),
+        updatedAt: new Date().toISOString(),
+      },
+      scope,
+    );
 
     return this.toView(saved, subject.userId);
   }
@@ -261,6 +275,29 @@ export class MatchingService {
       scope: DataScope.Self,
       resourceUserId: subject.userId,
     });
+  }
+
+  /**
+   * 构造仓储的**服务端授权边界**（`MatchingAccessScope`）。
+   *
+   * 两个字段都只能来自服务端：`ownerUserId` 是会话主体；`authorizedGroupIds` 是
+   * 「本次召回产物（`bundle.candidates`）∪ 会话主体自身的小组集合（`subject.groupIds`，由认证
+   * 链路从服务端会话解析，不是客户端输入）」——两者都是服务端授权判定/召回产物，请求体、查询串
+   * 与自定义头携带的 `userId` / `groupId` / `scope` 永不进入本结构。
+   *
+   * 为什么取并集：召回产物回答「本次可见哪些候选小组」，会话的小组集合回答「主体已属于哪些小组」，
+   * 任一被授权的小组都不应被判成越权。真实 groups / profiles 召回端口接入后（后续切片），
+   * 这里应改为「该端口的可见集合」，语义不变。
+   */
+  private accessScope(
+    subject: AuthorizationSubject,
+    bundle: MatchFeatureBundle | undefined,
+  ): MatchingAccessScope {
+    const visible = new Set<string>(subject.groupIds ?? []);
+    for (const candidate of bundle?.candidates ?? []) {
+      visible.add(candidate.groupId);
+    }
+    return { ownerUserId: subject.userId, authorizedGroupIds: [...visible] };
   }
 
   /**

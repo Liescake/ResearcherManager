@@ -28,9 +28,13 @@ import { ApiExceptionFilter } from '../../common/api-exception.filter';
 import { ApiResponseInterceptor } from '../../common/api-response.interceptor';
 import { APP_ENV, ConfigModule } from '../../config/config.module';
 import { loadEnv } from '../../config/env';
+import type { AppEnv } from '../../config/env';
+import { SQL_CONNECTION_FACTORY } from '../../db/ports/sql-executor.port';
+import type { SqlConnectionFactory } from '../../db/ports/sql-executor.port';
 import { AccessControlModule } from '../access-control/access-control.module';
 import { AuthModule } from '../auth/auth.module';
 import { InMemorySessionStore } from '../auth/session-store.in-memory';
+import { SESSION_STORE } from '../auth/session-subject.port';
 import { RUOYI_AUTHZ_ADAPTER } from '../ruoyi-adapter/ruoyi-adapter.port';
 import type { RuoYiAuthzAdapter } from '../ruoyi-adapter/ruoyi-adapter.port';
 import { MATCHING_REQUEST_INPUT_FIELDS, MATCHING_REQUEST_VIEW_FIELDS } from './matching.contract';
@@ -42,9 +46,9 @@ import {
   MATCHING_FEATURE_SOURCE,
   MATCHING_REPOSITORY,
 } from './matching.port';
-import type { MatchingRequest } from './matching.port';
+import type { MatchingAccessScope, MatchingRequest } from './matching.port';
 import { MatchingService } from './matching.service';
-import { MatchingModule } from './matching.module';
+import { MatchingModule, createMatchingRepository } from './matching.module';
 
 /**
  * 匹配切片（`/me/matching-requests`）的真实 HTTP 回归：
@@ -133,6 +137,19 @@ function featureBundle(): MatchFeatureBundle {
   };
 }
 
+/**
+ * 服务端授权边界夹具：主体 + 该主体被授权可见的小组集合。
+ *
+ * 与 `featureBundle()` 同源（召回产物即服务端授权产物），只在**直接操作仓储夹具**时使用；
+ * 走 HTTP 的用例由 service 自行构造边界。
+ */
+function scopeFor(ownerUserId: string): MatchingAccessScope {
+  return {
+    ownerUserId,
+    authorizedGroupIds: featureBundle().candidates.map((candidate) => candidate.groupId),
+  };
+}
+
 const startedApps: INestApplication[] = [];
 
 interface MatchingAppOptions {
@@ -153,8 +170,16 @@ function buildMatchingHttpModule(options: MatchingAppOptions = {}) {
       { provide: APP_INTERCEPTOR, useClass: ApiResponseInterceptor },
       { provide: APP_FILTER, useClass: ApiExceptionFilter },
       MatchingService,
-      InMemoryMatchingRepository,
-      { provide: MATCHING_REPOSITORY, useExisting: InMemoryMatchingRepository },
+      {
+        // 与真实 MatchingModule 同一换绑点：未配置数据库 ⇒ 内存基线；已配置 ⇒ PostgreSQL adapter
+        provide: MATCHING_REPOSITORY,
+        useFactory: (
+          env: AppEnv,
+          sqlConnectionFactory: SqlConnectionFactory | undefined,
+        ): InMemoryMatchingRepository | ReturnType<typeof createMatchingRepository> =>
+          createMatchingRepository(env, sqlConnectionFactory),
+        inject: [APP_ENV, { token: SQL_CONNECTION_FACTORY, optional: true }],
+      },
       InMemoryMatchingFeatureSource,
       { provide: MATCHING_FEATURE_SOURCE, useExisting: InMemoryMatchingFeatureSource },
       {
@@ -195,7 +220,7 @@ async function startMatchingApp(options: MatchingAppOptions = {}): Promise<TestA
   await app.listen(0, '127.0.0.1');
   startedApps.push(app);
 
-  const store = app.get(InMemorySessionStore);
+  const store = app.get<InMemorySessionStore>(SESSION_STORE);
   store.seed({
     sessionId: SESSION_STUDENT_1,
     subject: { userId: STUDENT_1, roles: [Role.Student] },
@@ -223,7 +248,7 @@ async function startMatchingApp(options: MatchingAppOptions = {}): Promise<TestA
     app,
     baseUrl: `${await app.getUrl()}/api/v1`,
     store,
-    repository: app.get(InMemoryMatchingRepository),
+    repository: app.get<InMemoryMatchingRepository>(MATCHING_REPOSITORY),
     features,
   };
 }
@@ -360,9 +385,10 @@ describe('匹配：成功路径（真实 HTTP + 统一响应信封）', () => {
     expect(res.text).not.toContain(STUDENT_1);
     expect(res.text).not.toContain('软件工程');
     expect(res.text).not.toContain('参与校级创新项目');
-    expect(repository.listByUserId(STUDENT_1)[0]?.inputSnapshotHash).toMatch(/^[0-9a-f]{64}$/u);
-    expect(res.text).not.toContain(repository.listByUserId(STUDENT_1)[0]?.inputSnapshotHash ?? 'x');
-    expect(repository.listByUserId(STUDENT_1)[0]?.userId).toBe(STUDENT_1);
+    const [stored] = await repository.listByUserId(scopeFor(STUDENT_1));
+    expect(stored?.inputSnapshotHash).toMatch(/^[0-9a-f]{64}$/u);
+    expect(res.text).not.toContain(stored?.inputSnapshotHash ?? 'x');
+    expect(stored?.userId).toBe(STUDENT_1);
   });
 
   it('不带请求体也能发起（画像版本可选）', async () => {
@@ -376,7 +402,10 @@ describe('匹配：成功路径（真实 HTTP + 统一响应信封）', () => {
 
   it('学生列表：只返回本人的请求与状态，不含他人记录', async () => {
     const { baseUrl, repository } = await startMatchingApp();
-    repository.create(fixtureRequest({ userId: STUDENT_2, id: randomUUID() }));
+    await repository.create(
+      fixtureRequest({ userId: STUDENT_2, id: randomUUID() }),
+      scopeFor(STUDENT_2),
+    );
 
     const mine = await call(baseUrl, 'POST', '/me/matching-requests', {
       headers: bearer(SESSION_STUDENT_1),
@@ -401,14 +430,14 @@ describe('匹配：成功路径（真实 HTTP + 统一响应信封）', () => {
     });
     expect(others.status).toBe(200);
     expect((others.body.data as Record<string, unknown>[]).map((item) => item.id)).toEqual([
-      repository.listByUserId(STUDENT_2)[0]?.id,
+      (await repository.listByUserId(scopeFor(STUDENT_2)))[0]?.id,
     ]);
   });
 
   it('无召回结果：no_candidate 终态（不是 500，也不是空推荐的成功态）', async () => {
     const { app, baseUrl, features } = await startMatchingApp();
     // 清掉召回结果的最简方式：用未 seed 的主体会话
-    app.get(InMemorySessionStore).seed({
+    app.get<InMemorySessionStore>(SESSION_STORE).seed({
       sessionId: 'session-student-3',
       subject: { userId: 'u-student-3', roles: [Role.Student] },
     });
@@ -512,7 +541,7 @@ describe('匹配：输入拒绝 400（闭集，不是静默剥离）', () => {
       expect(issuesOf(res.body)[0]?.message).toBe(`禁止设置服务端字段 ${key}`);
       expect(res.text).not.toContain('u-victim-1');
     }
-    expect(repository.listByUserId(STUDENT_1)).toHaveLength(0);
+    expect(await repository.listByUserId(scopeFor(STUDENT_1))).toHaveLength(0);
   });
 
   it('非法画像版本与非对象请求体 400', async () => {
@@ -568,7 +597,7 @@ describe('匹配：越权 403 与「授权先于一切」', () => {
       expect(get.body.error?.message).toBe('无权执行该操作');
       expect(get.text).not.toContain('u-leader-1');
     }
-    expect(repository.listByUserId('u-admin-1')).toHaveLength(0);
+    expect(await repository.listByUserId(scopeFor('u-admin-1'))).toHaveLength(0);
   });
 
   it('授权先于仓储访问：403 时仓储的读/写方法一次都不被调用', async () => {
@@ -669,7 +698,10 @@ describe('匹配：越权 403 与「授权先于一切」', () => {
 describe('匹配：客户端声明伪造无效（请求体 / 查询串 / 自定义头）', () => {
   it('查询串里的 userId/roles/scope/groupId 不被读取也不被信任', async () => {
     const { baseUrl, repository } = await startMatchingApp();
-    repository.create(fixtureRequest({ userId: STUDENT_2, id: randomUUID() }));
+    await repository.create(
+      fixtureRequest({ userId: STUDENT_2, id: randomUUID() }),
+      scopeFor(STUDENT_2),
+    );
 
     const res = await call(
       baseUrl,
@@ -720,8 +752,8 @@ describe('匹配：客户端声明伪造无效（请求体 / 查询串 / 自定�
     });
 
     expect(res.status).toBe(400);
-    expect(repository.listByUserId(STUDENT_1)).toHaveLength(0);
-    expect(repository.listByUserId('u-victim-1')).toHaveLength(0);
+    expect(await repository.listByUserId(scopeFor(STUDENT_1))).toHaveLength(0);
+    expect(await repository.listByUserId(scopeFor('u-victim-1'))).toHaveLength(0);
     expect(res.text).not.toContain('u-victim-1');
   });
 });
@@ -778,7 +810,7 @@ describe('匹配：敏感字段不外泄（快照、模型输出、存储记录�
   it('存储记录里的推荐文本含号码 → 500 INTERNAL_ERROR，且不回显号码与原文', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startMatchingApp();
-    repository.create(
+    await repository.create(
       fixtureRequest({
         recommendations: [
           {
@@ -789,6 +821,7 @@ describe('匹配：敏感字段不外泄（快照、模型输出、存储记录�
           },
         ],
       }),
+      scopeFor(STUDENT_1),
     );
 
     const res = await call(baseUrl, 'GET', '/me/matching-requests', {
@@ -826,7 +859,7 @@ describe('匹配：敏感字段不外泄（快照、模型输出、存储记录�
       expect(item.userId).toBeUndefined();
       expect(item.inputSnapshotHash).toBeUndefined();
       expect(list.text).not.toContain(
-        repository.findById(String(item.id))?.inputSnapshotHash ?? 'x',
+        (await repository.findById(String(item.id), scopeFor(STUDENT_1)))?.inputSnapshotHash ?? 'x',
       );
     }
   });
@@ -838,7 +871,7 @@ describe('匹配：状态机与存储不变量 fail-closed', () => {
     const existing = fixtureRequest({ status: MatchingRequestStatus.Completed });
     const createSpy = vi
       .spyOn(repository, 'create')
-      .mockImplementation(() => ({ ...existing, status: MatchingRequestStatus.Completed }));
+      .mockResolvedValue({ ...existing, status: MatchingRequestStatus.Completed });
     const saveSpy = vi.spyOn(repository, 'save');
 
     const res = await call(baseUrl, 'POST', '/me/matching-requests', {
@@ -857,13 +890,14 @@ describe('匹配：状态机与存储不变量 fail-closed', () => {
   it('存储记录状态未登记 → 500；状态与条数矛盾 → 500；都不泄露字段取值', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startMatchingApp();
-    const corrupted = repository.create(
+    const corrupted = await repository.create(
       fixtureRequest({
         status: 'unknown_status' as MatchingRequestStatus,
         recommendations: [
           { groupId: GROUP_MATCHED, score: 42, reason: '受损理由', advice: '受损建议' },
         ],
       }),
+      scopeFor(STUDENT_1),
     );
 
     const res = await call(baseUrl, 'GET', '/me/matching-requests', {
@@ -880,7 +914,7 @@ describe('匹配：状态机与存储不变量 fail-closed', () => {
   it('仓储返回他人归属 → 500，绝不把他人匹配请求当作本人列表输出', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository } = await startMatchingApp();
-    vi.spyOn(repository, 'listByUserId').mockReturnValue([
+    vi.spyOn(repository, 'listByUserId').mockResolvedValue([
       fixtureRequest({
         userId: STUDENT_2,
         recommendations: [],
@@ -907,7 +941,14 @@ describe('匹配：切片装配与既有路由回归', () => {
 
     expect(controllers).toEqual([MatchingController]);
     expect(providers).toContain(MatchingService);
+    // 仓储端口由换绑工厂提供（按是否配置 DATABASE_URL 分流），内存基线不再是 provider
     expect(providers).toContainEqual({
+      provide: MATCHING_REPOSITORY,
+      useFactory: expect.any(Function) as unknown,
+      inject: [APP_ENV, { token: SQL_CONNECTION_FACTORY, optional: true }],
+    });
+    expect(providers).not.toContain(InMemoryMatchingRepository);
+    expect(providers).not.toContainEqual({
       provide: MATCHING_REPOSITORY,
       useExisting: InMemoryMatchingRepository,
     });
@@ -954,22 +995,34 @@ describe('匹配：切片装配与既有路由回归', () => {
     );
   });
 
-  it('内存仓储不把内部引用交给调用方，且拒绝覆盖未知 id 与改写归属', () => {
+  it('内存仓储不把内部引用交给调用方，且拒绝覆盖未知 id 与改写归属', async () => {
     const repository = new InMemoryMatchingRepository(loadEnv({ NODE_ENV: 'development' }));
-    const stored = repository.create(
+    const scope = scopeFor(STUDENT_1);
+    const stored = await repository.create(
       fixtureRequest({ recommendations: [], status: MatchingRequestStatus.NoCandidate }),
+      scope,
     );
 
-    const listed = repository.listByUserId(STUDENT_1)[0] as
+    const listed = (await repository.listByUserId(scope))[0] as
       { id: string; status: string } | undefined;
     expect(listed?.id).toBe(stored.id);
     // 副本：外部改写不得影响存储
     if (listed) listed.status = 'tampered';
-    expect(repository.findById(stored.id)?.status).toBe(MatchingRequestStatus.NoCandidate);
+    expect((await repository.findById(stored.id, scope))?.status).toBe(
+      MatchingRequestStatus.NoCandidate,
+    );
 
-    expect(() => repository.save(fixtureRequest({ id: 'missing-id' }))).toThrow(/不存在/u);
-    expect(() => repository.save(fixtureRequest({ id: stored.id, userId: STUDENT_2 }))).toThrow(
-      /归属不一致/u,
+    await expect(repository.save(fixtureRequest({ id: 'missing-id' }), scope)).rejects.toThrow(
+      /不存在/u,
+    );
+    // 归属不得被改写：他人记录（同 id 属于 STUDENT_1）用另一个服务端主体覆盖写入必须被拒
+    const otherScope = scopeFor(STUDENT_2);
+    await expect(
+      repository.save(fixtureRequest({ id: stored.id, userId: STUDENT_2 }), otherScope),
+    ).rejects.toThrow(/归属不一致/u);
+    // 服务端主体与记录归属不一致（scope 与记录归属不同）同样在写入前被拒
+    await expect(repository.save(fixtureRequest({ id: stored.id }), otherScope)).rejects.toThrow(
+      /归属与本次访问的服务端主体不一致/u,
     );
   });
 
@@ -993,6 +1046,7 @@ describe('匹配：切片装配与既有路由回归', () => {
       'apiPort',
       'apiPrefix',
       'databaseConfigured',
+      'dependencyGate',
       'nodeEnv',
     ]);
 

@@ -34,19 +34,19 @@ export class MatchingController {
   ) {}
 
   @Get()
-  listMyMatchingRequests(
+  async listMyMatchingRequests(
     @Headers('authorization') authorization: string | undefined,
-  ): MatchingRequestView[] {
-    return this.matching.listMyMatchingRequests(requireSubject(this.sessions, authorization));
+  ): Promise<MatchingRequestView[]> {
+    return this.matching.listMyMatchingRequests(await requireSubject(this.sessions, authorization));
   }
 
   @Post()
-  createMyMatchingRequest(
+  async createMyMatchingRequest(
     @Headers('authorization') authorization: string | undefined,
     @Body() body: unknown,
   ): Promise<MatchingRequestView> {
     return this.matching.createMyMatchingRequest(
-      requireSubject(this.sessions, authorization),
+      await requireSubject(this.sessions, authorization),
       body,
     );
   }

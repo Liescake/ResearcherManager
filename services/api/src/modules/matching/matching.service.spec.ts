@@ -30,7 +30,12 @@ import {
   MATCHING_REQUEST_INPUT_FIELDS,
   MATCHING_REQUEST_INTEGRITY_MESSAGE,
 } from './matching.contract';
-import type { MatchingFeatureSource, MatchingRepository, MatchingRequest } from './matching.port';
+import type {
+  MatchingAccessScope,
+  MatchingFeatureSource,
+  MatchingRepository,
+  MatchingRequest,
+} from './matching.port';
 import { MatchingService } from './matching.service';
 
 /**
@@ -96,6 +101,8 @@ class StubMatchingRepository implements MatchingRepository {
 
   readonly created: MatchingRequest[] = [];
   readonly saved: MatchingRequest[] = [];
+  /** service 传给仓储的授权边界（用于断言「边界只来自服务端」） */
+  readonly scopes: MatchingAccessScope[] = [];
   createCalls = 0;
   saveCalls = 0;
   listCalls = 0;
@@ -109,29 +116,35 @@ class StubMatchingRepository implements MatchingRepository {
     for (const record of seed) this.records.set(record.id, record);
   }
 
-  create(request: MatchingRequest): MatchingRequest {
+  async create(request: MatchingRequest, scope: MatchingAccessScope): Promise<MatchingRequest> {
     this.createCalls += 1;
+    this.scopes.push(scope);
     this.created.push(request);
     if (this.createOverride) return this.createOverride;
     this.records.set(request.id, request);
     return request;
   }
 
-  save(request: MatchingRequest): MatchingRequest {
+  async save(request: MatchingRequest, scope: MatchingAccessScope): Promise<MatchingRequest> {
     this.saveCalls += 1;
+    this.scopes.push(scope);
     this.saved.push(request);
     this.records.set(request.id, request);
     return request;
   }
 
-  findById(requestId: string): MatchingRequest | undefined {
+  async findById(
+    requestId: string,
+    _scope: MatchingAccessScope,
+  ): Promise<MatchingRequest | undefined> {
     return this.records.get(requestId);
   }
 
-  listByUserId(userId: string): readonly MatchingRequest[] {
+  async listByUserId(scope: MatchingAccessScope): Promise<readonly MatchingRequest[]> {
     this.listCalls += 1;
+    this.scopes.push(scope);
     if (this.listOverride) return this.listOverride;
-    return [...this.records.values()].filter((record) => record.userId === userId);
+    return [...this.records.values()].filter((record) => record.userId === scope.ownerUserId);
   }
 }
 
@@ -225,16 +238,10 @@ function expectedRuleGroupIds(bundle: MatchFeatureBundle): string[] {
   return buildFallbackRecommendations(bundle).map((item) => item.groupId);
 }
 
-function captureError(run: () => unknown): unknown {
-  try {
-    run();
-  } catch (error) {
-    return error;
-  }
-  throw new Error('预期抛出异常，但没有抛出');
-}
-
-/** 异步版本的捕获（service 的发起接口是 async，同步捕获会漏掉 Promise 拒绝） */
+/**
+ * 统一的异常捕获（`MatchingService` 的两个对外方法现在都是 async，因此一律 await，
+ * 避免同步捕获漏掉 Promise 拒绝）。
+ */
 async function captureRejection(run: () => Promise<unknown>): Promise<unknown> {
   try {
     await run();
@@ -293,7 +300,7 @@ describe('MatchingService：主体与归属只来自服务端', () => {
     expect(withoutBody.profileVersion).toBeUndefined();
   });
 
-  it('列表：只取会话主体自己的记录，且视图不含归属字段', () => {
+  it('列表：只取会话主体自己的记录，且视图不含归属字段', async () => {
     const own = storedRequestFixture({ userId: 'u-student-1' });
     const other = storedRequestFixture({ userId: 'u-student-2' });
     const repository = new StubMatchingRepository([own, other]);
@@ -306,9 +313,11 @@ describe('MatchingService：主体与归属只来自服务端', () => {
       loadEnv({ NODE_ENV: 'test' }),
     );
 
-    const list = service.listMyMatchingRequests(student);
+    const list = await service.listMyMatchingRequests(student);
     expect(list.map((item) => item.id)).toEqual([own.id]);
     expect(JSON.stringify(list)).not.toContain('u-student-2');
+    // 取数主体由服务端会话主体承载，而不是任何客户端声明
+    expect(repository.scopes.at(-1)?.ownerUserId).toBe('u-student-1');
   });
 });
 
@@ -326,9 +335,9 @@ describe('MatchingService：授权先于字段校验与仓储访问', () => {
     }
   });
 
-  it('列表同样先授权：未授权主体看不到任何记录', () => {
+  it('列表同样先授权：未授权主体看不到任何记录', async () => {
     const { service, repository } = harness({});
-    const error = captureError(() => service.listMyMatchingRequests(admin));
+    const error = await captureRejection(() => service.listMyMatchingRequests(admin));
     expect(error).toBeInstanceOf(ForbiddenException);
     expect(repository.listCalls).toBe(0);
   });
@@ -342,7 +351,7 @@ describe('MatchingService：授权先于字段校验与仓储访问', () => {
     expect(error).not.toBeInstanceOf(ZodError);
   });
 
-  it('判定入参只来自服务端：权限点/范围/资源归属恒为常量与会话主体', () => {
+  it('判定入参只来自服务端：权限点/范围/资源归属恒为常量与会话主体', async () => {
     const adapter = new BaselineRuoYiAuthzAdapter(policy);
     const spy = vi.spyOn(adapter, 'checkAuthorization');
     const service = new MatchingService(
@@ -353,7 +362,7 @@ describe('MatchingService：授权先于字段校验与仓储访问', () => {
       loadEnv({ NODE_ENV: 'test' }),
     );
 
-    service.listMyMatchingRequests(student);
+    await service.listMyMatchingRequests(student);
     expect(spy).toHaveBeenCalledTimes(1);
     expect(spy).toHaveBeenCalledWith(
       { userId: 'u-student-1', roles: [Role.Student] },
@@ -575,17 +584,17 @@ describe('MatchingService：存储损坏与越界取数 fail-closed（500，不�
     );
   }
 
-  it('未知状态枚举 → 500，且不泄露未知值与字段取值', () => {
+  it('未知状态枚举 → 500，且不泄露未知值与字段取值', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const service = serviceWithList([
       storedRequestFixture({ status: 'unknown_status' as MatchingRequestStatus }),
     ]);
-    const error = captureError(() => service.listMyMatchingRequests(student));
+    const error = await captureRejection(() => service.listMyMatchingRequests(student));
     expect(error).toBeInstanceOf(InternalServerErrorException);
     expect((error as Error).message).toBe(MATCHING_REQUEST_INTEGRITY_MESSAGE);
   });
 
-  it('状态与推荐条数矛盾（completed 却 0 条 / failed 却有条数）→ 500', () => {
+  it('状态与推荐条数矛盾（completed 却 0 条 / failed 却有条数）→ 500', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     for (const record of [
       storedRequestFixture({ status: MatchingRequestStatus.Completed, recommendations: [] }),
@@ -594,12 +603,14 @@ describe('MatchingService：存储损坏与越界取数 fail-closed（500，不�
         recommendations: storedRequestFixture().recommendations,
       }),
     ]) {
-      const error = captureError(() => serviceWithList([record]).listMyMatchingRequests(student));
+      const error = await captureRejection(() =>
+        serviceWithList([record]).listMyMatchingRequests(student),
+      );
       expect(error).toBeInstanceOf(InternalServerErrorException);
     }
   });
 
-  it('存储记录里的推荐文本含手机号 → 500（内容不可外发），不把号码回给调用方', () => {
+  it('存储记录里的推荐文本含手机号 → 500（内容不可外发），不把号码回给调用方', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const service = serviceWithList([
       storedRequestFixture({
@@ -613,23 +624,25 @@ describe('MatchingService：存储损坏与越界取数 fail-closed（500，不�
         ],
       }),
     ]);
-    const error = captureError(() => service.listMyMatchingRequests(student));
+    const error = await captureRejection(() => service.listMyMatchingRequests(student));
     expect(error).toBeInstanceOf(InternalServerErrorException);
     expect(JSON.stringify(error)).not.toContain('13800138000');
   });
 
-  it('仓储返回他人归属 → 500，绝不把他人匹配请求当作本人列表输出', () => {
+  it('仓储返回他人归属 → 500，绝不把他人匹配请求当作本人列表输出', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const other = storedRequestFixture({ userId: 'u-student-2' });
-    const error = captureError(() => serviceWithList([other]).listMyMatchingRequests(student));
+    const error = await captureRejection(() =>
+      serviceWithList([other]).listMyMatchingRequests(student),
+    );
     expect(error).toBeInstanceOf(InternalServerErrorException);
     expect(JSON.stringify(error)).not.toContain('u-student-2');
   });
 
-  it('快照摘要形状非法（非 sha256）→ 500', () => {
+  it('快照摘要形状非法（非 sha256）→ 500', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const service = serviceWithList([storedRequestFixture({ inputSnapshotHash: 'plain' })]);
-    const error = captureError(() => service.listMyMatchingRequests(student));
+    const error = await captureRejection(() => service.listMyMatchingRequests(student));
     expect(error).toBeInstanceOf(InternalServerErrorException);
   });
 });
