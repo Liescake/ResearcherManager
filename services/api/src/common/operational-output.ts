@@ -483,7 +483,21 @@ export function describeStartupBanner(env: StartupBannerEnv): readonly string[] 
     `服务已启动: 监听 ${renderedHost}:${port}，前缀 ${prefix}`,
     `健康检查路径: ${healthPath}`,
   ];
-  if (lines.some((line) => findSensitiveOutput(line, 'startupBanner').length > 0)) {
+  // 不把已验证的 host + port 再拼回字符串交给裸 host:port 规则扫描：
+  // 该规则必须继续拦截普通输出中的内部拓扑，但监听地址本身是本函数的安全投影。
+  // 仍逐片扫描固定文案与投影字段，避免未来新增固定片段时绕过门禁。
+  const bannerFragments = [
+    '服务已启动: 监听 ',
+    renderedHost,
+    port,
+    '，前缀 ',
+    prefix,
+    '健康检查路径: ',
+    healthPath,
+  ];
+  if (
+    bannerFragments.some((fragment) => findSensitiveOutput(fragment, 'startupBanner').length > 0)
+  ) {
     return [`服务已启动: ${STARTUP_BANNER_PLACEHOLDER}`];
   }
   return lines;

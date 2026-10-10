@@ -116,6 +116,12 @@ const VALUE_RULES: readonly ValueRule[] = [
   { kind: 'raw-exception', pattern: RAW_EXCEPTION_VALUE_PATTERN },
   { kind: 'connection-string', pattern: /[a-z][a-z0-9+.-]*:\/\//iu },
   {
+    // 裸 host:port 也是内部拓扑信息；仅在主机名/IPv4 形态成立时命中，避免误伤 ISO 时间戳。
+    kind: 'internal-path',
+    pattern:
+      /(?:\b(?:\d{1,3}\.){3}\d{1,3}|\blocalhost\b|\b[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)(?::\d{1,5})\b/iu,
+  },
+  {
     kind: 'credential-pair',
     pattern: /\b(?:password|passwd|pwd|secret|token|api[_-]?key)\b\s*[:=]\s*\S/iu,
   },

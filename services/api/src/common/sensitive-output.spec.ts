@@ -67,6 +67,15 @@ describe('findSensitiveOutput：命中的敏感取值', () => {
     expect(findings).toEqual([{ path: 'data.detail', kind: 'connection-string' }]);
   });
 
+  it('裸 host:port 与 IPv4:port 拓扑信息被拦下，且不误伤 ISO 时间戳', () => {
+    for (const detail of ['db.internal:5432', '10.0.0.1:5432', '连接 localhost:3000 失败']) {
+      expect(findSensitiveOutput({ detail })).toEqual([
+        { path: 'data.detail', kind: 'internal-path' },
+      ]);
+    }
+    expect(findSensitiveOutput({ detail: '2026-01-01T00:00:00.000Z' })).toEqual([]);
+  });
+
   it('口令键值与私钥块被识别', () => {
     expect(findSensitiveOutput({ detail: 'password=hunter2' })).toEqual([
       { path: 'data.detail', kind: 'credential-pair' },
