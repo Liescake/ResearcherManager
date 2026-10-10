@@ -8,6 +8,12 @@ import { AccessControlModule } from '../access-control/access-control.module';
 import { AuthModule } from '../auth/auth.module';
 import { InMemoryExportArtifactStore } from './exports.artifact-store.in-memory';
 import { ExportsController } from './exports.controller';
+import {
+  EXPORT_CURSOR_CODEC,
+  createExportCursorCodec,
+  resolveExportCursorSecret,
+} from './exports.cursor';
+import type { ExportCursorCodec } from './exports.cursor';
 import { InMemoryExportDownloadAuditSink } from './exports.download-audit.in-memory';
 import { InMemoryExportRepository } from './exports.in-memory-repository';
 import { createLazyPostgresExportRepository } from './exports.postgres-repository';
@@ -20,11 +26,12 @@ import { ExportsService } from './exports.service';
  *
  * 本切片落地其中**本人导出请求的最小垂直切片**：
  * - `POST /me/exports` 创建本人的导出请求（服务端白名单资源 + 字段）；
- * - `GET  /me/exports` 本人导出请求列表与状态；
+ * - `GET  /me/exports` 本人导出请求列表与状态（**键集分页**：`cursor` / `limit` +
+ *   不透明签名游标，游标编解码由 `EXPORT_CURSOR_CODEC` 提供）；
  * - `GET  /me/exports/:exportId/download` 下载本人已完成导出的产物内容。
  *
  * 真实文件生成与字段级脱敏、**过期产物的清理**（本切片只落地服务端有效期与过期拒绝）、
- * 管理端 `POST /admin/exports`（`export:{resource}:create`）、列表分页与筛选属于后续切片，
+ * 管理端 `POST /admin/exports`（`export:{resource}:create`）与**列表筛选**属于后续切片，
  * 必须继续留在本模块内，不得跨模块直接调用其他领域模块的仓储（导出范围只由本模块的服务端
  * 字段白名单决定）。
  *
@@ -111,12 +118,29 @@ const EXPORT_REPOSITORY_PROVIDER: FactoryProvider = {
   inject: [APP_ENV, { token: SQL_CONNECTION_FACTORY, optional: true }],
 };
 
+/**
+ * 分页游标编解码器的 provider：密钥材料**只**从 `APP_ENV` 解析（复用启动期已校验的环境对象，
+ * 不额外读 `process.env`）。
+ *
+ * 配置了 `SESSION_SECRET` 时经域分离派生签名密钥；未配置时退化为**进程内随机密钥**
+ * （游标只在本进程内有效，重启后判为无效并让客户端从首页重新开始），
+ * 而不是退化成可猜测的固定常量 —— 后者会让「客户端自己签发游标」成为可行路径。
+ * 密钥与派生结果都不进入日志、错误消息与任何响应。
+ */
+const EXPORT_CURSOR_CODEC_PROVIDER: FactoryProvider = {
+  provide: EXPORT_CURSOR_CODEC,
+  useFactory: (env: AppEnv): ExportCursorCodec =>
+    createExportCursorCodec(resolveExportCursorSecret(env)),
+  inject: [APP_ENV],
+};
+
 @Module({
   imports: [AuthModule, AccessControlModule],
   controllers: [ExportsController],
   providers: [
     ExportsService,
     EXPORT_REPOSITORY_PROVIDER,
+    EXPORT_CURSOR_CODEC_PROVIDER,
     InMemoryExportArtifactStore,
     { provide: EXPORT_ARTIFACT_STORE, useExisting: InMemoryExportArtifactStore },
     InMemoryExportDownloadAuditSink,

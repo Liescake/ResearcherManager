@@ -12,7 +12,12 @@ import {
   EXPORT_RESOURCE_VALUES,
   EXPORT_STATUS_VALUES,
   EXPORT_TRANSITION_REJECTED,
+  assertExportKeyset,
+  isExportPageLimit,
   type AsyncExportRepository,
+  type ExportKeyset,
+  type ExportPage,
+  type ExportPageWindow,
   type ExportRepositoryCapabilities,
   type ExportRequest,
   type ExportStatus,
@@ -49,6 +54,7 @@ import { EXPORT_ENTRY_STATUS, EXPORT_STATUS_TRANSITIONS } from './exports.state-
  * | `save` 归属被改写抛错 | `WHERE id = $1 AND requester_id = $2` 钉住归属 + 返回行逐列复核 → `OWNER_VIOLATION` |
  * | `save` 有效期被改写抛错 | `expires_at` 不在 `SET` 列表（不可变列）+ 返回行逐列复核 → `IDENTITY_MISMATCH` |
  * | `listByOwnerId` 只返回该主体名下记录 | `WHERE requester_id = $1::uuid`（归属下推）+ 逐条复核 |
+ * | `listByOwnerIdPage` 键集分页 | `WHERE requester_id = $1::uuid AND (date_trunc($2::text, created_at), id) > ($3::timestamptz, $4::uuid)` + `ORDER BY date_trunc($5::text, created_at) ASC, id ASC` + `LIMIT $6::int`（**没有 OFFSET**） |
  * | `findByIdForOwner` 不存在 / 属于他人都是 `undefined` | `WHERE id = $1::uuid AND requester_id = $2::uuid` → 0 行即 `undefined`（两者不可区分） |
  * | 端口没有删除 / 归档方法 | adapter 同样没有：`delete` / `archive` / `purge` / `truncate` / `upsert` 一个都不存在 |
  *
@@ -377,6 +383,7 @@ export type PostgresExportRepositoryErrorCode =
   | 'IDENTITY_MISMATCH'
   | 'OWNER_VIOLATION'
   | 'NOT_FOUND'
+  | 'INVALID_WINDOW'
   | 'TRANSITION_REJECTED';
 
 /**
@@ -582,21 +589,80 @@ ON CONFLICT (id) DO NOTHING
 RETURNING ${COLUMN_LIST}`;
 
 /**
- * 排序键：`created_at ASC, id ASC`——与内存基线的创建顺序一致（service 在 create 时写入
- * `createdAt = now`），并给出逐页稳定、可复现的**全序**（后续键集分页所需的稳定排序键）。
- * 本切片**不加** `LIMIT/OFFSET`：端口还没有分页窗口，adapter 自行截断会让结果与内存基线语义
- * 不一致（同名 spec 有边界断言）。
+ * `date_trunc` 的**截断字段**（排序与边界判定统一使用它）。
+ *
+ * 它**以参数绑定**（`date_trunc($n::text, created_at)`），而不是写成 SQL 字面量：本 adapter 的
+ * 既有硬约定是「SQL 文本只由模块常量与 `$n` 占位符构成、文本里零引号」（同名 spec 的
+ * `expectParameterizedSql` 会拒绝任何 `'` / `"` / `;` / `*` / `--`）。把字段名走参数既保留了
+ * 这条约定，又让「截断粒度」成为一处可核对的常量。
  */
-const ORDER_BY = 'ORDER BY created_at ASC, id ASC';
+export const POSTGRES_EXPORT_TRUNCATION_FIELD = 'milliseconds';
+
+/**
+ * **按毫秒粒度构造排序子句**（`ORDER BY date_trunc($n::text, created_at) ASC, id ASC`）——
+ * 排序键是**毫秒粒度的键集全序**，与内存基线的 `compareExportKeysets` 逐条一致
+ * （见 `exports.port.ts`）。
+ *
+ * 为什么时间分量必须按毫秒截断、而且**排序与边界谓词必须用同一个表达式**：
+ * `timestamptz` 在存储侧可以有微秒精度，而领域记录的 `createdAt` 是 ISO 毫秒形态
+ * （驱动读回的 `Date` 也只有毫秒）。若按**原始**列排序、却用毫秒截断后的值做边界，
+ * 边界行自己的真实值严格大于被截断的边界值，于是它会在下一页**被再次取出**
+ * —— 相邻两页重复同一行；反过来若只在排序里截断、边界谓词用原始列，则会**漏行**
+ * （同一毫秒桶内按主键定序的行会被原始列序排除）。因此两者必须是同一个表达式。
+ *
+ * 代价：该表达式无法借用 `idx_export_jobs_requester_created` 的**排序**能力
+ * （复合索引仍用于 `requester_id` 的定位，随后对本人名下的少量行排序）。
+ * 这是刻意用「可判定的一致性」换取的：分页的正确性不能依赖「存储里恰好没有亚毫秒行」。
+ * 本切片**不加** `OFFSET` / `FETCH`：分页窗口由 `LIMIT` 表达。
+ *
+ * 为什么是一个函数而不是常量：`ORDER BY` 与 `WHERE` 的边界谓词必须使用**同一个**截断表达式
+ * （否则会重复或漏行），但本仓库的执行器把「同一占位符序号出现两次」判为
+ * `PARAMETER_SLOT_DUPLICATE` 并拒绝执行 —— 因此续页语句的 `ORDER BY` 必须换一个序号。
+ * 由这一个工厂函数给出排序子句，保证「同一表达式、不同占位符」这点不会因为手抄而漂移。
+ */
+function orderByMillisecondKeyset(truncationSlot: number): string {
+  return `ORDER BY date_trunc($${truncationSlot}::text, created_at) ASC, id ASC`;
+}
 
 /**
  * 按主体取数：主体走 `$1::uuid` 绑定，**归属下推进 SQL**（他人导出请求既不出库也不回流）；
- * 显式列清单，不使用 `SELECT *`。
+ * 显式列清单，不使用 `SELECT *`。**无窗口**：结果集大小由 SQL 决定（没有 `LIMIT`），
+ * HTTP 路由已不再使用它（列表走下面的窗口语句），它保留为端口既有的完整读取能力。
  */
 const SELECT_BY_OWNER_SQL = `SELECT ${COLUMN_LIST}
   FROM ${TABLE_IDENTIFIER}
   WHERE requester_id = $1::uuid
-  ${ORDER_BY}`;
+  ${orderByMillisecondKeyset(2)}`;
+
+/**
+ * **键集分页：首页**（没有边界谓词）。
+ *
+ * `LIMIT $3::int` 的取值恒为「已校验的页大小 + 1」：多取一行只为判定 `hasNext`，
+ * 多取的那一行在返回到领域层之前被丢弃。每个占位符只出现一次（本仓库的执行器把
+ * 「同一序号出现两次」判为 `PARAMETER_SLOT_DUPLICATE`），因此截断字段、边界时间与页大小
+ * 各占**独立**占位符。
+ */
+const SELECT_PAGE_FIRST_SQL = `SELECT ${COLUMN_LIST}
+  FROM ${TABLE_IDENTIFIER}
+  WHERE requester_id = $1::uuid
+  ${orderByMillisecondKeyset(2)}
+  LIMIT $3::int`;
+
+/**
+ * **键集分页：续页**（带 `(created_at, id)` 边界）。
+ *
+ * - 边界是**严格大于**（行构造器比较），因此边界行本身不会在下一页重复出现；
+ * - 归属谓词与边界谓词都是参数占位符：归属、边界键值**不参与 SQL 文本**；
+ * - WHERE 与 ORDER BY 使用**同一个**截断表达式（见 `orderByMillisecondKeyset` 的说明），
+ *   否则会重复或漏行；两处的截断字段各占一个占位符（执行器拒绝重复序号）；
+ * - 没有 `OFFSET`：位移分页在并发写入下会重复或遗漏行。
+ */
+const SELECT_PAGE_AFTER_SQL = `SELECT ${COLUMN_LIST}
+  FROM ${TABLE_IDENTIFIER}
+  WHERE requester_id = $1::uuid
+    AND (date_trunc($2::text, created_at), id) > ($3::timestamptz, $4::uuid)
+  ${orderByMillisecondKeyset(5)}
+  LIMIT $6::int`;
 
 /**
  * 按「主键 + 归属」取**单条**记录（下载切片的取数语句）。
@@ -884,6 +950,64 @@ export function assertPostgresExportRecordId(id: unknown): string {
     '记录 ID 必须落在存储 ID 域内（合法且非空的规范小写 UUID）：非法 ID 属于服务端缺陷，不得进入 SQL',
     'id',
   );
+}
+
+/**
+ * 分页**键集边界**的存储域自检：主键必须落在存储 ID 域（`uuid`）、时间分量必须是 UTC ISO 8601。
+ *
+ * 游标本身已由签名保护（客户端改不动），这里仍然判一次是纵深防御：边界值会被绑定进
+ * `$2::timestamptz` / `$3::uuid`，一旦形态不合规，绑定就退化为「让数据库去做字符串比较 /
+ * 转换失败」，而不是在**进 SQL 之前** fail-closed。错误只带字段标签，不回显边界取值。
+ */
+export function assertPostgresExportKeyset(keyset: unknown): ExportKeyset {
+  try {
+    assertExportKeyset(keyset);
+  } catch {
+    throw new PostgresExportRepositoryError(
+      'INVALID_WINDOW',
+      '分页键集边界必须是 (createdAt, id) 两个非空字符串（服务端缺陷），不得进入 SQL',
+      ['after'],
+    );
+  }
+  const candidate = keyset as ExportKeyset;
+  assertPostgresExportRecordId(candidate.id);
+  if (!z.string().datetime().safeParse(candidate.createdAt).success) {
+    throw new PostgresExportRepositoryError(
+      'INVALID_WINDOW',
+      '分页键集边界的时间分量必须是 UTC ISO 8601 形态（服务端缺陷），不得进入 SQL',
+      ['after.createdAt'],
+    );
+  }
+  return candidate;
+}
+
+/**
+ * 分页窗口的存储域自检（**取数之前**执行）：`limit` 必须落在 `EXPORT_PAGE_MAX_LIMIT` 内。
+ *
+ * 为什么窗口也要在 adapter 侧再判一次：`LIMIT` 的值来自调用方，若只信任上层校验，
+ * 「按客户端提交的行数取数」这条路径在存储层就是敞开的（例如将来有人新增一条调用链）。
+ * 非法窗口一律 `INVALID_WINDOW` 且**一个 SQL 都不执行**，绝不把越界值夹到上界继续。
+ */
+export function assertPostgresExportPageWindow(window: unknown): ExportPageWindow {
+  if (typeof window !== 'object' || window === null || Array.isArray(window)) {
+    throw new PostgresExportRepositoryError(
+      'INVALID_WINDOW',
+      '分页窗口必须是对象（服务端缺陷），不得进入 SQL',
+      ['window'],
+    );
+  }
+  const candidate = window as { readonly limit?: unknown; readonly after?: unknown };
+  if (!isExportPageLimit(candidate.limit)) {
+    throw new PostgresExportRepositoryError(
+      'INVALID_WINDOW',
+      '分页窗口的 limit 必须是服务端闭集内的正整数（服务端缺陷），不得进入 SQL',
+      ['limit'],
+    );
+  }
+  if (candidate.after === undefined) {
+    return { limit: candidate.limit };
+  }
+  return { limit: candidate.limit, after: assertPostgresExportKeyset(candidate.after) };
 }
 
 /**
@@ -1312,8 +1436,55 @@ export class PostgresExportRepository implements AsyncExportRepository {
     const executor = this.usableExecutor();
     const ownerId = assertPostgresExportSubject(ownerUserId);
 
-    const rows = await runQuery(executor, SELECT_BY_OWNER_SQL, [ownerId]);
+    const rows = await runQuery(executor, SELECT_BY_OWNER_SQL, [
+      ownerId,
+      POSTGRES_EXPORT_TRUNCATION_FIELD,
+    ]);
     return this.mapScopedRows(rows, ownerId);
+  }
+
+  /**
+   * 按服务端主体取**一页**记录（`GET /me/exports` 的唯一取数入口，键集分页）。
+   *
+   * 判定顺序（被测试固定）：
+   * 1. 能力与执行器自检（构造后被降级 / 能力声明被改写都会 fail-closed）；
+   * 2. 主体与窗口都在**进入 SQL 之前**判定：非 UUID 主体 `INVALID_SUBJECT`、越界 `limit` 或
+   *    非法键集边界 `INVALID_WINDOW` —— 拒绝路径一个 SQL 都不执行（`executor.calls` 为空）；
+   * 3. 按窗口选一条固定语句（首页 / 续页），归属与边界键值**只出现在参数里**；
+   * 4. `LIMIT = limit + 1` 判定 `hasNext`：取到 `limit + 1` 行即后面还有行，多取的行被丢弃，
+   *    因此 `records.length <= limit` 恒成立；
+   * 5. 返回行逐条过严格行契约、读取契约与归属复核（`mapScopedRows`），
+   *    重复主键 / 他人记录 / 损坏行一律 fail-closed（绝不「过滤掉继续返回」）。
+   *
+   * 本方法**不**返回游标串（游标是 API 层的密码学凭据），也不返回任何近似总数：
+   * `hasNext` 与 `records` 来自**同一次**取数快照。
+   */
+  async listByOwnerIdPage(ownerUserId: string, window: ExportPageWindow): Promise<ExportPage> {
+    const executor = this.usableExecutor();
+    const ownerId = assertPostgresExportSubject(ownerUserId);
+    const { limit, after } = assertPostgresExportPageWindow(window);
+
+    // 多取一行判定 hasNext（与内存基线同构）；越界 / 非法窗口已在上一步拒绝
+    const probeLimit = limit + 1;
+    const rows =
+      after === undefined
+        ? await runQuery(executor, SELECT_PAGE_FIRST_SQL, [
+            ownerId,
+            POSTGRES_EXPORT_TRUNCATION_FIELD,
+            probeLimit,
+          ])
+        : await runQuery(executor, SELECT_PAGE_AFTER_SQL, [
+            ownerId,
+            POSTGRES_EXPORT_TRUNCATION_FIELD,
+            after.createdAt,
+            after.id,
+            POSTGRES_EXPORT_TRUNCATION_FIELD,
+            probeLimit,
+          ]);
+
+    const hasNext = rows.length > limit;
+    const records = this.mapScopedRows(hasNext ? rows.slice(0, limit) : rows, ownerId);
+    return { records, hasNext };
   }
 
   /**
@@ -1402,6 +1573,12 @@ export function createLazyPostgresExportRepository(
     async listByOwnerId(ownerUserId: string): Promise<readonly ExportRequest[]> {
       const ownerId = assertPostgresExportSubject(ownerUserId);
       return new PostgresExportRepository(await executor()).listByOwnerId(ownerId);
+    },
+    async listByOwnerIdPage(ownerUserId: string, window: ExportPageWindow): Promise<ExportPage> {
+      // 主体与窗口都先判、再建连：非法标识与越界页大小不会触发任何数据库连接
+      const ownerId = assertPostgresExportSubject(ownerUserId);
+      assertPostgresExportPageWindow(window);
+      return new PostgresExportRepository(await executor()).listByOwnerIdPage(ownerId, window);
     },
     async findByIdForOwner(id: string, ownerUserId: string): Promise<ExportRequest | undefined> {
       // 记录 ID 与归属都先判、再建连：非法标识不会触发任何数据库连接

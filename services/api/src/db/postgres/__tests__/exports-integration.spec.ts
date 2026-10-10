@@ -59,7 +59,13 @@ import {
  * 9. **存储 ID 域在进 SQL 之前判定**：非 UUID 主体 fail-closed（`INVALID_SUBJECT`），
  *    且不产生任何行；
  * 10. **模块换绑工厂 + 真实执行器**：`createExportRepository` 在真库上直接闭环
- *    （这是「数据库已配置 ⇒ 导出端口走 PostgreSQL 实现」的端到端证据）。
+ *    （这是「数据库已配置 ⇒ 导出端口走 PostgreSQL 实现」的端到端证据）；
+ * 11. **键集分页（`listByOwnerIdPage`）**：排序与边界都是**毫秒粒度的** `(created_at, id)` 全序，
+ *    首 / 中 / 末页**无重复、无遗漏**；亚毫秒 `created_at`（只有原始 SQL 能写出的形态）
+ *    不会让边界行在下一页被再取一次；边界是严格大于（`after` 指向某行 ⇒ 该行不再出现）；
+ *    行数恰好等于 `limit` 时 `hasNext = false`；他人名下的行既不出库也不影响本主体的
+ *    `hasNext`；下推语句含归属谓词与边界谓词、**没有 `OFFSET`**，键值只出现在参数里；
+ *    非法窗口 / 非法边界在真库上**一个 SQL 都不下发**。
  *
  * ## 为什么需要清理行
  * 与只追加的审计表不同，本表是可变的业务表，因此本套件在 `afterAll` 里按**本次运行写入的主键
@@ -152,6 +158,16 @@ const INSERT_SQL = `INSERT INTO export_jobs
 const INSERT_WITH_EXPIRY_SQL = `INSERT INTO export_jobs
   (id, requester_id, resource, fields, status, artifact_id, expires_at, created_at, updated_at)
   VALUES ($1::uuid, $2::uuid, $3, $4::text[], $5, $6::uuid, $7::timestamptz, $8::timestamptz, $9::timestamptz)`;
+
+/**
+ * 键集分页夹具的 INSERT：**显式给定 `created_at` / `updated_at`**（没有 `expires_at` 列，
+ * 因此服务端有效期落 NULL，与「历史行 / 未签发有效期」同形）。这是分页用例必须的构造能力：
+ * 「同一毫秒内的多行」与「亚毫秒精度」两类样本都要求时间由调用方精确指定，
+ * 而 `now()`（见上面的 `INSERT_SQL`）既不可控也不是毫秒整数。
+ */
+const INSERT_PAGED_SQL = `INSERT INTO export_jobs
+  (id, requester_id, resource, fields, status, artifact_id, created_at, updated_at)
+  VALUES ($1::uuid, $2::uuid, $3, $4::text[], $5, $6::uuid, $7::timestamptz, $8::timestamptz)`;
 
 async function query<T = Record<string, unknown>>(
   sql: string,
@@ -813,6 +829,228 @@ integrationDescribe(
       expect(after).toEqual(before);
       expect(after[0]?.['status']).toBe(ExportStatus.Pending);
       expect(after[0]?.['updated_at']).toEqual(before[0]?.['updated_at']);
+    }, 60_000);
+
+    // ---------------------------------------------------------------------------------------
+    // 键集分页（GET /me/exports 的取数路径）：真库上的硬性质
+    // ---------------------------------------------------------------------------------------
+
+    /**
+     * 显式落一行（**绕过 adapter**，用于构造驱动读回时只有毫秒精度的边界条件）：
+     * `created_at` 由调用方给定，因此可以精确构造「同一毫秒内的多行」「亚毫秒精度」两类样本。
+     */
+    async function seedRowAt(ownerUserId: string, id: string, createdAt: string): Promise<string> {
+      createdIds.add(id);
+      await (connection as SqlConnection).query(INSERT_PAGED_SQL, [
+        id,
+        ownerUserId,
+        ExportResource.Profile,
+        [...FIELDS],
+        ExportStatus.Pending,
+        null,
+        createdAt,
+        createdAt,
+      ]);
+      return id;
+    }
+
+    /**
+     * 稳定 UUID 夹具：前缀取**该主体 UUID 的前 8 位**（因此每个用例一组互不冲突的主键，
+     * 不会跨用例撞主键），末位递增（因此同一主体内文本序与数值序一致，
+     * 便于断言「同一毫秒桶内按主键定序」）。
+     */
+    function pageId(owner: string, n: number): string {
+      return `${owner.slice(0, 8)}-0000-4000-8000-00000000000${n}`;
+    }
+
+    /** 从某一行继续下一页（与服务端行为一致：边界取**已返回的最后一行**的键值） */
+    async function nextPages(
+      ownerUserId: string,
+      limit: number,
+      start?: { readonly createdAt: string; readonly id: string },
+    ): Promise<{ readonly ids: string[]; readonly hasNext: boolean }[]> {
+      const pages: { ids: string[]; hasNext: boolean }[] = [];
+      let after = start;
+      for (let guard = 0; guard < 20; guard += 1) {
+        const page = await repository().listByOwnerIdPage(ownerUserId, {
+          limit,
+          ...(after === undefined ? {} : { after }),
+        });
+        pages.push({ ids: page.records.map((record) => record.id), hasNext: page.hasNext });
+        if (!page.hasNext) break;
+        const last = page.records[page.records.length - 1];
+        expect(last).toBeDefined();
+        after = { createdAt: last?.createdAt ?? '', id: last?.id ?? '' };
+      }
+      return pages;
+    }
+
+    it('键集分页：首 / 中 / 末页按 (created_at, id) 全序推进，无重复、无遗漏', async () => {
+      const owner = newOwner();
+      const order = [3, 1, 5, 2, 4];
+      for (const n of order) {
+        await seedRowAt(owner, pageId(owner, n), `2026-11-0${n}T00:00:00.000Z`);
+      }
+      // 期望序：created_at 升序（上面的 n 恰好与时间同序）
+      const expected = [1, 2, 3, 4, 5].map((n) => pageId(owner, n));
+
+      const first = await repository().listByOwnerIdPage(owner, { limit: 2 });
+      expect(first.records.map((record) => record.id)).toEqual(expected.slice(0, 2));
+      expect(first.hasNext).toBe(true);
+
+      const pages = await nextPages(owner, 2);
+      expect(pages.map((page) => page.ids.length)).toEqual([2, 2, 1]);
+      expect(pages.map((page) => page.hasNext)).toEqual([true, true, false]);
+      expect(pages.flatMap((page) => page.ids)).toEqual(expected);
+      // 相邻页之间没有交集，且并集恰好是全部行
+      expect(new Set(pages.flatMap((page) => page.ids)).size).toBe(expected.length);
+    }, 60_000);
+
+    it('亚毫秒 created_at：排序与边界统一在毫秒粒度，续页不重复返回边界行', async () => {
+      const owner = newOwner();
+      // 前三行落在**同一毫秒桶**（.123），第四行跨到下一毫秒；驱动读回的 Date 只有毫秒精度
+      const ids = [1, 2, 3, 4].map((n) => pageId(owner, n));
+      await seedRowAt(owner, ids[0] as string, '2026-11-11T00:00:00.123100Z');
+      await seedRowAt(owner, ids[1] as string, '2026-11-11T00:00:00.123200Z');
+      await seedRowAt(owner, ids[2] as string, '2026-11-11T00:00:00.123300Z');
+      await seedRowAt(owner, ids[3] as string, '2026-11-11T00:00:00.124000Z');
+
+      const pages = await nextPages(owner, 1);
+
+      expect(pages).toHaveLength(4);
+      // 同一毫秒桶内按主键定序 ⇒ 夹具主键递增时结果仍是 1,2,3,4
+      expect(pages.flatMap((page) => page.ids)).toEqual(ids);
+      expect(pages.map((page) => page.hasNext)).toEqual([true, true, true, false]);
+      // 关键回归：若排序用原始列、边界用毫秒截断值，边界行会在下一页**被再取一次**
+      expect(new Set(pages.flatMap((page) => page.ids)).size).toBe(ids.length);
+      // 读回的 `createdAt` 是毫秒形态（与游标载荷同形态）
+      const [firstRecord] = (await repository().listByOwnerIdPage(owner, { limit: 1 })).records;
+      expect(firstRecord?.createdAt).toBe('2026-11-11T00:00:00.123Z');
+    }, 60_000);
+
+    it('边界严格大于：after 指向某一行自身时该行不再出现；指向最后一行时返回空页', async () => {
+      const owner = newOwner();
+      const ids = [1, 2, 3].map((n) => pageId(owner, n));
+      for (const n of [1, 2, 3]) {
+        await seedRowAt(owner, pageId(owner, n), `2026-12-0${n}T00:00:00.000Z`);
+      }
+
+      const secondRow = await repository().findByIdForOwner(ids[1] as string, owner);
+      const afterSecond = await repository().listByOwnerIdPage(owner, {
+        limit: 5,
+        after: { createdAt: secondRow?.createdAt ?? '', id: secondRow?.id ?? '' },
+      });
+      expect(afterSecond.records.map((record) => record.id)).toEqual([ids[2]]);
+      expect(afterSecond.hasNext).toBe(false);
+
+      const lastRow = await repository().findByIdForOwner(ids[2] as string, owner);
+      const afterLast = await repository().listByOwnerIdPage(owner, {
+        limit: 5,
+        after: { createdAt: lastRow?.createdAt ?? '', id: lastRow?.id ?? '' },
+      });
+      expect(afterLast.records).toEqual([]);
+      expect(afterLast.hasNext).toBe(false);
+    }, 60_000);
+
+    it('行数恰好等于 limit 时 hasNext = false；归属隔离下「他人更晚的行」不影响本主体分页', async () => {
+      const owner = newOwner();
+      const other = newOwner();
+      for (const n of [1, 2]) {
+        await seedRowAt(owner, pageId(owner, n), `2027-01-0${n}T00:00:00.000Z`);
+      }
+      // 他人名下有**更晚**的行：它不得影响本主体最后一页的 hasNext 判定，也不得出库
+      await seedRowAt(other, pageId(other, 9), '2027-12-31T00:00:00.000Z');
+
+      const exact = await repository().listByOwnerIdPage(owner, { limit: 2 });
+      expect(exact.records.map((record) => record.id)).toEqual([
+        pageId(owner, 1),
+        pageId(owner, 2),
+      ]);
+      expect(exact.hasNext).toBe(false);
+
+      const otherPage = await repository().listByOwnerIdPage(other, { limit: 5 });
+      expect(otherPage.records.map((record) => record.ownerUserId)).toEqual([other]);
+      expect(JSON.stringify(otherPage.records)).not.toContain(owner);
+    }, 60_000);
+
+    it('下推语句：真实执行器上捕获的分页 SQL 含归属谓词与 (created_at, id) 边界，且没有 OFFSET', async () => {
+      const owner = newOwner();
+      await seedRowAt(owner, pageId(owner, 1), '2027-02-01T00:00:00.000Z');
+      await seedRowAt(owner, pageId(owner, 2), '2027-02-02T00:00:00.000Z');
+
+      const statements: { sql: string; parameters: readonly unknown[] | undefined }[] = [];
+      const spy: SqlExecutor = {
+        capabilities: UNATTESTED_POSTGRES_CAPABILITIES,
+        query: (sql, parameters) => {
+          statements.push({ sql, parameters });
+          return (connection as SqlConnection).query(sql, parameters);
+        },
+      };
+
+      const firstPage = await new PostgresExportRepository(spy).listByOwnerIdPage(owner, {
+        limit: 1,
+      });
+      const [firstCall] = statements;
+      expect(firstCall?.sql).toContain('WHERE requester_id = $1::uuid');
+      expect(firstCall?.sql).toContain('ORDER BY date_trunc($2::text, created_at) ASC, id ASC');
+      expect(firstCall?.sql).toContain('LIMIT $3::int');
+      expect(firstCall?.sql).not.toMatch(/\bOFFSET\b/u);
+      expect(firstCall?.sql).not.toContain(owner);
+      // 探针是 limit + 1 行
+      expect(firstCall?.parameters).toEqual([owner, 'milliseconds', 2]);
+      expect(firstPage.hasNext).toBe(true);
+
+      const last = firstPage.records[firstPage.records.length - 1];
+      statements.length = 0;
+      const secondPage = await new PostgresExportRepository(spy).listByOwnerIdPage(owner, {
+        limit: 1,
+        after: { createdAt: last?.createdAt ?? '', id: last?.id ?? '' },
+      });
+      const [secondCall] = statements;
+      expect(secondCall?.sql).toContain(
+        'AND (date_trunc($2::text, created_at), id) > ($3::timestamptz, $4::uuid)',
+      );
+      expect(secondCall?.sql).toContain('ORDER BY date_trunc($5::text, created_at) ASC, id ASC');
+      expect(secondCall?.sql).toContain('LIMIT $6::int');
+      expect(secondCall?.sql).not.toMatch(/\bOFFSET\b/u);
+      // 边界键值与归属只出现在参数里，不进 SQL 文本
+      expect(secondCall?.sql).not.toContain(last?.id ?? 'no-id');
+      expect(secondCall?.parameters).toEqual([
+        owner,
+        'milliseconds',
+        last?.createdAt,
+        last?.id,
+        'milliseconds',
+        2,
+      ]);
+      expect(secondPage.records.map((record) => record.id)).toEqual([pageId(owner, 2)]);
+      expect(secondPage.hasNext).toBe(false);
+    }, 60_000);
+
+    it('非法窗口 / 非法边界在真库上同样不产生任何 SQL（fail-closed 不是「先查再拒」）', async () => {
+      const owner = newOwner();
+      const statements: string[] = [];
+      const spy: SqlExecutor = {
+        capabilities: UNATTESTED_POSTGRES_CAPABILITIES,
+        query: (sql, parameters) => {
+          statements.push(sql);
+          return (connection as SqlConnection).query(sql, parameters);
+        },
+      };
+      const underTest = new PostgresExportRepository(spy);
+
+      for (const window of [
+        { limit: 0 },
+        { limit: 101 },
+        { limit: 1.5 },
+        { limit: 1, after: { createdAt: '2027-01-01T00:00:00.000Z', id: 'not-a-uuid' } },
+        { limit: 1, after: { createdAt: 'not-a-time', id: pageId(owner, 1) } },
+      ]) {
+        await expect(underTest.listByOwnerIdPage(owner, window as never)).rejects.toMatchObject({
+          code: expect.stringMatching(/INVALID_WINDOW|INVALID_ID/u),
+        });
+      }
+      expect(statements).toEqual([]);
     }, 60_000);
   },
 );

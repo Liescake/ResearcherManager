@@ -1341,7 +1341,13 @@ describe('导出下载：仓储单条取数的归属隔离（内存基线）', (
     const repository = new InMemoryExportRepository(
       loadEnv({ NODE_ENV: 'test' }),
     ) as unknown as Record<string, unknown>;
-    for (const present of ['create', 'save', 'listByOwnerId', 'findByIdForOwner']) {
+    for (const present of [
+      'create',
+      'save',
+      'listByOwnerId',
+      'listByOwnerIdPage',
+      'findByIdForOwner',
+    ]) {
       expect(typeof repository[present]).toBe('function');
     }
     for (const forbidden of ['findById', 'findByOwner', 'findAll', 'query', 'delete', 'upsert']) {

@@ -17,7 +17,10 @@ import {
 import { EXPORTABLE_FIELDS } from './exports.contract';
 import { InMemoryExportRepository } from './exports.in-memory-repository';
 import { createExportRepository } from './exports.module';
-import { POSTGRES_EXPORT_REPOSITORY_CAPABILITIES } from './exports.postgres-repository';
+import {
+  POSTGRES_EXPORT_REPOSITORY_CAPABILITIES,
+  POSTGRES_EXPORT_TRUNCATION_FIELD,
+} from './exports.postgres-repository';
 import {
   EXPORT_REPOSITORY,
   EXPORT_REPOSITORY_BACKEND_POSTGRES,
@@ -225,9 +228,9 @@ describe('导出仓储的持久化分流（createExportRepository）', () => {
     ]) {
       expect(sql).not.toContain(internal);
     }
-    // 取值绝不出现在 SQL 文本里
+    // 取值绝不出现在 SQL 文本里；参数恰好是「归属 + 毫秒截断字段常量」两项
     expect(sql).not.toContain(OWNER);
-    expect(harness.parameters()[0]).toEqual([OWNER]);
+    expect(harness.parameters()[0]).toEqual([OWNER, POSTGRES_EXPORT_TRUNCATION_FIELD]);
   });
 
   it('服务端有效期经换绑点原样承载：NULL → 字段缺省、非空 → UTC ISO；且 SQL 里是显式列 + 参数', async () => {
@@ -266,7 +269,7 @@ describe('导出仓储的持久化分流（createExportRepository）', () => {
     expect(sql).toContain('expires_at');
     expect(sql).not.toContain('*');
     expect(sql).not.toContain(expiresAt);
-    expect(withExpiry.parameters()[0]).toEqual([OWNER]);
+    expect(withExpiry.parameters()[0]).toEqual([OWNER, POSTGRES_EXPORT_TRUNCATION_FIELD]);
   });
 
   it('存储 ID 域先判、再建连：非 UUID 会话主体在进入 SQL 之前就被拒绝', async () => {
@@ -516,11 +519,17 @@ describe('导出端口语义：归属隔离与受控落库（内存基线）', (
     expect(JSON.stringify(mine)).not.toContain(OTHER_OWNER);
   });
 
-  it('端口没有「按客户端声明取数」与删除入口：只有 create / save / listByOwnerId / findByIdForOwner', () => {
+  it('端口没有「按客户端声明取数」与删除入口：只有五个归属受限入口', () => {
     const repository = new InMemoryExportRepository(
       loadEnv({ NODE_ENV: 'test' }),
     ) as unknown as Record<string, unknown>;
-    for (const present of ['create', 'save', 'listByOwnerId', 'findByIdForOwner']) {
+    for (const present of [
+      'create',
+      'save',
+      'listByOwnerId',
+      'listByOwnerIdPage',
+      'findByIdForOwner',
+    ]) {
       expect(typeof repository[present]).toBe('function');
     }
     // 删除 / 归档 / 未过滤读取入口一个都不存在（入口越少，越不存在越权面）

@@ -14,6 +14,7 @@ import {
 } from './exports.contract';
 import { InMemoryExportRepository } from './exports.in-memory-repository';
 import {
+  EXPORT_PAGE_MAX_LIMIT,
   EXPORT_REPOSITORY_BACKEND_POSTGRES,
   EXPORT_REPOSITORY_STORAGE_ID_DOMAIN,
   EXPORT_RESOURCE_VALUES,
@@ -43,11 +44,13 @@ import {
   POSTGRES_EXPORT_REPOSITORY_CAPABILITIES,
   POSTGRES_EXPORT_REPOSITORY_VERIFICATION_STEPS,
   POSTGRES_EXPORT_TABLE,
+  POSTGRES_EXPORT_TRUNCATION_FIELD,
   POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS,
   PostgresExportRepository,
   PostgresExportRepositoryError,
   assertExportInternalColumnsAbsent,
   assertExportViewExclusion,
+  assertPostgresExportPageWindow,
   assertPostgresExportRepositoryCapabilities,
   createLazyPostgresExportRepository,
   exportStatusPredecessors,
@@ -715,8 +718,15 @@ describe('PostgreSQL 导出仓储：能力声明与交付边界', () => {
     for (const method of POSTGRES_EXPORT_FORBIDDEN_METHODS) {
       expect(surface[method]).toBeUndefined();
     }
-    // 公开面必须有 create / save / listByOwnerId / findByIdForOwner 四个方法，且都不返回同步值
-    for (const method of ['create', 'save', 'listByOwnerId', 'findByIdForOwner']) {
+    // 公开面必须有 create / save / listByOwnerId / listByOwnerIdPage / findByIdForOwner 五个方法，
+    // 且都不返回同步值
+    for (const method of [
+      'create',
+      'save',
+      'listByOwnerId',
+      'listByOwnerIdPage',
+      'findByIdForOwner',
+    ]) {
       expect(typeof surface[method]).toBe('function');
     }
   });
@@ -959,9 +969,12 @@ describe('PostgreSQL 导出仓储：参数化 SQL 与固定标识符', () => {
 
     const sql = callAt(executor, 0)?.sql ?? '';
     expect(sql).toContain('WHERE requester_id = $1::uuid');
-    expect(sql).toContain('ORDER BY created_at ASC, id ASC');
+    // 全序是**毫秒粒度**的键集序：`date_trunc` 的字段名走参数（SQL 文本零引号），
+    // 排序表达式与分页边界谓词共用同一份构造（见 adapter 的 orderByMillisecondKeyset）
+    expect(sql).toContain('ORDER BY date_trunc($2::text, created_at) ASC, id ASC');
     expect(sql).not.toMatch(/\b(?:LIMIT|OFFSET|FETCH)\b/u);
-    expect(callAt(executor, 0)?.parameters).toEqual([OWNER]);
+    // 归属只出现在参数里；第二个参数是「毫秒截断字段」这一服务端常量（不是客户端输入）
+    expect(callAt(executor, 0)?.parameters).toEqual([OWNER, POSTGRES_EXPORT_TRUNCATION_FIELD]);
   });
 
   it('创建语句是 ON CONFLICT (id) DO NOTHING（不静默覆盖），写回语句的 SET 不含身份与导出范围', async () => {
@@ -2183,5 +2196,248 @@ describe('PostgreSQL 导出仓储：单条取数的归属隔离（下载切片�
     expect(source).toContain('const SELECT_BY_ID_FOR_OWNER_SQL = `SELECT');
     expect(source).toContain('WHERE id = $1::uuid AND requester_id = $2::uuid');
     expect(source).not.toMatch(/`(?:DELETE|TRUNCATE|ALTER|DROP|GRANT|COPY)\b/u);
+  });
+});
+
+/**
+ * 键集分页（`listByOwnerIdPage`）的**离线**验收：SQL 形态、窗口 fail-closed、`hasNext` 语义。
+ *
+ * 真库上的「首 / 中 / 末页无重复无遗漏」由 `db/postgres/__tests__/exports-integration.spec.ts`
+ * 闭环；这里固定的是**语句与边界**这一层（不需要数据库也能判定的部分）：
+ * - 归属 + 边界 + 页大小**全部**是参数占位符，SQL 文本里没有取值、没有 `OFFSET`；
+ * - 首页与续页是两条固定语句（续页才有 `(created_at, id) > ($3, $4)` 边界谓词）；
+ * - `limit + 1` 是「多取一行」探针：取到 `limit + 1` 行 ⇒ `hasNext = true`，
+ *   且**多取的那一行不进 `records`**；
+ * - 非法窗口（越界 / 非整数 `limit`、非法键集边界）在**取数之前** fail-closed，一个 SQL 都不执行。
+ */
+describe('PostgreSQL 导出仓储：键集分页窗口', () => {
+  const BOUNDARY = { createdAt: LATER_AT, id: OTHER_JOB_ID };
+
+  it('首页：只剩归属与页大小两个参数，排序按毫秒键集，且没有 OFFSET', async () => {
+    const { repository, executor } = repoWith({ rows: [rowFromJob(PENDING_JOB)], rowCount: 1 });
+
+    const page = await repository.listByOwnerIdPage(OWNER, { limit: 2 });
+
+    expect(page.hasNext).toBe(false);
+    expect(page.records).toHaveLength(1);
+
+    const call = callAt(executor, 0);
+    const sql = call?.sql ?? '';
+    expectParameterizedSql(sql);
+    expect(sql).toContain('WHERE requester_id = $1::uuid');
+    expect(sql).toContain('ORDER BY date_trunc($2::text, created_at) ASC, id ASC');
+    expect(sql).toContain('LIMIT $3::int');
+    // 键集分页：绝不使用位移
+    expect(sql).not.toMatch(/\bOFFSET\b/u);
+    expect(placeholderIndexes(sql)).toEqual([1, 2, 3]);
+    // 参数恰好是「归属 + 毫秒截断字段常量 + limit + 1 的探针」
+    expect(call?.parameters).toEqual([OWNER, POSTGRES_EXPORT_TRUNCATION_FIELD, 3]);
+    expect(sql).not.toContain(OWNER);
+  });
+
+  it('续页：边界是 `(created_at, id)` 行构造器谓词（严格大于），键值只进参数、不进 SQL 文本', async () => {
+    const { repository, executor } = repoWith({ rows: [rowFromJob(PENDING_JOB)], rowCount: 1 });
+
+    await repository.listByOwnerIdPage(OWNER, { limit: 1, after: BOUNDARY });
+
+    const call = callAt(executor, 0);
+    const sql = call?.sql ?? '';
+    expectParameterizedSql(sql);
+    expect(sql).toContain('WHERE requester_id = $1::uuid');
+    expect(sql).toContain(
+      'AND (date_trunc($2::text, created_at), id) > ($3::timestamptz, $4::uuid)',
+    );
+    // 排序与边界谓词必须是同一个截断表达式（否则会重复或漏行）
+    expect(sql).toContain('ORDER BY date_trunc($5::text, created_at) ASC, id ASC');
+    expect(sql).toContain('LIMIT $6::int');
+    expect(sql).not.toMatch(/\bOFFSET\b/u);
+    expect(placeholderIndexes(sql)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(call?.parameters).toEqual([
+      OWNER,
+      POSTGRES_EXPORT_TRUNCATION_FIELD,
+      BOUNDARY.createdAt,
+      BOUNDARY.id,
+      POSTGRES_EXPORT_TRUNCATION_FIELD,
+      2,
+    ]);
+    // 边界键值与归属都不出现在 SQL 文本里
+    expect(sql).not.toContain(OWNER);
+    expect(sql).not.toContain(BOUNDARY.id);
+    expect(sql).not.toContain(BOUNDARY.createdAt);
+  });
+
+  it('多取一行只用于判定 hasNext：取到 limit + 1 行时最后一行不进 records', async () => {
+    const first = { ...PENDING_JOB, id: JOB_ID, createdAt: CREATED_AT };
+    const second = { ...PENDING_JOB, id: HEX_JOB_ID, createdAt: LATER_AT };
+    const { repository, executor } = repoWith({
+      rows: [rowFromJob(first), rowFromJob(second)],
+      rowCount: 2,
+    });
+
+    const page = await repository.listByOwnerIdPage(OWNER, { limit: 1 });
+
+    expect(page.hasNext).toBe(true);
+    expect(page.records.map((record) => record.id)).toEqual([JOB_ID]);
+    // 探针是 limit + 1（不是 limit，也不是更大的窗口）
+    expect(callAt(executor, 0)?.parameters?.[2]).toBe(2);
+  });
+
+  it('非法窗口（越界 / 非整数 / 非对象）在取数之前 fail-closed，一个 SQL 都不执行', async () => {
+    const windows: readonly unknown[] = [
+      { limit: 0 },
+      { limit: -1 },
+      { limit: 1.5 },
+      { limit: Number.NaN },
+      { limit: Number.POSITIVE_INFINITY },
+      { limit: '1' },
+      { limit: EXPORT_PAGE_MAX_LIMIT + 1 },
+      { limit: 1_000_000 },
+      {},
+      null,
+      [],
+      'limit=1',
+    ];
+    for (const window of windows) {
+      const { repository, executor } = repoWith({ rows: [], rowCount: 0 });
+      const error = await captureRepoError(() =>
+        repository.listByOwnerIdPage(OWNER, window as never),
+      );
+      expect(error.code).toBe('INVALID_WINDOW');
+      expect(executor.calls).toHaveLength(0);
+      expectNoValueLeak(error);
+    }
+  });
+
+  it('非法键集边界（非 UUID / 非 ISO 时间 / 缺分量）同样在取数之前 fail-closed', async () => {
+    const boundaries: readonly unknown[] = [
+      { createdAt: LATER_AT, id: 'not-a-uuid' },
+      { createdAt: LATER_AT, id: NIL_UUID },
+      { createdAt: LATER_AT, id: HEX_JOB_ID_UPPER },
+      { createdAt: '2026/01/02', id: OTHER_JOB_ID },
+      { createdAt: '', id: OTHER_JOB_ID },
+      { createdAt: LATER_AT },
+      { id: OTHER_JOB_ID },
+      {},
+    ];
+    for (const after of boundaries) {
+      const { repository, executor } = repoWith({ rows: [], rowCount: 0 });
+      const error = await captureRepoError(() =>
+        repository.listByOwnerIdPage(OWNER, { limit: 5, after: after as never }),
+      );
+      expect(['INVALID_WINDOW', 'INVALID_ID']).toContain(error.code);
+      expect(executor.calls).toHaveLength(0);
+      expectNoValueLeak(error);
+    }
+  });
+
+  it('窗口上限来自服务端常量：恰好等于上界可用，上界 + 1 被拒绝', async () => {
+    const atBound = repoWith({ rows: [], rowCount: 0 });
+    await expect(
+      atBound.repository.listByOwnerIdPage(OWNER, { limit: EXPORT_PAGE_MAX_LIMIT }),
+    ).resolves.toEqual({ records: [], hasNext: false });
+    expect(assertPostgresExportPageWindow({ limit: EXPORT_PAGE_MAX_LIMIT })).toEqual({
+      limit: EXPORT_PAGE_MAX_LIMIT,
+    });
+    expect(() => assertPostgresExportPageWindow({ limit: EXPORT_PAGE_MAX_LIMIT + 1 })).toThrow(
+      PostgresExportRepositoryError,
+    );
+    expect(() => assertPostgresExportPageWindow({ limit: 0 })).toThrow(
+      PostgresExportRepositoryError,
+    );
+  });
+
+  it('取数主体仍先判存储 ID 域：非 UUID 主体绝不进入 SQL（窗口合法也一样）', async () => {
+    for (const subject of ['u-student-1', '', NIL_UUID, HEX_OWNER_UPPER]) {
+      const { repository, executor } = repoWith({ rows: [], rowCount: 0 });
+      const error = await captureRepoError(() =>
+        repository.listByOwnerIdPage(subject, { limit: 1 }),
+      );
+      expect(error.code).toBe('INVALID_SUBJECT');
+      expect(executor.calls).toHaveLength(0);
+      expectNoValueLeak(error);
+    }
+  });
+
+  it('结果集仍然逐条复核：他人记录 / 重复主键 / 损坏行一律 fail-closed（不静默过滤）', async () => {
+    const foreign = repoWith({ rows: [rowFromJob(OTHER_OWNER_JOB)], rowCount: 1 });
+    const ownerError = await captureRepoError(() =>
+      foreign.repository.listByOwnerIdPage(OWNER, { limit: 5 }),
+    );
+    expect(ownerError.code).toBe('OWNER_VIOLATION');
+
+    const duplicated = repoWith({
+      rows: [rowFromJob(PENDING_JOB), rowFromJob(PENDING_JOB)],
+      rowCount: 2,
+    });
+    const dupError = await captureRepoError(() =>
+      duplicated.repository.listByOwnerIdPage(OWNER, { limit: 5 }),
+    );
+    expect(dupError.code).toBe('RESULT_SET_VIOLATION');
+
+    const broken = repoWith({
+      rows: [rowFromJob(PENDING_JOB, { resource: 'bogus' })],
+      rowCount: 1,
+    });
+    const rowError = await captureRepoError(() =>
+      broken.repository.listByOwnerIdPage(OWNER, { limit: 5 }),
+    );
+    expect(rowError.code).toBe('INVALID_ROW');
+  });
+
+  it('能力 / 执行器自检先于窗口与取数（构造后被降级 ⇒ 立即 fail-closed）', async () => {
+    const { repository, executor } = repoWith({ rows: [rowFromJob(PENDING_JOB)], rowCount: 1 });
+    (repository as { capabilities: ExportRepositoryCapabilities }).capabilities = {
+      backend: 'postgres',
+      persistent: true,
+      productionReady: true,
+    };
+    const error = await captureRepoError(() => repository.listByOwnerIdPage(OWNER, { limit: 1 }));
+    expect(error.code).toBe('CAPABILITY_MISDECLARED');
+    expect(executor.calls).toHaveLength(0);
+  });
+
+  it('延迟建连包装：窗口与主体都在解析执行器之前判定，非法输入不触发任何连接', async () => {
+    let resolves = 0;
+    const lazy: AsyncExportRepository = createLazyPostgresExportRepository(() => {
+      resolves += 1;
+      return Promise.resolve(undefined as unknown as SqlExecutor);
+    });
+
+    await expect(lazy.listByOwnerIdPage(OWNER, { limit: 0 })).rejects.toMatchObject({
+      code: 'INVALID_WINDOW',
+    });
+    await expect(
+      lazy.listByOwnerIdPage(OWNER, { limit: 1, after: { createdAt: '2026/01/02', id: JOB_ID } }),
+    ).rejects.toMatchObject({ code: 'INVALID_WINDOW' });
+    await expect(lazy.listByOwnerIdPage('u-student-1', { limit: 1 })).rejects.toMatchObject({
+      code: 'INVALID_SUBJECT',
+    });
+    expect(resolves).toBe(0);
+
+    // 合法窗口：解析执行器并走到 adapter（此处执行器为 undefined，构造即 fail-closed）
+    await expect(lazy.listByOwnerIdPage(OWNER, { limit: 1 })).rejects.toMatchObject({
+      code: 'EXECUTOR_UNAVAILABLE',
+    });
+    expect(resolves).toBe(1);
+  });
+
+  it('端口与 adapter 的分页契约在源码层面固定：五个方法、没有 OFFSET、边界谓词只在续页语句里', () => {
+    const portSource = readFileSync(PORT_PATH, 'utf8');
+    expect(portSource).toContain(
+      'listByOwnerIdPage(ownerUserId: string, window: ExportPageWindow): Promise<ExportPage>;',
+    );
+    expect(portSource).toContain('export const EXPORT_PAGE_DEFAULT_LIMIT');
+    expect(portSource).toContain('export const EXPORT_PAGE_MAX_LIMIT');
+    expect(portSource).toContain('export function isExportPageLimit');
+    expect(portSource).toContain('export function compareExportKeysets');
+
+    const adapterSource = readFileSync(ADAPTER_PATH, 'utf8');
+    expect(adapterSource).toContain('async listByOwnerIdPage(');
+    // 位移分页在本切片里根本不存在（既不是「先写后忘」，也不是「保留但不用」）。
+    // 注意：`OFFSET` 这个词会出现在说明它「刻意不加」的注释里，因此这里判定的是
+    // **可执行形态**（`OFFSET $n` / `OFFSET 数字` / `FETCH FIRST|NEXT`），而不是注释文本；
+    // 真正下发的语句里连这个词都没有，由上面两条 SQL 用例逐条断言。
+    expect(adapterSource).not.toMatch(/\bOFFSET\s+(?:\$|\d)/iu);
+    expect(adapterSource).not.toMatch(/\bFETCH\s+(?:FIRST|NEXT)\b/iu);
   });
 });

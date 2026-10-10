@@ -14,6 +14,7 @@ import {
   EXPORT_DOWNLOAD_MAX_BYTES,
   EXPORT_DOWNLOAD_UNAVAILABLE_MESSAGE,
   EXPORT_REQUEST_INTEGRITY_MESSAGE,
+  assertDeclaredExportListQueryFields,
   assertDeclaredExportQueryFields,
   assertDeclaredExportRequestFields,
   assertSafeExportDownloadHeaderValue,
@@ -22,6 +23,7 @@ import {
   digestExportId,
   exportDownloadIdSchema,
   exportExpiresAtFrom,
+  exportListQuerySchema,
   exportRequestInputSchema,
   isExportDownloadExpired,
   parseExportRequestView,
@@ -29,9 +31,12 @@ import {
   readArtifactId,
   readExportOwnerId,
   resolveExportFields,
+  toExportPageMeta,
   toExportRequestView,
 } from './exports.contract';
-import type { ExportRequestView } from './exports.contract';
+import type { ExportRequestPage, ExportRequestView } from './exports.contract';
+import { EXPORT_CURSOR_CODEC } from './exports.cursor';
+import type { ExportCursorCodec } from './exports.cursor';
 import {
   EXPORT_ARTIFACT_STORE,
   EXPORT_DOWNLOAD_AUDIT,
@@ -119,11 +124,22 @@ import { EXPORT_ENTRY_STATUS, assertExportTransition } from './exports.state-mac
  * 两段语义独立（入口 = 本人导出入口；资源 = 该资源的本人读取），重复判定不改变结果。
  *
  * 尚不包含（明确留给后续切片）：真实文件生成与字段级脱敏、**过期产物的清理 / 回收**
- * （本切片只判定「过期即拒绝下载」，不做删除、不做撤销、不做游标）、有效期续期或撤销入口、
- * 管理端 `POST /admin/exports` 与按资源/范围的导出、列表分页与筛选、
- * 幂等键与元数据落库、下载限流与审计的持久化查询面。
+ * （本切片只判定「过期即拒绝下载」，不做删除、不做撤销）、有效期续期或撤销入口、
+ * 管理端 `POST /admin/exports` 与按资源/范围的导出、**列表的筛选**（分页已在本切片落地：
+ * 键集分页 + 不透明签名游标）、幂等键与元数据落库、下载限流与审计的持久化查询面。
  * 下载切片已落地的是**交付边界**本身（归属、状态、授权、硬上限、响应头、留痕脱敏），
  * 它复用内存基线产物存储的**最小读能力**，不伪造生产文件下载。
+ *
+ * ## 列表分页的安全边界（本切片新增）
+ * - **游标是不透明签名串**：载荷只有版本号与两个排序键分量（该主体在公开视图里已经收到的
+ *   `createdAt` / `id`），**没有**归属、产物句柄、路径、存储 key 或任何 PII；签名密钥由
+ *   服务端主体派生，因此**跨主体重放**与**篡改**在同一条判定上失败（同一个 400）；
+ * - **归属只来自服务端会话**：`?userId=` / `?ownerUserId=` / `?groupId=` / `?status=` /
+ *   `?fileUrl=` / `?path=` / `?artifactId=` 一律 400（可区分原因），既不读取也不信任；
+ * - **页大小有界**：`limit` 缺省取服务端默认值，上界是服务端常量，仓储侧再判一次
+ *   （绝不「夹到上界继续」）；
+ * - **排序与边界都由服务端固定**：`(createdAt ASC, id ASC)`，边界是严格大于，
+ *   客户端无法提交排序字段或边界键值。
  */
 @Injectable()
 export class ExportsService {
@@ -134,28 +150,80 @@ export class ExportsService {
     @Inject(EXPORT_REPOSITORY) private readonly repository: ExportRepository,
     @Inject(EXPORT_ARTIFACT_STORE) private readonly artifacts: ExportArtifactStore,
     @Inject(EXPORT_DOWNLOAD_AUDIT) private readonly downloadAudit: ExportDownloadAuditSink,
+    @Inject(EXPORT_CURSOR_CODEC) private readonly cursors: ExportCursorCodec,
   ) {}
 
   /**
-   * 本人导出请求列表与状态：先入口授权，再查询串闭集，最后只按服务端主体取数。
+   * 本人导出请求列表与状态（**键集分页**）：先入口授权，再查询串闭集与分页参数校验，
+   * 最后只按服务端主体、按服务端给定的窗口取数。
    *
-   * 契约改为异步后的**顺序约束没有变化**：入口授权与查询串闭集都在**任何 `await` 之前**完成，
-   * 因此「未授权主体一次都不会触达仓储」在异步契约下同样成立 —— 拒绝路径上一个 Promise
-   * 都不会被创建，更不会建立任何数据库连接。
+   * 判定顺序（被测试固定，且契约改为异步后顺序约束不变）：
+   * 1. 入口授权（服务端常量）先于一切输入校验与任何取数：未授权主体**一次都不会触达仓储**，
+   *    拒绝路径上一个 Promise 都不会被创建，更不会建立任何数据库连接；
+   * 2. 查询串闭集：`cursor` / `limit` 之外的任何查询参数一律 400，其中归属 / 授权 / 状态 /
+   *    产物位置类参数**可区分地**拒绝（`禁止使用查询参数 userId`），而不是静默忽略；
+   * 3. 分页参数 schema：`limit` 必须是服务端闭集内的严格正整数（缺省 = 服务端默认值），
+   *    `cursor` 必须是形态合规的短串；超长 / 非 base64url / 段数不对在**解码之前**就 400；
+   * 4. **游标校验绑定服务端主体**：`decode(cursor, subject.userId)` —— 篡改与**跨主体重放**
+   *    在这里收敛为同一个 400（同一个错误码、同一条文案，不区分原因、不回显取值）；
+   *    游标里没有归属明文：绑定靠的是「签名密钥由服务端主体派生」；
+   * 5. 取数：`listByOwnerIdPage(subject.userId, {limit, after})` —— 主体只来自服务端会话，
+   *    窗口只来自服务端校验结果；仓储把归属下推进存储，并按键集全序取**一页**；
+   * 6. 逐条复核读取契约、归属与出口白名单（`toOwnedView`），任何一条不合规即 500
+   *    （绝不「跳过坏行继续返回」）；
+   * 7. 下一页游标由**本页最后一行**签发（`hasNext` 为 false 时不签发），
+   *    因此 `hasNext === true` 与 `nextCursor !== null` 互为充要条件。
    */
   async listMyExportRequests(
     subject: AuthorizationSubject,
     query: unknown,
-  ): Promise<ExportRequestView[]> {
+  ): Promise<ExportRequestPage> {
     // 1. 入口授权先于查询串校验与任何仓储访问（未授权主体拿不到任何字段级反馈）
     this.authorizeEntry(subject);
 
-    // 2. 查询串闭集：`?status=`/`?userId=`/`?fileUrl=` 等一律 400，不是静默忽略
-    assertDeclaredExportQueryFields(query);
+    // 2. 列表端点的查询串闭集：`cursor` / `limit` 之外一律 400，不是静默忽略
+    assertDeclaredExportListQueryFields(query);
 
-    // 3. 只按服务端主体取数；逐条复核读取契约与归属（绝不外发他人记录）
-    const records = await this.repository.listByOwnerId(subject.userId);
-    return records.map((record) => this.toOwnedView(record, subject.userId));
+    // 3. 分页参数 schema（limit 默认值与上界都是服务端常量；cursor 先过形态与长度门禁）
+    const input = exportListQuerySchema.parse(query === undefined || query === null ? {} : query);
+
+    // 4. 游标解码：签名校验 + 主体绑定。篡改 / 跨主体重放 / 版本不符都收敛为同一个 400，
+    //    且**先于任何取数**：存储层不会因为一个伪造游标被访问
+    const after =
+      input.cursor === undefined ? undefined : this.cursors.decode(input.cursor, subject.userId);
+
+    // 5. 只按服务端主体取一页；归属下推进仓储，排序与边界由仓储的键集实现保证
+    const page = await this.repository.listByOwnerIdPage(subject.userId, {
+      limit: input.limit,
+      ...(after === undefined ? {} : { after }),
+    });
+
+    // 5b. **窗口契约复核**（纵深防御）：`hasNext = true` 只可能来自「取到 limit + 1 行」的探针，
+    //     因此此时 `records` 必须恰好是 `limit` 行；任何「多返行 / 少返行 / hasNext 与行数不自洽」
+    //     都是仓储缺陷 ⇒ 500。若放过它，就会出现「`hasNext: true` 却没有可签发游标的边界行」
+    //     这种自相矛盾的分页元数据，客户端会卡在死循环里。
+    if (
+      page.records.length > input.limit ||
+      (page.hasNext && page.records.length !== input.limit)
+    ) {
+      this.logger.error(
+        '[exports] 仓储返回的分页窗口与端口契约不符（行数超出窗口，或 hasNext 与行数不自洽）',
+      );
+      throw new InternalServerErrorException(EXPORT_REQUEST_INTEGRITY_MESSAGE);
+    }
+
+    // 6. 逐条复核读取契约与归属（绝不外发他人记录）
+    const items = page.records.map((record) => this.toOwnedView(record, subject.userId));
+
+    // 7. 下一页游标由**本页最后一行**签发：`hasNext` 为真时必然存在一行（limit ≥ 1），
+    //    `hasNext` 为假时不签发（`nextCursor` 恒为 null，客户端不需要二次探测）
+    const boundary = page.hasNext ? items[items.length - 1] : undefined;
+    const nextCursor =
+      boundary === undefined
+        ? undefined
+        : this.cursors.encode({ createdAt: boundary.createdAt, id: boundary.id }, subject.userId);
+
+    return { items, page: toExportPageMeta(input.limit, page.hasNext, nextCursor) };
   }
 
   /**

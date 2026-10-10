@@ -2,7 +2,14 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { trimmedText, uuidSchema } from '@rm/shared';
 import {
+  EXPORT_CURSOR_INVALID_MESSAGE,
+  EXPORT_CURSOR_MAX_LENGTH,
+  EXPORT_CURSOR_PATTERN,
+} from './exports.cursor';
+import {
   EXPORT_DOWNLOAD_AUDIT_RESULT_VALUES,
+  EXPORT_PAGE_DEFAULT_LIMIT,
+  EXPORT_PAGE_MAX_LIMIT,
   EXPORT_RESOURCE_VALUES,
   EXPORT_STATUS_VALUES,
   ExportResource,
@@ -17,6 +24,12 @@ import type { ExportDownloadAuditEntry } from './exports.port';
  * 输入闭集（`POST /me/exports` 只接受两个字段）：
  * - `resource`：必须是服务端白名单资源（`profile` / `achievement` / `education` / `statistics`）；
  * - `fields`：可选的导出字段列表，必须是**该资源服务端白名单的子集**（缺省 = 白名单全集）。
+ *
+ * 列表端点（`GET /me/exports`）的输入闭集只有两项（见 `EXPORT_LIST_QUERY_FIELDS`）：`cursor`
+ * 与 `limit`；游标的**形态**门禁在本文件（长度 / 字母表 / 段数），**密码学**校验与主体绑定在
+ * `exports.cursor.ts`（签名密钥由服务端主体派生，因此篡改与跨主体重放同形失败）。
+ * 两项之外的查询参数一律 400：归属、授权、状态、产物位置、位移分页（`offset` / `page`）
+ * 都不是「被忽略的输入」。
  *
  * 闭集之外的字段一律 400，**不是静默忽略**：`userId`/`roles`/`scope`/`groupId`/`status`/
  * `fileUrl`/`path`/`artifactId`/`createdAt` 之类的服务端字段是必须显式拒绝的越权尝试，
@@ -387,11 +400,163 @@ export function readArtifactId(ref: unknown): string | undefined {
 }
 
 /**
- * 端点声明的查询参数闭集：**空集**（`/me/exports` 的读与写都不接受任何查询参数）。
- * 列表筛选、分页与排序属后续切片；`?status=` / `?userId=` 这类查询不是「被忽略的输入」，
- * 而是明确不被接受的输入。
+ * 端点声明的查询参数闭集：**空集**。
+ *
+ * 适用面：`POST /me/exports` 与 `GET /me/exports/:exportId/download` 都不接受任何查询参数。
+ * `GET /me/exports` 自本切片起接受 `cursor` / `limit` 两个参数（见下 `EXPORT_LIST_QUERY_FIELDS`），
+ * 因此它使用**另一份**闭集门禁；两份门禁共用同一批服务端独占字段清单与同一条拒绝文案口径。
  */
 export const EXPORT_QUERY_FIELDS = [] as const;
+
+/**
+ * **列表端点**（`GET /me/exports`）声明的查询参数闭集：恰好 `cursor` / `limit`。
+ *
+ * 其余一切查询参数仍然一律 400，且拒绝原因区分「服务端独占字段」与「未声明参数」：
+ * 归属（`userId` / `ownerUserId` / `ownerId` / `actorId`）、授权（`roles` / `scope` / `permissions`）、
+ * 小组（`groupId`）、状态（`status`）、产物位置（`fileUrl` / `path` / `storageKey` / `artifactId` /
+ * `fileName`）、有效期（`expiresAt`）**都不是**「被忽略的输入」，而是必须显式拒绝的越权尝试 ——
+ * 客户端提交的归属既不被读取，也绝不被信任。
+ *
+ * 位移分页参数（`page` / `pageSize` / `offset` / `skip`）同样被拒绝：本端点只提供**键集分页**，
+ * 位移分页在并发写入下会重复或遗漏行（见 `exports.port.ts` 的 `ExportKeyset`）。
+ */
+export const EXPORT_LIST_QUERY_FIELDS = ['cursor', 'limit'] as const;
+
+/**
+ * `limit` 的输入契约：**严格正整数**且落在服务端闭集 `[1, EXPORT_PAGE_MAX_LIMIT]`。
+ *
+ * 缺省即 `EXPORT_PAGE_DEFAULT_LIMIT`（默认值是服务端常量，不由客户端「省略即无上界」决定）。
+ * 下列形态一律 400：`0` / 负数 / 小数 / `1e2` / `+1` / 前导零 / 纯空白 / 空串 /
+ * 非十进制字符串 / 重复参数（Express 解析成数组）/ 对象形（`?limit[x]=1`）/ 超出上界的巨大值。
+ * 严格十进制正则刻意不用 `Number()` 的宽松解析（否则 `'0x10'`、`' 5 '`、`'5abc'` 会被静默接受）。
+ */
+export const exportListLimitSchema = z.preprocess(
+  (value) => {
+    if (value === undefined) return EXPORT_PAGE_DEFAULT_LIMIT;
+    if (typeof value === 'string' && /^[1-9][0-9]*$/u.test(value)) return Number(value);
+    return value;
+  },
+  z
+    .number({
+      required_error: 'limit 必须是严格正整数',
+      invalid_type_error: 'limit 必须是严格正整数',
+    })
+    .int('limit 必须是严格正整数')
+    .min(1, 'limit 必须是严格正整数')
+    .max(EXPORT_PAGE_MAX_LIMIT, `limit 不能超过 ${EXPORT_PAGE_MAX_LIMIT}`),
+);
+
+/**
+ * `cursor` 的**输入**契约（密码学校验之前的形态门禁）：非空、长度受控、字母表与段数固定。
+ *
+ * 这一层是刻意的前置门禁：超长输入与注入式载荷在**解码之前**就被拒绝（既有长度上界，
+ * 也保证后续 `split` / base64 解码 / HMAC 的输入规模有限）；真正的签名校验与键集解出
+ * 由 `exports.cursor.ts` 的 `EXPORT_CURSOR_CODEC` 完成，两者都失败即 400，且文案完全同形。
+ */
+export const exportCursorInputSchema = z
+  .string({
+    required_error: 'cursor 必须是非空字符串',
+    invalid_type_error: 'cursor 必须是非空字符串',
+  })
+  .min(1, 'cursor 必须是非空字符串')
+  .max(EXPORT_CURSOR_MAX_LENGTH, `cursor 不能超过 ${EXPORT_CURSOR_MAX_LENGTH} 个字符`)
+  .regex(EXPORT_CURSOR_PATTERN, EXPORT_CURSOR_INVALID_MESSAGE);
+
+/** 列表端点的查询参数 schema：闭集（`.strict()`）+ 默认值由 schema 给出 */
+export const exportListQuerySchema = z
+  .object({
+    cursor: exportCursorInputSchema.optional(),
+    limit: exportListLimitSchema,
+  })
+  .strict();
+
+export type ExportListQueryInput = z.infer<typeof exportListQuerySchema>;
+
+/**
+ * 列表端点查询串闭集门禁：`cursor` / `limit` 之外的任何键一律抛 `ZodError`
+ * （⇒ 400 `VALIDATION_FAILED` + `details.issues`，`path` 指向违规参数本身，不回显取值）。
+ *
+ * 非对象查询（`undefined`／`null`，即无查询串）不在这里拒绝：那是「没有输入」的正常情况。
+ */
+export function assertDeclaredExportListQueryFields(query: unknown): void {
+  const unexpected = unexpectedFields(query, EXPORT_LIST_QUERY_FIELDS);
+  if (!unexpected) return;
+
+  const forbidden: readonly string[] = FORBIDDEN_EXPORT_QUERY_FIELDS;
+  throwUnexpectedFields(unexpected, (key) =>
+    forbidden.includes(key)
+      ? `禁止使用查询参数 ${key}（归属、授权、状态与产物位置只来自服务端）`
+      : `本端点不接受查询参数 ${key}`,
+  );
+}
+
+/**
+ * 分页元数据的字段白名单（**恰好三项**）：`limit` / `hasNext` / `nextCursor`。
+ *
+ * 刻意没有 `total` / `totalPages` / `page` / `pageSize`：键集分页不需要（也不应假装有）
+ * 一个稳定的总数快照；给出它意味着要么多一次全表计数、要么给出一个与当前页不一致的数字。
+ * 刻意没有 `cursor` 原文含义、没有边界键值、没有归属、没有产物位置 —— 元数据只承载
+ * 「这一页多大、后面还有没有、有的话从哪继续」，而 `nextCursor` 是一个**不透明串**。
+ */
+export const EXPORT_PAGE_META_FIELDS = ['limit', 'hasNext', 'nextCursor'] as const;
+
+/**
+ * 列表端点的分页元数据契约：
+ * - `limit`：本页使用的页大小（服务端闭集内的值；缺省时是服务端默认值）；
+ * - `hasNext`：后面**还有没有**行。为 `true` 时 `nextCursor` 必有值；为 `false` 时必为 `null`；
+ * - `nextCursor`：下一页的不透明游标，或 `null`（没有下一页 / 空页）。
+ *
+ * 稳定性契约（被测试固定）：空页 ⇒ `hasNext === false` 且 `nextCursor === null`；
+ * 末页 ⇒ 同上；`hasNext === true` 与 `nextCursor !== null` **互为充要条件**。
+ * 因此客户端不需要「先请求下一页再判断有没有下一页」这种探测。
+ */
+export interface ExportPageMeta {
+  readonly limit: number;
+  readonly hasNext: boolean;
+  readonly nextCursor: string | null;
+}
+
+/**
+ * 列表端点的业务返回：既有对外视图数组 + 分页元数据。
+ * 控制器把它包装为 `{ data, meta, error }` 信封（`meta` 另由拦截器补 `requestId` / `generatedAt`），
+ * 因此**响应面没有任何新增字段**：`data` 仍是 `ExportRequestView` 闭集。
+ */
+export interface ExportRequestPage {
+  readonly items: ExportRequestView[];
+  readonly page: ExportPageMeta;
+}
+
+/** 由服务端事实构造分页元数据（`hasNext` 与 `nextCursor` 的充要关系在这里被强制） */
+export function toExportPageMeta(
+  limit: number,
+  hasNext: boolean,
+  nextCursor: string | undefined,
+): ExportPageMeta {
+  return {
+    limit,
+    hasNext,
+    nextCursor: hasNext ? (nextCursor ?? null) : null,
+  };
+}
+
+/**
+ * 查询串闭集门禁（**空集**口径）：出现任何查询参数即抛 `ZodError`，由 `ApiExceptionFilter`
+ * 统一映射为 400 `VALIDATION_FAILED` + `details.issues`（`path` 指向违规参数本身，不回显取值）。
+ *
+ * 非对象查询（`undefined`／`null`，即无查询串）不在这里拒绝：那是「没有输入」的正常情况。
+ * 重复参数在 Express 下会解析成数组，但键名仍然违规，因此同样被拒绝。
+ */
+export function assertDeclaredExportQueryFields(query: unknown): void {
+  const unexpected = unexpectedFields(query, EXPORT_QUERY_FIELDS);
+  if (!unexpected) return;
+
+  const forbidden: readonly string[] = FORBIDDEN_EXPORT_QUERY_FIELDS;
+  throwUnexpectedFields(unexpected, (key) =>
+    forbidden.includes(key)
+      ? `禁止使用查询参数 ${key}（归属、授权、状态与产物位置只来自服务端）`
+      : `本端点不接受查询参数 ${key}`,
+  );
+}
 
 /**
  * 服务端独占的查询串声明（**禁止客户端提交**）：身份、操作主体、角色、范围、小组归属、
@@ -436,25 +601,6 @@ export const FORBIDDEN_EXPORT_QUERY_FIELDS = [
   'filename',
   'expiresAt',
 ] as const;
-
-/**
- * 查询串闭集门禁：出现任何查询参数即抛 `ZodError`，由 `ApiExceptionFilter` 统一映射为
- * 400 `VALIDATION_FAILED` + `details.issues`（`path` 指向违规参数本身，不回显取值）。
- *
- * 非对象查询（`undefined`／`null`，即无查询串）不在这里拒绝：那是「没有输入」的正常情况。
- * 重复参数在 Express 下会解析成数组，但键名仍然违规，因此同样被拒绝。
- */
-export function assertDeclaredExportQueryFields(query: unknown): void {
-  const unexpected = unexpectedFields(query, EXPORT_QUERY_FIELDS);
-  if (!unexpected) return;
-
-  const forbidden: readonly string[] = FORBIDDEN_EXPORT_QUERY_FIELDS;
-  throwUnexpectedFields(unexpected, (key) =>
-    forbidden.includes(key)
-      ? `禁止使用查询参数 ${key}（归属、授权、状态与产物位置只来自服务端）`
-      : `本端点不接受查询参数 ${key}`,
-  );
-}
 
 /** 端点声明的请求体字段闭集（`POST /me/exports` 只接受这两个字段） */
 export const EXPORT_REQUEST_INPUT_FIELDS = ['resource', 'fields'] as const;

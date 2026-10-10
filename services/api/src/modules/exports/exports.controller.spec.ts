@@ -36,13 +36,16 @@ import {
   EXPORTABLE_FIELD_NAME_VALUES,
   EXPORT_DOWNLOAD_TTL_MS,
   EXPORT_MAX_FIELD_COUNT,
+  EXPORT_PAGE_META_FIELDS,
   EXPORT_QUERY_FIELDS,
   EXPORT_REQUEST_INTEGRITY_MESSAGE,
   EXPORT_REQUEST_INPUT_FIELDS,
   EXPORT_REQUEST_VIEW_FIELDS,
   EXPORT_REQUEST_VIEW_REQUIRED_FIELDS,
+  assertDeclaredExportListQueryFields,
   assertDeclaredExportQueryFields,
   assertDeclaredExportRequestFields,
+  exportListQuerySchema,
   exportRequestInputSchema,
   parseExportRequestView,
   parseStoredExportRequest,
@@ -51,10 +54,19 @@ import {
   toExportRequestView,
 } from './exports.contract';
 import type { ExportRequestView, StoredExportRequest } from './exports.contract';
+import {
+  EXPORT_CURSOR_INVALID_MESSAGE,
+  EXPORT_CURSOR_MAX_LENGTH,
+  EXPORT_CURSOR_PREFIX,
+  createExportCursorCodec,
+  resolveExportCursorSecret,
+} from './exports.cursor';
 import { ExportsController } from './exports.controller';
 import { InMemoryExportRepository } from './exports.in-memory-repository';
 import {
   EXPORT_ARTIFACT_STORE,
+  EXPORT_PAGE_DEFAULT_LIMIT,
+  EXPORT_PAGE_MAX_LIMIT,
   EXPORT_REPOSITORY,
   EXPORT_RESOURCE_VALUES,
   EXPORT_STATUS_VALUES,
@@ -63,7 +75,7 @@ import {
   ExportStatus,
   isExportTransitionRejection,
 } from './exports.port';
-import type { ExportRequest } from './exports.port';
+import type { ExportKeyset, ExportRequest } from './exports.port';
 import {
   PostgresExportRepository,
   PostgresExportRepositoryError,
@@ -480,7 +492,8 @@ interface PortSpies {
 function spyOnPorts(app: TestApp): PortSpies {
   return {
     create: vi.spyOn(app.repository, 'create'),
-    list: vi.spyOn(app.repository, 'listByOwnerId'),
+    // 列表路由的唯一取数入口是**窗口化**的键集入口（`listByOwnerId` 已不由 HTTP 路由使用）
+    list: vi.spyOn(app.repository, 'listByOwnerIdPage'),
     store: vi.spyOn(app.artifacts, 'store'),
   };
 }
@@ -1812,7 +1825,10 @@ describe('导出切片：PII 与 fail-closed 500', () => {
   it('仓储返回归属不一致的记录（未按主体过滤）→ 500：不把他人记录发给调用方', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const app = await startExportsApp();
-    vi.spyOn(app.repository, 'listByOwnerId').mockResolvedValue([app.seeded.otherCompleted]);
+    vi.spyOn(app.repository, 'listByOwnerIdPage').mockResolvedValue({
+      records: [app.seeded.otherCompleted],
+      hasNext: false,
+    });
 
     const res = await call(app.baseUrl, 'GET', '/me/exports', {
       headers: bearer(SESSION_STUDENT_1),
@@ -1867,7 +1883,10 @@ describe('导出切片：PII 与 fail-closed 500', () => {
       const app = await startExportsApp({ seed: false });
       // 直接由仓储返回损坏记录（归属形态非法的一条不会被「按主体取数」命中，
       // 必须这样构造才能让出口的 fail-closed 门禁看见它）
-      vi.spyOn(app.repository, 'listByOwnerId').mockResolvedValue([record]);
+      vi.spyOn(app.repository, 'listByOwnerIdPage').mockResolvedValue({
+        records: [record],
+        hasNext: false,
+      });
 
       const res = await call(app.baseUrl, 'GET', '/me/exports', {
         headers: bearer(SESSION_STUDENT_1),
@@ -1887,7 +1906,7 @@ describe('导出切片：PII 与 fail-closed 500', () => {
   it('仓储返回非记录形态（对象/数组/标量）→ 500：响应不含返回值', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const app = await startExportsApp();
-    const list = vi.spyOn(app.repository, 'listByOwnerId');
+    const list = vi.spyOn(app.repository, 'listByOwnerIdPage');
 
     const shapes: ReadonlyArray<unknown[]> = [
       [{ name: '张三', phone: OTHER_PHONE, path: FORGED_PATH }],
@@ -1897,7 +1916,7 @@ describe('导出切片：PII 与 fail-closed 500', () => {
     ];
 
     for (const shape of shapes) {
-      list.mockReturnValue(shape as never);
+      list.mockResolvedValue({ records: shape as never, hasNext: false });
 
       const res = await call(app.baseUrl, 'GET', '/me/exports', {
         headers: bearer(SESSION_STUDENT_1),
@@ -2050,10 +2069,10 @@ describe('导出切片：存储异常（仓储端口抛错 → 500，不泄露�
     ]);
   });
 
-  it('listByOwnerId 抛异常 → 500，且不返回任何记录', async () => {
+  it('listByOwnerIdPage 抛异常 → 500，且不返回任何记录', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const app = await startExportsApp();
-    vi.spyOn(app.repository, 'listByOwnerId').mockImplementation(() => {
+    vi.spyOn(app.repository, 'listByOwnerIdPage').mockImplementation(() => {
       throw new Error(`read failed: ownerUserId=${STUDENT_1} phone=${OTHER_PHONE}`);
     });
 
@@ -2538,3 +2557,529 @@ function parseStoredExportRequestOrThrow(record: unknown): StoredExportRequest {
   }
   return parsed.value;
 }
+
+/**
+ * 列表键集分页的**真实 HTTP 回归**（同一份真实 Nest 应用 + 真实 HTTP + 统一信封）。
+ *
+ * 与游标编码器的离线用例互补：这里验证的是「游标 → API → 仓储 → 响应」这一整条链，
+ * 即用户要求的可判定性质：
+ * - **排序固定**：`createdAt ASC, id ASC`（含同一 createdAt 时按主键定序）；
+ * - **首 / 中 / 末页无重复、无遗漏**：把各页拼起来必须逐项等于全量有序结果；
+ * - **契约稳定**：空页 ⇒ `hasNext=false && nextCursor=null`；
+ *   `hasNext === true` 与 `nextCursor !== null` 互为充要条件；
+ * - **输入 fail-closed**：`limit` 非严格正整数 / 越界、`cursor` 超长或非法、客户端主体字段
+ *   一律 400，且**一次都不触达仓储**；
+ * - **游标绑定服务端主体**：跨主体重放与篡改都 400（同一个出口，不回显取值）；
+ * - **响应面不变**：`data` 仍是既有 `ExportRequestView` 闭集，`meta` 只多三项分页元数据，
+ *   游标里不含归属 / 产物句柄 / 路径 / PII 的明文。
+ */
+describe('导出切片：列表键集分页（真实 HTTP + 不透明游标）', () => {
+  /** 稳定 UUID 夹具：末位递增 ⇒ 文本序与数值序一致，便于断言「同一时刻按主键定序」 */
+  const pagedId = (n: number): string => `00000000-0000-4000-8000-00000000000${n}`;
+
+  /** 与生产装配**同一份**密钥解析（同样读 `process.env`），因此夹具游标与运行期游标同源 */
+  function pagedCodec() {
+    return createExportCursorCodec(resolveExportCursorSecret(loadEnv()));
+  }
+
+  /** 直接种入若干条本人记录（绕过 HTTP，只构造存储事实），返回期望的全序 id */
+  async function seedPagedRecords(
+    app: TestApp,
+    specs: ReadonlyArray<{
+      readonly id: string;
+      readonly createdAt: string;
+      readonly owner?: string;
+    }>,
+  ): Promise<string[]> {
+    for (const spec of specs) {
+      await app.repository.create(
+        fixtureExportRequest({
+          id: spec.id,
+          ownerUserId: spec.owner ?? STUDENT_1,
+          createdAt: spec.createdAt,
+          updatedAt: spec.createdAt,
+        }),
+      );
+    }
+    return [...specs]
+      .sort((left, right) =>
+        left.createdAt === right.createdAt
+          ? left.id < right.id
+            ? -1
+            : 1
+          : left.createdAt < right.createdAt
+            ? -1
+            : 1,
+      )
+      .map((spec) => spec.id);
+  }
+
+  /** 逐页取回全部视图（沿 `nextCursor` 走到底），返回各页与其元数据 */
+  async function pageThrough(
+    app: TestApp,
+    limit: number,
+  ): Promise<
+    ReadonlyArray<{
+      readonly ids: string[];
+      readonly hasNext: boolean;
+      readonly nextCursor: unknown;
+      readonly meta: Record<string, unknown>;
+    }>
+  > {
+    const pages: Array<{
+      ids: string[];
+      hasNext: boolean;
+      nextCursor: unknown;
+      meta: Record<string, unknown>;
+    }> = [];
+    let cursor: string | undefined;
+    for (let guard = 0; guard < 20; guard += 1) {
+      const query = cursor === undefined ? `?limit=${limit}` : `?limit=${limit}&cursor=${cursor}`;
+      const res = await call(app.baseUrl, 'GET', `/me/exports${query}`, {
+        headers: bearer(SESSION_STUDENT_1),
+      });
+      expect(res.status).toBe(200);
+      const meta = res.body.meta as Record<string, unknown>;
+      pages.push({
+        ids: viewsOf(res.body).map((view) => view.id),
+        hasNext: meta['hasNext'] === true,
+        nextCursor: meta['nextCursor'],
+        meta,
+      });
+      if (meta['hasNext'] !== true) break;
+      expect(typeof meta['nextCursor']).toBe('string');
+      cursor = meta['nextCursor'] as string;
+    }
+    return pages;
+  }
+
+  it('默认页大小与分页元数据：缺省 limit 取服务端默认值，meta 只多三项、无下一页时不签发游标', async () => {
+    const app = await startExportsApp();
+
+    const res = await call(app.baseUrl, 'GET', '/me/exports', {
+      headers: bearer(SESSION_STUDENT_1),
+    });
+
+    expect(res.status).toBe(200);
+    // meta 恰好是「分页三项 + 拦截器补 requestId / generatedAt」：没有 page/pageSize/total
+    expect(Object.keys(res.body.meta).sort()).toEqual(
+      [...EXPORT_PAGE_META_FIELDS, 'generatedAt', 'requestId'].sort(),
+    );
+    expect(res.body.meta['limit']).toBe(EXPORT_PAGE_DEFAULT_LIMIT);
+    expect(res.body.meta['hasNext']).toBe(false);
+    expect(res.body.meta['nextCursor']).toBeNull();
+    expect(viewsOf(res.body)).toHaveLength(3);
+  });
+
+  it('首 / 中 / 末页：拼接结果逐项等于全量有序结果，无重复、无遗漏', async () => {
+    const app = await startExportsApp({ seed: false });
+    const expected = await seedPagedRecords(app, [
+      { id: pagedId(3), createdAt: '2026-02-03T00:00:00.000Z' },
+      { id: pagedId(1), createdAt: '2026-02-01T00:00:00.000Z' },
+      { id: pagedId(5), createdAt: '2026-02-05T00:00:00.000Z' },
+      { id: pagedId(2), createdAt: '2026-02-02T00:00:00.000Z' },
+      { id: pagedId(4), createdAt: '2026-02-04T00:00:00.000Z' },
+    ]);
+
+    const pages = await pageThrough(app, 2);
+
+    expect(pages).toHaveLength(3);
+    expect(pages.map((page) => page.ids.length)).toEqual([2, 2, 1]);
+    expect(pages.flatMap((page) => page.ids)).toEqual(expected);
+    // 首 / 中页有下一页 ⇒ hasNext=true 且签发游标；末页反之
+    expect(pages.map((page) => page.hasNext)).toEqual([true, true, false]);
+    expect(pages.map((page) => typeof page.nextCursor)).toEqual(['string', 'string', 'object']);
+    expect(pages[2]?.nextCursor).toBeNull();
+    // 每页都如实回传页大小
+    for (const page of pages) expect(page.meta['limit']).toBe(2);
+
+    // 相邻页之间没有交集（用 nextCursor 续页不会把边界行再取一次）
+    expect(new Set(pages.flatMap((page) => page.ids)).size).toBe(expected.length);
+  });
+
+  it('同一 createdAt 的多行按主键定序：逐条分页仍然无重复、无遗漏', async () => {
+    const app = await startExportsApp({ seed: false });
+    const sameInstant = '2026-03-01T00:00:00.000Z';
+    const expected = await seedPagedRecords(app, [
+      { id: pagedId(3), createdAt: sameInstant },
+      { id: pagedId(1), createdAt: sameInstant },
+      { id: pagedId(2), createdAt: sameInstant },
+    ]);
+
+    const pages = await pageThrough(app, 1);
+
+    expect(pages).toHaveLength(3);
+    expect(pages.flatMap((page) => page.ids)).toEqual(expected);
+    expect(new Set(pages.flatMap((page) => page.ids)).size).toBe(3);
+    expect(pages.map((page) => page.hasNext)).toEqual([true, true, false]);
+  });
+
+  it('行数恰好等于 limit：hasNext=false（多取一行的探针不得凭空多报一页）', async () => {
+    const app = await startExportsApp({ seed: false });
+    await seedPagedRecords(app, [
+      { id: pagedId(1), createdAt: '2026-04-01T00:00:00.000Z' },
+      { id: pagedId(2), createdAt: '2026-04-02T00:00:00.000Z' },
+    ]);
+
+    const res = await call(app.baseUrl, 'GET', '/me/exports?limit=2', {
+      headers: bearer(SESSION_STUDENT_1),
+    });
+
+    expect(res.status).toBe(200);
+    expect(viewsOf(res.body)).toHaveLength(2);
+    expect(res.body.meta['hasNext']).toBe(false);
+    expect(res.body.meta['nextCursor']).toBeNull();
+  });
+
+  it('空页契约：无记录时是空数组；游标指向最后一行时同样收敛到「空页 + 无下一页」', async () => {
+    const empty = await startExportsApp({ seed: false });
+
+    const noRecords = await call(empty.baseUrl, 'GET', '/me/exports?limit=5', {
+      headers: bearer(SESSION_STUDENT_1),
+    });
+    expect(noRecords.status).toBe(200);
+    expect(viewsOf(noRecords.body)).toEqual([]);
+    expect(noRecords.body.meta['hasNext']).toBe(false);
+    expect(noRecords.body.meta['nextCursor']).toBeNull();
+
+    // 游标指向唯一一行的键集：下一页必然为空，且仍然满足同一份元数据契约
+    const seeded = await startExportsApp({
+      seed: false,
+    });
+    const lastKeyset: ExportKeyset = {
+      createdAt: '2026-05-01T00:00:00.000Z',
+      id: pagedId(1),
+    };
+    await seedPagedRecords(seeded, [{ id: lastKeyset.id, createdAt: lastKeyset.createdAt }]);
+    const cursor = pagedCodec().encode(lastKeyset, STUDENT_1);
+
+    const beyond = await call(
+      seeded.baseUrl,
+      'GET',
+      `/me/exports?limit=5&cursor=${encodeURIComponent(cursor)}`,
+      { headers: bearer(SESSION_STUDENT_1) },
+    );
+    expect(beyond.status).toBe(200);
+    expect(viewsOf(beyond.body)).toEqual([]);
+    expect(beyond.body.meta['hasNext']).toBe(false);
+    expect(beyond.body.meta['nextCursor']).toBeNull();
+  });
+
+  it('响应面不变：data 仍是既有视图闭集，meta 不含游标含义、正文与游标都不含归属 / 句柄 / 路径 / PII', async () => {
+    const app = await startExportsApp({ seed: false });
+    await seedPagedRecords(app, [
+      { id: pagedId(1), createdAt: '2026-06-01T00:00:00.000Z' },
+      { id: pagedId(2), createdAt: '2026-06-02T00:00:00.000Z' },
+    ]);
+
+    const res = await call(app.baseUrl, 'GET', '/me/exports?limit=1', {
+      headers: bearer(SESSION_STUDENT_1),
+    });
+
+    expect(res.status).toBe(200);
+    const [view] = viewsOf(res.body);
+    expect(view).toBeDefined();
+    expect(Object.keys(view ?? {}).every((key) => VIEW_WHITELIST.includes(key))).toBe(true);
+    expect(contentText(res)).not.toContain(STUDENT_1);
+    expect(contentText(res)).not.toContain(FORGED_PATH);
+    expectNoStorageLeak(contentText(res));
+
+    const cursor = res.body.meta['nextCursor'];
+    expect(typeof cursor).toBe('string');
+    const cursorText = String(cursor);
+    // 游标形态：版本前缀 + base64url 段（不可读），且不含归属、边界主键与明文时间戳
+    expect(cursorText.startsWith(EXPORT_CURSOR_PREFIX)).toBe(true);
+    expect(cursorText).not.toContain(STUDENT_1);
+    expect(cursorText).not.toContain(pagedId(1));
+    expect(cursorText).not.toContain('2026-06-01T00:00:00.000Z');
+    expect(cursorText.length).toBeLessThanOrEqual(EXPORT_CURSOR_MAX_LENGTH);
+  });
+
+  it('limit 输入矩阵：严格正整数且有有限上界，缺省取默认值；非法一律 400 且不取数', async () => {
+    const valid: ReadonlyArray<{ readonly query: string; readonly limit: number }> = [
+      { query: '', limit: EXPORT_PAGE_DEFAULT_LIMIT },
+      { query: '?limit=1', limit: 1 },
+      { query: `?limit=${EXPORT_PAGE_MAX_LIMIT}`, limit: EXPORT_PAGE_MAX_LIMIT },
+    ];
+    for (const { query, limit } of valid) {
+      const app = await startExportsApp();
+      const res = await call(app.baseUrl, 'GET', `/me/exports${query}`, {
+        headers: bearer(SESSION_STUDENT_1),
+      });
+      expect(res.status).toBe(200);
+      expect(res.body.meta['limit']).toBe(limit);
+      expect(viewsOf(res.body).length).toBeLessThanOrEqual(limit);
+    }
+
+    const invalid: ReadonlyArray<{ readonly query: string; readonly expected: string }> = [
+      { query: '?limit=0', expected: 'limit 必须是严格正整数' },
+      { query: '?limit=-1', expected: 'limit 必须是严格正整数' },
+      { query: '?limit=1.5', expected: 'limit 必须是严格正整数' },
+      { query: '?limit=abc', expected: 'limit 必须是严格正整数' },
+      { query: '?limit=1e2', expected: 'limit 必须是严格正整数' },
+      { query: '?limit=%201', expected: 'limit 必须是严格正整数' },
+      { query: '?limit=01', expected: 'limit 必须是严格正整数' },
+      { query: '?limit=', expected: 'limit 必须是严格正整数' },
+      { query: '?limit=1&limit=2', expected: 'limit 必须是严格正整数' },
+      {
+        query: `?limit=${EXPORT_PAGE_MAX_LIMIT + 1}`,
+        expected: `limit 不能超过 ${EXPORT_PAGE_MAX_LIMIT}`,
+      },
+      {
+        query: '?limit=99999999999999999999',
+        expected: `limit 不能超过 ${EXPORT_PAGE_MAX_LIMIT}`,
+      },
+    ];
+    for (const { query, expected } of invalid) {
+      const app = await startExportsApp();
+      const spies = spyOnPorts(app);
+      const res = await call(app.baseUrl, 'GET', `/me/exports${query}`, {
+        headers: bearer(SESSION_STUDENT_1),
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.error?.code).toBe('VALIDATION_FAILED');
+      expect(issuesOf(res.body).map((issue) => issue.message)).toContain(expected);
+      expectNoPortCalls(spies);
+    }
+  });
+
+  it('cursor 输入矩阵：超长 / 形态非法 / 篡改 / 跨主体重放一律 400，且不取数、不回显游标', async () => {
+    const app = await startExportsApp();
+    const codec = pagedCodec();
+    const ownCursor = codec.encode(
+      { createdAt: '2026-01-06T00:00:00.000Z', id: app.seeded.ownPending.id },
+      STUDENT_1,
+    );
+    // 他人主体的合法游标（同一服务端密钥、不同主体）：跨主体重放必须被拒
+    const foreignCursor = codec.encode(
+      { createdAt: app.seeded.otherCompleted.createdAt, id: app.seeded.otherCompleted.id },
+      STUDENT_2,
+    );
+    const tampered = `${ownCursor.slice(0, -1)}${ownCursor.endsWith('A') ? 'B' : 'A'}`;
+
+    const cases: ReadonlyArray<{
+      readonly query: string;
+      readonly expected: string;
+      readonly leaked?: string;
+    }> = [
+      { query: '?cursor=', expected: 'cursor 必须是非空字符串' },
+      { query: '?cursor=abc', expected: EXPORT_CURSOR_INVALID_MESSAGE, leaked: 'abc' },
+      {
+        query: '?cursor=e2.abc.def',
+        expected: EXPORT_CURSOR_INVALID_MESSAGE,
+        leaked: 'e2.abc.def',
+      },
+      {
+        query: `?cursor=${'A'.repeat(EXPORT_CURSOR_MAX_LENGTH + 1)}`,
+        expected: `cursor 不能超过 ${EXPORT_CURSOR_MAX_LENGTH} 个字符`,
+      },
+      {
+        query: '?cursor=a&cursor=b',
+        expected: 'cursor 必须是非空字符串',
+      },
+      {
+        query: `?cursor=${encodeURIComponent(foreignCursor)}`,
+        expected: EXPORT_CURSOR_INVALID_MESSAGE,
+      },
+      { query: `?cursor=${encodeURIComponent(tampered)}`, expected: EXPORT_CURSOR_INVALID_MESSAGE },
+    ];
+
+    for (const { query, expected, leaked } of cases) {
+      const spies = spyOnPorts(app);
+      const res = await call(app.baseUrl, 'GET', `/me/exports${query}`, {
+        headers: bearer(SESSION_STUDENT_1),
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.error?.code).toBe('VALIDATION_FAILED');
+      expect(issuesOf(res.body).map((issue) => issue.message)).toContain(expected);
+      // 拒绝原因只给字段名 / 稳定文案：不回显游标原文（哪怕是被篡改的那一份）
+      if (leaked !== undefined) expect(contentText(res)).not.toContain(leaked);
+      expect(contentText(res)).not.toContain(ownCursor);
+      expectNoPortCalls(spies);
+    }
+
+    // 反向对照：本人、未被改动的游标可用（证明上面的拒绝来自校验，而不是「游标一律拒绝」）
+    const ok = await call(
+      app.baseUrl,
+      'GET',
+      `/me/exports?limit=2&cursor=${encodeURIComponent(ownCursor)}`,
+      { headers: bearer(SESSION_STUDENT_1) },
+    );
+    expect(ok.status).toBe(200);
+    expect(viewsOf(ok.body).map((view) => view.id)).toEqual([
+      app.seeded.ownCompleted.id,
+      app.seeded.ownFailed.id,
+    ]);
+  });
+
+  it('客户端主体字段一律 400（可区分原因）：归属 / 授权 / 状态 / 产物位置都不被读取、不被信任', async () => {
+    const cases: ReadonlyArray<{
+      readonly query: string;
+      readonly expected: string;
+      readonly leaked?: string;
+    }> = [
+      { query: `userId=${STUDENT_2}`, expected: '禁止使用查询参数 userId', leaked: STUDENT_2 },
+      {
+        query: `ownerUserId=${STUDENT_2}`,
+        expected: '禁止使用查询参数 ownerUserId',
+        leaked: STUDENT_2,
+      },
+      { query: 'ownerId=g-9', expected: '禁止使用查询参数 ownerId', leaked: 'g-9' },
+      { query: 'actorId=u-9', expected: '禁止使用查询参数 actorId', leaked: 'u-9' },
+      { query: 'roles=super_admin', expected: '禁止使用查询参数 roles', leaked: 'super_admin' },
+      { query: 'groupId=g-1', expected: '禁止使用查询参数 groupId', leaked: 'g-1' },
+      { query: 'status=completed', expected: '禁止使用查询参数 status', leaked: 'completed' },
+      { query: 'offset=10', expected: '本端点不接受查询参数 offset' },
+      { query: 'page=2', expected: '本端点不接受查询参数 page' },
+      {
+        query: `artifactId=${FORGED_ARTIFACT_ID}`,
+        expected: '禁止使用查询参数 artifactId',
+        leaked: FORGED_ARTIFACT_ID,
+      },
+      {
+        query: `path=${encodeURIComponent(FORGED_PATH)}`,
+        expected: '禁止使用查询参数 path',
+        leaked: FORGED_PATH,
+      },
+    ];
+
+    for (const { query, expected, leaked } of cases) {
+      const app = await startExportsApp();
+      const spies = spyOnPorts(app);
+      const res = await call(app.baseUrl, 'GET', `/me/exports?${query}`, {
+        headers: bearer(SESSION_STUDENT_1),
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.error?.code).toBe('VALIDATION_FAILED');
+      expect(
+        issuesOf(res.body)
+          .map((issue) => issue.message)
+          .some((message) => message.includes(expected)),
+      ).toBe(true);
+      expect(contentText(res)).not.toContain(leaked);
+      expectNoPortCalls(spies);
+    }
+  });
+
+  it('认证与授权仍然先于分页校验：401 / 403 时不触达仓储，也不泄露合法 limit 是否存在', async () => {
+    const app = await startExportsApp();
+
+    const anonymous = spyOnPorts(app);
+    const unauthenticated = await call(app.baseUrl, 'GET', '/me/exports?limit=1');
+    expect(unauthenticated.status).toBe(401);
+    expect(unauthenticated.body.error?.code).toBe('UNAUTHENTICATED');
+    expectNoPortCalls(anonymous);
+
+    const forbidden = spyOnPorts(app);
+    const admin = await call(app.baseUrl, 'GET', '/me/exports?limit=1', {
+      headers: bearer(SESSION_ADMIN_1),
+    });
+    expect(admin.status).toBe(403);
+    expect(admin.body.error?.code).toBe('FORBIDDEN');
+    expectNoPortCalls(forbidden);
+  });
+
+  it('分页读取不产生任何写入副作用，且只调用窗口化取数入口一次', async () => {
+    const app = await startExportsApp();
+    const spies = spyOnPorts(app);
+
+    await call(app.baseUrl, 'GET', '/me/exports?limit=2', {
+      headers: bearer(SESSION_STUDENT_1),
+    });
+
+    expect(spies.list).toHaveBeenCalledTimes(1);
+    // 主体只来自服务端会话；窗口由服务端校验结果决定
+    expect(spies.list.mock.calls[0]?.[0]).toBe(STUDENT_1);
+    expect(spies.list.mock.calls[0]?.[1]).toMatchObject({ limit: 2 });
+    expect(spies.create).not.toHaveBeenCalled();
+    expect(spies.store).not.toHaveBeenCalled();
+  });
+
+  it('仓储返回不自洽的窗口（hasNext 为真却没有 limit 行 / 超过窗口行数）→ 500，不发出矛盾的元数据', async () => {
+    vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+
+    const cases: ReadonlyArray<{ readonly page: unknown; readonly limit: number }> = [
+      // hasNext = true 却没有可签发游标的边界行
+      { page: { records: [], hasNext: true }, limit: 2 },
+      { page: { records: [fixtureExportRequest()], hasNext: true }, limit: 2 },
+      // 返回行数超过请求的窗口
+      {
+        page: {
+          records: [
+            fixtureExportRequest({ id: pagedId(1) }),
+            fixtureExportRequest({ id: pagedId(2) }),
+            fixtureExportRequest({ id: pagedId(3) }),
+          ],
+          hasNext: false,
+        },
+        limit: 2,
+      },
+    ];
+
+    for (const { page, limit } of cases) {
+      const app = await startExportsApp({ seed: false });
+      vi.spyOn(app.repository, 'listByOwnerIdPage').mockResolvedValue(page as never);
+
+      const res = await call(app.baseUrl, 'GET', `/me/exports?limit=${limit}`, {
+        headers: bearer(SESSION_STUDENT_1),
+      });
+
+      expect(res.status).toBe(500);
+      expect(res.body.data).toBeNull();
+      expect(res.body.error?.code).toBe('INTERNAL_ERROR');
+      // 矛盾的元数据一个都不外发（没有 limit / hasNext / nextCursor）
+      expect(res.body.meta['hasNext']).toBeUndefined();
+      expect(res.body.meta['nextCursor']).toBeUndefined();
+    }
+  });
+
+  it('纯函数门禁：列表查询闭集、limit 默认值/上界与 cursor 形态（门禁非恒真）', () => {
+    expect(EXPORT_PAGE_DEFAULT_LIMIT).toBeGreaterThan(0);
+    expect(EXPORT_PAGE_MAX_LIMIT).toBeGreaterThanOrEqual(EXPORT_PAGE_DEFAULT_LIMIT);
+    expect(EXPORT_PAGE_META_FIELDS).toEqual(['limit', 'hasNext', 'nextCursor']);
+
+    // 闭集：只放行 cursor / limit，其余（含服务端字段）逐项拒绝
+    expect(() => assertDeclaredExportListQueryFields({})).not.toThrow();
+    expect(() => assertDeclaredExportListQueryFields(undefined)).not.toThrow();
+    expect(() => assertDeclaredExportListQueryFields(null)).not.toThrow();
+    expect(() => assertDeclaredExportListQueryFields({ cursor: 'x', limit: '1' })).not.toThrow();
+    const forbidden = captureZodError(() =>
+      assertDeclaredExportListQueryFields({ userId: STUDENT_2 }),
+    );
+    expect(forbidden?.issues[0]?.message).toContain('禁止使用查询参数 userId');
+    const unknown = captureZodError(() => assertDeclaredExportListQueryFields({ page: '1' }));
+    expect(unknown?.issues[0]?.message).toBe('本端点不接受查询参数 page');
+
+    // limit：缺省取默认值；严格正整数；上界有限
+    expect(exportListQuerySchema.parse({})).toEqual({ limit: EXPORT_PAGE_DEFAULT_LIMIT });
+    expect(exportListQuerySchema.parse({ limit: '7' }).limit).toBe(7);
+    for (const limit of [
+      '0',
+      '-1',
+      '1.5',
+      'abc',
+      '1e2',
+      ' 1',
+      '01',
+      '',
+      '101',
+      String(EXPORT_PAGE_MAX_LIMIT + 1),
+      ['1'],
+      {},
+      null,
+      0,
+      -1,
+      1.5,
+    ]) {
+      expect(exportListQuerySchema.safeParse({ limit }).success).toBe(false);
+    }
+    expect(exportListQuerySchema.safeParse({ limit: EXPORT_PAGE_MAX_LIMIT }).success).toBe(true);
+
+    // cursor 只接受形态合规的短串；超长 / 空串 / 非字符串一律拒绝
+    expect(exportListQuerySchema.safeParse({ cursor: 'abc' }).success).toBe(false);
+    expect(exportListQuerySchema.safeParse({ cursor: '' }).success).toBe(false);
+    expect(exportListQuerySchema.safeParse({ cursor: 'A'.repeat(600) }).success).toBe(false);
+    expect(exportListQuerySchema.safeParse({ cursor: ['a', 'b'] }).success).toBe(false);
+    expect(exportListQuerySchema.safeParse({ cursor: 1 }).success).toBe(false);
+  });
+});

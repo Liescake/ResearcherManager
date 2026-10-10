@@ -1,4 +1,6 @@
 import { Body, Controller, Get, Headers, Inject, Param, Post, Query, Res } from '@nestjs/common';
+import { ok } from '@rm/shared';
+import type { ApiEnvelope } from '@rm/shared';
 import { requireSubject } from '../auth/require-subject';
 import { SESSION_SUBJECT_RESOLVER } from '../auth/session-subject.port';
 import type { SessionSubjectResolver } from '../auth/session-subject.port';
@@ -37,7 +39,8 @@ export interface ExportDownloadResponseLike {
  *    `x-file-url` 都不进入判定）；
  * 2. 资源级判定在 service 内经由 `AuthorizationGuard`（`RUOYI_AUTHZ_ADAPTER` 端口）完成，
  *    且**先于字段校验与任何端口调用**，拒绝即 403；控制器不自行判断权限，也不拼接判定入参；
- * 3. `@Query()` 与 `@Body()` 原样交给 service，在授权之后判定：本切片不声明任何查询参数、
+ * 3. `@Query()` 与 `@Body()` 原样交给 service，在授权之后判定：**列表端点只声明
+ *    `cursor` / `limit` 两个查询参数**（其余一律 400），创建端点不接受任何查询参数、
  *    请求体只声明 `resource` / `fields`，因此 `?userId=`/`?artifactId=`/`?fileUrl=`/`?path=` 与
  *    `{ userId, roles, scope, groupId, status, fileUrl, path }` 之类一律 400 `VALIDATION_FAILED`
  *    （给出可区分的拒绝原因），而不是静默忽略——客户端提交的归属、授权、状态与产物位置
@@ -57,15 +60,28 @@ export class ExportsController {
     @Inject(SESSION_SUBJECT_RESOLVER) private readonly sessions: SessionSubjectResolver,
   ) {}
 
+  /**
+   * 本人导出请求列表与状态（**键集分页**）。
+   *
+   * 查询串闭集只有 `cursor` / `limit` 两项（其余一律 400，见 service）；控制器**原样**把
+   * `@Query()` 交给 service，不声明任何 DTO，也不读取任何自定义头 —— 因此客户端提交的
+   * `userId` / `ownerUserId` / `artifactId` / `filePath` / `storageKey` 之类既不进入判定，
+   * 也不会被「框架自动转换」成可用输入。
+   *
+   * 响应是共享信封 `{ data, meta, error }`：`data` 是既有 `ExportRequestView` 数组（**没有**
+   * 任何新增字段，仍不含归属、产物句柄、路径与有效期），`meta` 只多出三项分页元数据
+   * （`limit` / `hasNext` / `nextCursor`），`nextCursor` 是不透明签名串。
+   */
   @Get()
   async listMyExportRequests(
     @Headers('authorization') authorization: string | undefined,
     @Query() query: unknown,
-  ): Promise<ExportRequestView[]> {
-    return this.exports.listMyExportRequests(
+  ): Promise<ApiEnvelope<ExportRequestView[]>> {
+    const result = await this.exports.listMyExportRequests(
       await requireSubject(this.sessions, authorization),
       query,
     );
+    return ok(result.items, { ...result.page });
   }
 
   @Post()

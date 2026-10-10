@@ -138,6 +138,133 @@ export interface ExportRepositoryCapabilities {
 }
 
 /**
+ * 分页窗口的**键集游标**（keyset）：排序键是**唯一全序** `(createdAt ASC, id ASC)` 的全前缀，
+ * 两个分量都来自服务端记录（`createdAt` 由服务端时钟写入、`id` 由服务端生成），
+ * 客户端无法声明或覆盖。
+ *
+ * 为什么不是 offset：`OFFSET n` 的语义是「跳过前 n 行」，在并发写入（本人新建导出请求）下会
+ * 让同一行出现在两页或从两页之间漏掉；键集游标把「下一页从哪里继续」表达为**已返回的最后一行的
+ * 键值边界**，因此分页结果与「上一页取走之后又插入了新行」无关，也不会重复或遗漏既有行。
+ */
+export interface ExportKeyset {
+  /**
+   * 排序键第一分量：服务端时钟写入的 UTC ISO 8601 绝对时刻。
+   * 比较与边界判定都发生在**毫秒粒度**（见 `compareExportKeysets`）。
+   */
+  readonly createdAt: string;
+  /** 排序键第二分量：服务端生成的记录主键（UUID），用于给同一时刻的多行定序 */
+  readonly id: string;
+}
+
+/**
+ * 分页窗口（**服务端**侧入参，不是客户端输入）：
+ * - `limit`：本页最多返回的行数，由 API 层按服务端闭集校验（严格正整数且有有限上界）后传入；
+ * - `after`：键集边界，缺省 = 从该主体名下的最早一行开始（首页）。
+ */
+export interface ExportPageWindow {
+  readonly limit: number;
+  readonly after?: ExportKeyset;
+}
+
+/**
+ * 一页读取结果。
+ *
+ * `hasNext` **必须由存储实现**给出（而不是让上层「猜」）：判断依据是「按窗口多取一行」——
+ * 取到 `limit + 1` 行即表示后面还有行，且多取的那一行**不得**出现在 `records` 里。
+ * 因此 `records.length <= limit` 恒成立，且 `hasNext` 与 `records` 来自**同一次**取数快照，
+ * 不存在「先数总数再取一页」两次读取之间的漂移。
+ */
+export interface ExportPage {
+  readonly records: readonly ExportRequest[];
+  readonly hasNext: boolean;
+}
+
+/**
+ * 分页窗口的**服务端闭集**：默认页大小与硬上界都是服务端常量。
+ *
+ * 为什么上界必须有限且写在契约层：`limit` 若可以被客户端放大到任意值，一次请求就能把本人全部
+ * 导出请求（以及它们的字段列表）拉出来，分页本身就不再是资源边界，而只是一个可选的提示。
+ * 上界放在这里（而不是 API 层独有）还有第二个原因：数据库 adapter 需要先判定「窗口合法」
+ * 才允许把 `limit + 1` 绑定进 SQL 的 `LIMIT`，否则「按客户端提交的行数取数」这条路径在
+ * 存储层就是敞开的。
+ */
+export const EXPORT_PAGE_DEFAULT_LIMIT = 20;
+export const EXPORT_PAGE_MAX_LIMIT = 100;
+
+/** 页大小是否是服务端闭集内的严格正整数（唯一的判定位点，内存基线与数据库 adapter 共用） */
+export function isExportPageLimit(value: unknown): value is number {
+  return (
+    typeof value === 'number' &&
+    Number.isInteger(value) &&
+    value >= 1 &&
+    value <= EXPORT_PAGE_MAX_LIMIT
+  );
+}
+
+/**
+ * 窗口自检（**服务端缺陷**出口）：非法页大小或形态非法的键集边界都说明调用链已损坏，
+ * 必须抛错而不是「夹到一个合法值继续」——静默修正会让「上层漏了校验」永远不可见。
+ */
+export function assertExportPageWindow(window: unknown): ExportPageWindow {
+  if (typeof window !== 'object' || window === null || Array.isArray(window)) {
+    throw new Error('导出分页窗口必须是对象（服务端缺陷）');
+  }
+  const candidate = window as { readonly limit?: unknown; readonly after?: unknown };
+  if (!isExportPageLimit(candidate.limit)) {
+    throw new Error(`导出分页窗口的 limit 必须是 1–${EXPORT_PAGE_MAX_LIMIT} 的整数（服务端缺陷）`);
+  }
+  if (candidate.after !== undefined) {
+    assertExportKeyset(candidate.after);
+  }
+  return window as ExportPageWindow;
+}
+
+/** 键集边界的形态自检：两个分量都必须是非空字符串（取值域由上层读取契约保证） */
+export function assertExportKeyset(keyset: unknown): ExportKeyset {
+  if (typeof keyset !== 'object' || keyset === null || Array.isArray(keyset)) {
+    throw new Error('导出分页键集边界必须是对象（服务端缺陷）');
+  }
+  const candidate = keyset as { readonly createdAt?: unknown; readonly id?: unknown };
+  if (
+    typeof candidate.createdAt !== 'string' ||
+    candidate.createdAt === '' ||
+    typeof candidate.id !== 'string' ||
+    candidate.id === ''
+  ) {
+    throw new Error('导出分页键集边界必须是 (createdAt, id) 两个非空字符串（服务端缺陷）');
+  }
+  return candidate as ExportKeyset;
+}
+
+/**
+ * 键集全序比较（**内存基线与数据库 adapter 必须一致的那一份序**）。
+ *
+ * - 第一分量按**毫秒粒度**的绝对时刻比较（`Date.parse` 的取值就是毫秒整数），
+ *   而不是按 ISO 字符串字面量：同一瞬时点的合法 ISO 形态不止一种（带 / 不带小数秒、
+ *   微秒位不同），逐字节比较会排出与时间先后不同的顺序；毫秒粒度同时与数据库侧
+ *   `date_trunc('milliseconds', created_at)` 的排序表达式、以及领域记录能表达的
+ *   ISO 毫秒精度一致（`ORDER BY date_trunc('milliseconds', created_at) ASC, id ASC`）；
+ * - 第二分量按**规范小写 UUID 文本**比较：数据库对 `uuid` 的比较是 16 字节值序，而规范小写形
+ *   （定长十六进制 + 固定位置连字符）的文本序与该值序一致，因此两侧序相同；
+ * - 排序键合起来是唯一全序（主键唯一），因此「严格大于边界」与「等于边界之后」等价，
+ *   分页既不会重复也不会遗漏。
+ *
+ * 为什么毫秒粒度是**必须**的：`timestamptz` 允许微秒精度，而领域记录的 `createdAt` 是
+ * ISO 毫秒形态（驱动读回的 `Date` 也只有毫秒）。若排序用原始列、边界用毫秒截断值，
+ * 边界行自己的真实值严格大于截断值，于是它会在下一页**被再次取出** —— 相邻两页重复同一行。
+ */
+export function compareExportKeysets(left: ExportKeyset, right: ExportKeyset): number {
+  const leftMs = Date.parse(left.createdAt);
+  const rightMs = Date.parse(right.createdAt);
+  const bothFinite = Number.isFinite(leftMs) && Number.isFinite(rightMs);
+  if (bothFinite && leftMs !== rightMs) {
+    return leftMs < rightMs ? -1 : 1;
+  }
+  if (left.id === right.id) return 0;
+  return left.id < right.id ? -1 : 1;
+}
+
+/**
  * 导出请求仓储端口（**任务事实的唯一落库入口**）。
  *
  * - `create`：写入一条已由 service 补齐归属、状态、字段与时间戳的记录（入口恒为 `pending`）；
@@ -188,8 +315,25 @@ export interface ExportRepository {
   /**
    * 只返回该服务端主体名下的记录，按创建顺序。
    * 调用方必须是已授权访问该主体资源的服务端代码；归属必须下推进 SQL（他人记录不出库）。
+   *
+   * **无窗口的完整读取**：HTTP 路由不再使用它（`GET /me/exports` 走下面的窗口入口），
+   * 它保留为端口上的既有取数能力与回归夹具的读取入口；两条入口共用同一份行映射与归属复核，
+   * 因此语义不会漂移。
    */
   listByOwnerId(ownerUserId: string): Promise<readonly ExportRequest[]>;
+  /**
+   * 按服务端主体取**一页**记录（键集分页的唯一取数入口）。
+   *
+   * - 排序固定为键集全序 `(createdAt ASC, id ASC)`；`window.after` 缺省表示首页；
+   * - 边界语义是**严格大于**：`after` 行本身不会再出现在下一页（否则相邻两页会重复该行）；
+   * - 实现**必须多取一行**（`limit + 1`）来判定 `hasNext`，且多取的那一行不得进入 `records`；
+   * - **不得使用 `OFFSET`**：位移分页在并发写入下会重复或遗漏行，键集边界必须由
+   *   `(created_at, id)` 的下推谓词表达；
+   * - 归属必须下推进存储（`WHERE requester_id = …`），并逐条复核返回行的归属；
+   * - `window.limit` 必须落在 `EXPORT_PAGE_MAX_LIMIT` 内，非法窗口在**取数之前** fail-closed
+   *   （绝不「夹到上界继续」）。
+   */
+  listByOwnerIdPage(ownerUserId: string, window: ExportPageWindow): Promise<ExportPage>;
   /**
    * 按「记录 ID + 服务端主体归属」取单条记录（下载切片的唯一取数入口）。
    *
@@ -239,9 +383,10 @@ export const EXPORT_REPOSITORY_STORAGE_ID_DOMAIN = 'uuid';
  * 真库集成验证闭环），因此两份契约已收敛：运行时绑定（内存基线）与数据库 adapter 现在实现
  * **同一份**签名，「切换到数据库」与「回退到内存基线」仍是可整步执行 / 整步回退的操作。
  *
- * 方法集**只有四个**（`create` / `save` / `listByOwnerId` / `findByIdForOwner`）：唯一的单条读取
- * 入口也把主体写进签名（`findByIdForOwner`），不存在需要额外补主体参数的「裸 findById」；
- * 四者都从入参取**服务端**主体，数据库实现把归属**下推进 SQL**（`WHERE requester_id = $1`）。
+ * 方法集**只有五个**（`create` / `save` / `listByOwnerId` / `listByOwnerIdPage` /
+ * `findByIdForOwner`）：唯一的单条读取入口也把主体写进签名（`findByIdForOwner`），
+ * 不存在需要额外补主体参数的「裸 findById」；无窗口与有窗口两个列表入口都从入参取**服务端**主体，
+ * 数据库实现把归属**下推进 SQL**（`WHERE requester_id = $1`）。
  *
  * 实现者（`exports.in-memory-repository.ts` 与 `exports.postgres-repository.ts`）必须满足
  * **完全相同**的语义

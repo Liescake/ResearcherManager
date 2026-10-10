@@ -1,7 +1,14 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { APP_ENV } from '../../config/config.module';
 import type { AppEnv } from '../../config/env';
-import type { ExportRepository, ExportRepositoryCapabilities, ExportRequest } from './exports.port';
+import { assertExportPageWindow, compareExportKeysets } from './exports.port';
+import type {
+  ExportPage,
+  ExportPageWindow,
+  ExportRepository,
+  ExportRepositoryCapabilities,
+  ExportRequest,
+} from './exports.port';
 
 /**
  * 导出请求仓储的**内存基线**：开发与测试用，缺失真实持久化实现时的显式替身。
@@ -19,7 +26,9 @@ import type { ExportRepository, ExportRepositoryCapabilities, ExportRequest } fr
  *   （第三条与数据库 adapter 的 `expires_at` 不可变列同语义）；
  * - **没有**删除/归档方法：本切片不提供「删除导出请求」的能力；
  * - **没有**不带归属条件的单条读取：单条读取只有 `findByIdForOwner(id, ownerUserId)`，
- *   归属是取数条件本身（不存在 `findById` / `findByOwner` / `query` 这类入口）。
+ *   归属是取数条件本身（不存在 `findById` / `findByOwner` / `query` 这类入口）；
+ * - **列表只有两个归属受限入口**：`listByOwnerId`（无窗口）与 `listByOwnerIdPage`（键集窗口）。
+ *   后者是 `GET /me/exports` 的唯一取数入口；两者共用同一份排序与归属过滤，语义不漂移。
  */
 @Injectable()
 export class InMemoryExportRepository implements ExportRepository {
@@ -70,13 +79,67 @@ export class InMemoryExportRepository implements ExportRepository {
   }
 
   /**
-   * 只返回该服务端主体名下的记录，按创建顺序。
+   * 只返回该服务端主体名下的记录，按**键集全序**（毫秒粒度的 `createdAt ASC`，同刻按 `id ASC`）
+   * 排列。
+   *
+   * 排序口径与数据库实现的 `ORDER BY date_trunc($n::text, created_at) ASC, id ASC`
+   * **逐条一致**：内存基线此前按插入顺序返回，而插入顺序只在「创建时刻严格递增」时才等于键集序；
+   * 同一毫秒内创建的两条记录会因此在两条实现之间出现顺序漂移，而分页边界正是建立在这个序上。
+   * 让两条实现共用 `compareExportKeysets` 是「同一份序」的唯一事实来源。
+   *
    * 过滤行为**不作为安全边界**：service 仍会逐条复核归属（纵深防御）。
    */
   async listByOwnerId(ownerUserId: string): Promise<readonly ExportRequest[]> {
+    return this.ownedRecords(ownerUserId).map((record) => copyRequest(record));
+  }
+
+  /**
+   * 按服务端主体取**一页**记录（键集分页）。
+   *
+   * 语义与数据库 adapter 的
+   * `WHERE requester_id = $1::uuid AND (date_trunc($2::text, created_at), id)
+   *  > ($3::timestamptz, $4::uuid) ORDER BY date_trunc($5::text, created_at) ASC, id ASC
+   *  LIMIT $6::int` **完全一致**：
+   * - 窗口先过 `assertExportPageWindow`（`limit` 越界 / 键集形态非法属服务端缺陷，直接抛错，
+   *   绝不「夹到上界继续」）；
+   * - 边界是**严格大于**：`after` 那一行不会再出现在下一页；
+   * - 排序与边界判定都在**毫秒粒度**（与数据库侧使用同一个截断表达式），因此亚毫秒
+   *   `createdAt` 不会让边界行在下一页被再取一次；
+   * - 多取一行判定 `hasNext`，多取的行**不进** `records`（与 SQL 的 `LIMIT limit + 1` 同构）；
+   * - 返回副本，调用方拿不到内部可变引用。
+   *
+   * 复杂度：每次取页都是全量扫描 + 排序（`O(n log n)`）。这是内存基线的**如实形态**
+   * （它是开发/测试替身，不声称生产可用；`productionReady = false` 已在能力声明里）。
+   */
+  async listByOwnerIdPage(ownerUserId: string, window: ExportPageWindow): Promise<ExportPage> {
+    const { limit, after } = assertExportPageWindow(window);
+    const candidates =
+      after === undefined
+        ? this.ownedRecords(ownerUserId)
+        : this.ownedRecords(ownerUserId).filter(
+            (record) => compareExportKeysets(record, after) > 0,
+          );
+
+    // 多取一行：取到 limit + 1 行即证明后面还有行（与 SQL 的 LIMIT limit + 1 同构）
+    const probed = candidates.slice(0, limit + 1);
+    const hasNext = probed.length > limit;
+    return {
+      records: probed.slice(0, limit).map((record) => copyRequest(record)),
+      hasNext,
+    };
+  }
+
+  /**
+   * 主体名下的记录，按键集全序排列（**唯一的排序点**，两个列表入口共用）。
+   *
+   * 比较用 `compareExportKeysets`（按**毫秒粒度**的绝对时刻比较，同刻按规范 UUID 文本序），
+   * 而不是按 ISO 字面量：同一瞬时点的合法 ISO 形态不止一种（带 / 不带小数秒、微秒位不同），
+   * 逐字节比较会排出与时间先后不同的顺序，也会与 `timestamptz` 的比较结果漂移。
+   */
+  private ownedRecords(ownerUserId: string): readonly ExportRequest[] {
     return [...this.requests.values()]
       .filter((record) => record.ownerUserId === ownerUserId)
-      .map((record) => copyRequest(record));
+      .sort(compareExportKeysets);
   }
 
   /**
