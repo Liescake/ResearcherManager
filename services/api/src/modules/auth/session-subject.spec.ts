@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { loadEnv } from '../../config/env';
 import { requireSubject } from './require-subject';
 import { InMemorySessionStore } from './session-store.in-memory';
-import { isSessionTicket } from './session-ticket';
+import { isSessionTicket, sessionTicketDigest } from './session-ticket';
 import {
   BearerSessionSubjectResolver,
   extractSessionId,
@@ -270,11 +270,11 @@ describe('InMemorySessionStore：会话生命周期（创建 / 读取 / 撤销 /
     // 且与落库形 sha256 摘要的 64 字符十六进制不重叠）
     expect(isSessionTicket(issued.ticket)).toBe(true);
     expect(issued.expiresAt).toBe(input.expiresAt);
-    expect(issued.record.sessionId).toBe(issued.ticket);
+    expect(issued.record.sessionId).toBe(sessionTicketDigest(issued.ticket));
     expect(issued.record.subject).toEqual(input.subject);
 
     await expect(store.findSession(issued.ticket)).resolves.toMatchObject({
-      sessionId: issued.ticket,
+      sessionId: sessionTicketDigest(issued.ticket),
     });
   });
 

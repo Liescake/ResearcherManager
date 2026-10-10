@@ -1,7 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { APP_ENV } from '../../config/config.module';
 import type { AppEnv } from '../../config/env';
-import { generateSessionTicket, isSessionTicket } from './session-ticket';
+import { generateSessionTicket, isSessionTicket, sessionTicketDigest } from './session-ticket';
 import type {
   CreateSessionInput,
   IssuedSession,
@@ -43,7 +43,7 @@ export class InMemorySessionStore implements SessionStore {
     productionReady: false,
   };
 
-  /** 存储项：记录 + 过期时刻（毫秒；`undefined` 表示显式 seed 的会话不设过期） */
+  /** 存储项：摘要键、记录 + 过期时刻（毫秒；`undefined` 表示显式 seed 的会话不设过期） */
   private readonly sessions = new Map<string, InMemorySessionEntry>();
 
   constructor(@Inject(APP_ENV) env: AppEnv) {
@@ -56,6 +56,7 @@ export class InMemorySessionStore implements SessionStore {
 
   /**
    * 仅供开发/测试装配：显式写入一条会话，不接受任何隐式全局状态。
+   * `seed` 仍接受测试用会话 ID；由 `createSession` 签发的会话始终按摘要键存储。
    *
    * `expiresAt` 省略时该会话**永不过期**（`purgeExpired` 不会删它）：seed 的用途是「让某个
    * 会话 ID 可被解析」，给它绑一个会随时间漂移的过期时刻只会让用例变得不稳定。需要覆盖过期语义的
@@ -72,24 +73,27 @@ export class InMemorySessionStore implements SessionStore {
   }
 
   async findSession(ticket: string): Promise<SessionRecord | undefined> {
-    const entry = this.liveEntry(ticket);
+    const sessionId = isSessionTicket(ticket) ? sessionTicketDigest(ticket) : ticket;
+    const entry = this.liveEntry(sessionId);
     return entry === undefined ? undefined : copyRecord(entry.record);
   }
 
   async createSession(input: CreateSessionInput): Promise<IssuedSession> {
     const expiresAtMs = parseExpiry(input.expiresAt);
-    // 原始票据只在此处出现一次；存储里放的是这张票据本身（内存基线不落盘，见类注释第 1 条）
+    // 与持久化实现保持同一口径：内存仅存不可逆摘要，原始票据只在返回值中出现一次。
     const ticket = generateSessionTicket();
+    const sessionId = sessionTicketDigest(ticket);
     const record: SessionRecord = {
-      sessionId: ticket,
+      sessionId,
       subject: copySubject(input.subject),
     };
-    this.sessions.set(ticket, { record, expiresAtMs, revoked: false });
+    this.sessions.set(sessionId, { record, expiresAtMs, revoked: false });
     return { ticket, record: copyRecord(record), expiresAt: input.expiresAt };
   }
 
   async revokeSession(ticket: string): Promise<boolean> {
-    const entry = this.sessions.get(ticket);
+    if (!isSessionTicket(ticket)) return false;
+    const entry = this.sessions.get(sessionTicketDigest(ticket));
     if (entry === undefined || entry.revoked) {
       return false;
     }
@@ -118,8 +122,8 @@ export class InMemorySessionStore implements SessionStore {
   }
 
   /** 可用的存储项：存在、未撤销、未过期；其余一律视为「这张票据无效」 */
-  private liveEntry(ticket: string): InMemorySessionEntry | undefined {
-    const entry = this.sessions.get(ticket);
+  private liveEntry(sessionId: string): InMemorySessionEntry | undefined {
+    const entry = this.sessions.get(sessionId);
     if (entry === undefined || entry.revoked) {
       return undefined;
     }
