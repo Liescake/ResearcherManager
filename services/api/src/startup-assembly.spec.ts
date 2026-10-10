@@ -157,6 +157,56 @@ function httpGet(
   });
 }
 
+/**
+ * 带请求体的真实 HTTP 调用（请求体大小上限用例专用）。
+ * 返回原始响应文本：断言「不泄露请求体」必须建立在**原始文本**上，而不是解析后的字段上
+ * （回显可能出现在 message/details 等任何位置）。
+ */
+interface HttpPostResult {
+  readonly status: number;
+  readonly body: ApiEnvelope<unknown>;
+  readonly text: string;
+  readonly headers: IncomingHttpHeaders;
+}
+
+function httpPost(
+  baseUrl: string,
+  path: string,
+  body: string,
+  contentType: string,
+): Promise<HttpPostResult> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const req = request(
+      `${baseUrl}${path}`,
+      {
+        method: 'POST',
+        // 不用连接池：单个用例里连续发多个请求时，keep-alive 复用会让「被解析器拒绝后连接
+        // 是否仍可用」干扰下一次请求（响应断言与连接复用无关，隔离掉更稳定）
+        agent: false,
+        headers: {
+          'content-type': contentType,
+          'content-length': Buffer.byteLength(body),
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          resolvePromise({
+            status: res.statusCode ?? 0,
+            body: JSON.parse(text) as ApiEnvelope<unknown>,
+            text,
+            headers: res.headers,
+          });
+        });
+      },
+    );
+    req.on('error', rejectPromise);
+    req.end(body);
+  });
+}
+
 describe('启动装配：配置来源边界（默认导入路径不变）', () => {
   it('未显式提供配置时读取 process.env：测试/开发环境允许无数据库装配', async () => {
     const app = await assemble();
@@ -733,5 +783,176 @@ describe('启动装配：安全响应头与 CORS 默认关闭（真实 HTTP）',
     } finally {
       restoreEnv();
     }
+  });
+});
+
+/**
+ * 请求体大小上限在**真实启动链路**上的回归（认证 / DoS 审计 BLOCK 项的验收面）。
+ *
+ * 与 `common/request-body-limits.spec.ts` 的分工：那里用假应用对象钉住「配了什么值、注册顺序、
+ * 错误翻译边界」；这里走**默认 `createApp()` + 真实 `listen` + 真实 HTTP**，守住只能在这一层
+ * 观察到的四件事：
+ * 1. 超限请求体在**认证之前**就被解析器拒绝：413，而不是 401/400/500（改动前实测 500 ——
+ *    body-parser 的错误不是 HttpException，会落进异常过滤器的兜底分支）；
+ * 2. 上限数值真的生效：恰好等于上限放行、多 1 字节拒绝（把 `20kb` 改回 `100kb` 这类回退必须被咬住）；
+ * 3. 两条上限**互相独立**：30kb 的 JSON 必须放行（只受 100kb 约束），60kb 的表单必须拒绝
+ *    （受 20kb 约束；若 Nest 默认的 100kb 表单解析器仍在生效，这里会误放行成 401）；
+ * 4. 拒绝时不泄露请求体与上限细节，且 413 响应同样带安全响应头（安全头先于解析器注册）。
+ *
+ * 为什么打 `POST /api/v1/groups` 而不是自造测试路由：这是**已声明**的公开端点，无会话时必然
+ * 401 —— 于是「401（解析器放行、进入认证链）」与「413（解析器直接拒绝）」构成一对可判定的观测，
+ * 既不需要预置会话，也不必为了让测试通过而新增任何测试专用路由。
+ */
+describe('启动装配：请求体大小上限（真实 HTTP，认证之前拒绝）', () => {
+  /** 请求体里的标记：任何响应里出现它，就说明请求体被回显 */
+  const BODY_SECRET = 'sk-body-limit-must-never-echo';
+
+  /** 恰好 `bytes` 字节的 JSON 请求体（全 ASCII ⇒ 字节数 == 字符数） */
+  function jsonBodyOfBytes(bytes: number, secret = ''): string {
+    const prefix = secret === '' ? '{"pad":"' : `{"secret":"${secret}","pad":"`;
+    const suffix = '"}';
+    return `${prefix}${'x'.repeat(bytes - prefix.length - suffix.length)}${suffix}`;
+  }
+
+  /** 恰好 `bytes` 字节的表单请求体：标记直接作为字段值，无论是否被解析都不该出现在响应里 */
+  function formBodyOfBytes(bytes: number, secret = ''): string {
+    const prefix = secret === '' ? 'pad=' : `secret=${secret}&pad=`;
+    return `${prefix}${'x'.repeat(bytes - prefix.length)}`;
+  }
+
+  /** 用真实 `createApp()` 起一个临时监听；应用由文件末尾的全局 afterAll 统一关闭 */
+  async function withRealApp<T>(run: (baseUrl: string) => Promise<T>): Promise<T> {
+    applyEnv({
+      NODE_ENV: 'test',
+      DATABASE_URL: undefined,
+      DATABASE_SSL: undefined,
+      API_PREFIX: '/api/v1',
+    });
+    try {
+      const app = await createApp({ abortOnError: false });
+      startedApps.push(app);
+      await app.listen(0, '127.0.0.1');
+      return await run(await app.getUrl());
+    } finally {
+      restoreEnv();
+    }
+  }
+
+  /** 413 的公共断言：状态码、统一信封、不泄露请求体与上限细节、安全响应头 */
+  function expectPayloadTooLargeRejected(res: HttpPostResult): void {
+    expect(res.status).toBe(413);
+    expect(Object.keys(res.body).sort()).toEqual(['data', 'error', 'meta']);
+    expect(res.body.data).toBeNull();
+    expect(res.body.error).not.toBeNull();
+    // 不泄露请求体：整段原始响应文本里都不得出现标记
+    expect(res.text).not.toContain(BODY_SECRET);
+    // 不泄露上限细节与内部错误类型：客户端只需知道「太大了」，不必知道是哪个解析器、限多少
+    expect(res.text).not.toMatch(/100kb|20kb|102400|20480|entity\.too\.large|body-parser/iu);
+    // 413 是「未进路由就被拒绝」的响应：安全头必须已经挂在解析器之前
+    expect(res.headers['x-content-type-options']).toBe('nosniff');
+    expect(res.headers['x-frame-options']).toBe('DENY');
+  }
+
+  it('超限 JSON / 表单一律 413：恰好等于上限放行，多 1 字节即拒绝', async () => {
+    await withRealApp(async (baseUrl) => {
+      // JSON 上限 100kb = 102400 字节（body-parser 的判定是 `length > limit` 才拒绝）
+      expectPayloadTooLargeRejected(
+        await httpPost(
+          baseUrl,
+          '/api/v1/groups',
+          jsonBodyOfBytes(300 * 1024, BODY_SECRET),
+          'application/json',
+        ),
+      );
+
+      expectPayloadTooLargeRejected(
+        await httpPost(
+          baseUrl,
+          '/api/v1/groups',
+          jsonBodyOfBytes(102400 + 1, BODY_SECRET),
+          'application/json',
+        ),
+      );
+
+      // 表单上限 20kb = 20480 字节；60kb 远低于 Nest 默认的 100kb ⇒ 这条用例是
+      // 「20kb 上限真的生效」的判别式：默认解析器仍生效时这里会放行成 401
+      expectPayloadTooLargeRejected(
+        await httpPost(
+          baseUrl,
+          '/api/v1/groups',
+          formBodyOfBytes(60 * 1024, BODY_SECRET),
+          'application/x-www-form-urlencoded',
+        ),
+      );
+
+      expectPayloadTooLargeRejected(
+        await httpPost(
+          baseUrl,
+          '/api/v1/groups',
+          formBodyOfBytes(20480 + 1, BODY_SECRET),
+          'application/x-www-form-urlencoded',
+        ),
+      );
+    });
+  });
+
+  it('合法边界请求仍正常：等于上限的 JSON/表单放行，30kb JSON 不受 20kb 表单上限影响', async () => {
+    await withRealApp(async (baseUrl) => {
+      // 无会话 ⇒ 解析器放行后进入认证链并返回 401；被解析器拒绝则会是 413
+      const boundaryJson = await httpPost(
+        baseUrl,
+        '/api/v1/groups',
+        jsonBodyOfBytes(102400),
+        'application/json',
+      );
+      expect(boundaryJson.status).toBe(401);
+      expect(boundaryJson.body.error?.code).toBe('UNAUTHENTICATED');
+
+      // 30kb > 20kb（表单上限）但 < 100kb（JSON 上限）：两条上限互相独立，不能一起收紧
+      const aboveFormLimitJson = await httpPost(
+        baseUrl,
+        '/api/v1/groups',
+        jsonBodyOfBytes(30 * 1024),
+        'application/json',
+      );
+      expect(aboveFormLimitJson.status).toBe(401);
+
+      const boundaryForm = await httpPost(
+        baseUrl,
+        '/api/v1/groups',
+        formBodyOfBytes(20480),
+        'application/x-www-form-urlencoded',
+      );
+      expect(boundaryForm.status).toBe(401);
+      expect(boundaryForm.body.error?.code).toBe('UNAUTHENTICATED');
+
+      const smallForm = await httpPost(
+        baseUrl,
+        '/api/v1/groups',
+        formBodyOfBytes(19 * 1024),
+        'application/x-www-form-urlencoded',
+      );
+      expect(smallForm.status).toBe(401);
+
+      const smallJson = await httpPost(baseUrl, '/api/v1/groups', '{}', 'application/json');
+      expect(smallJson.status).toBe(401);
+    });
+  });
+
+  it('非法 JSON 仍 400，且消息里不回显请求体（含敏感标记）', async () => {
+    await withRealApp(async (baseUrl) => {
+      const malformed = await httpPost(
+        baseUrl,
+        '/api/v1/groups',
+        `{"secret":"${BODY_SECRET}",`,
+        'application/json',
+      );
+
+      expect(malformed.status).toBe(400);
+      expect(malformed.body.error?.code).toBe('VALIDATION_FAILED');
+      // body-parser 的语法错误消息会回显原始请求体片段，统一出口必须换成稳定文案
+      expect(malformed.text).not.toContain(BODY_SECRET);
+      expect(malformed.body.error?.message).not.toContain(BODY_SECRET);
+    });
   });
 });

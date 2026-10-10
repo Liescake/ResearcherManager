@@ -1,7 +1,9 @@
 import 'reflect-metadata';
 import { Logger, type INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
+import { applyRequestBodyLimits } from './common/request-body-limits';
 import { applySecurityHeaders } from './common/security-headers';
 import { APP_ENV } from './config/config.module';
 import { describeEnv, type AppEnv } from './config/env';
@@ -33,9 +35,14 @@ export async function createApp(
     readonly abortOnError?: boolean;
   } = {},
 ): Promise<INestApplication> {
-  const app = await NestFactory.create(AppModule, {
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
     bufferLogs: false,
     abortOnError: options.abortOnError ?? true,
+    // 关掉 Nest 的默认解析器注册（`init()` 里的 `registerParserMiddleware()`）：默认解析器用的是
+    // body-parser 的隐式默认上限（json/urlencoded 都是 100kb）且把 urlencoded 硬编码为
+    // `extended: true`。这里改由 `applyRequestBodyLimits()` **独占**解析栈（显式 100kb / 20kb +
+    // `extended: false`），避免「实际生效的上限」取决于两套中间件的先后与请求流是否已读完。
+    bodyParser: false,
   });
 
   // 全局前缀必须在 init() **之前**设置。原因：init() 内部的 `registerRouter()` 会在**注册路由的
@@ -62,6 +69,13 @@ export async function createApp(
   // 不回显 `Origin`、不允许 credentials。跨源需求由部署侧（反向代理同源收敛）解决，
   // 不为此开放任意跨源。
   applySecurityHeaders(app, env);
+
+  // 请求体上限（认证/DoS 加固）：注册在安全响应头**之后**、`init()` **之前**。
+  // 顺序不是风格问题：Express 的错误中间件只能接住注册在它之前的层产生的错误，而请求体超限
+  // 是**解析器**直接拒绝的（路由与守卫都还没跑到）—— 只有先挂安全头，413 响应才同样带上安全头；
+  // 也只有早于 init() 注册，解析器才排在路由之前（认证之前就拒绝超大请求体）。
+  // 取值与不加环境变量开关的理由见 common/request-body-limits.ts。
+  applyRequestBodyLimits(app);
 
   if (options.setGlobalPrefix !== false) {
     // Nest 的 setGlobalPrefix 不接受前导斜杠
