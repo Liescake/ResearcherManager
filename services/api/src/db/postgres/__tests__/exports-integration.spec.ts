@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { loadEnv } from '../../../config/env';
 import { resolveDatabaseConfig } from '../../config/database-config';
@@ -36,21 +38,27 @@ import {
  * `notifications-integration.spec.ts` / `groups-integration.spec.ts` 同一套启用口径。
  *
  * ## 断言的硬性质（离线 spec 无法证明、必须在真库上闭环的）
- * 1. **schema 由仓库真实迁移建立**：`export_jobs` 由迁移 `0013` 建出，列清单**恰好**是
- *    adapter 的 8 个输出列（一个内部列都没有）；主键是 `id`；`(requester_id, created_at, id)`
- *    取数索引与状态闭集 / 归属非空 UUID / 产物与状态自洽的 CHECK 齐备；
- * 2. **读写闭环**：`create`（入口恒为 `pending`）→ `save`（推进到 `completed` 并落服务端短引用）
- *    → `listByOwnerId` 逐字段往返，且返回对象**只有**端口契约的字段（没有任何位置 / 凭据 / 签名）；
- * 3. **归属隔离**：库里同时存在多个主体时只返回请求主体的记录；跨主体写回**一行都写不中**
+ * 1. **schema 由仓库真实迁移建立**：`export_jobs` 由迁移 `0013` 建出、服务端有效期列 `expires_at`
+ *    由迁移 `0015` 补出，列清单**恰好**是 adapter 的 9 个输出列（一个内部列都没有，且
+ *    `expires_at` 是 `timestamptz` + **可空**）；主键是 `id`；`(requester_id, created_at, id)`
+ *    取数索引、状态闭集 / 归属非空 UUID / 产物与状态自洽 / 「有效期必须晚于创建时间」的 CHECK 齐备；
+ * 2. **读写闭环**：`create`（入口恒为 `pending`，服务端有效期随创建落库）→ `save`（推进到
+ *    `completed` 并落服务端短引用，**不改写有效期**）→ `listByOwnerId` 逐字段往返，
+ *    且返回对象**只有**端口契约的字段（没有任何位置 / 凭据 / 签名）；
+ * 3. **服务端有效期的存储语义**：`NULL` 往返为「字段缺省」（下载边界据此 fail-closed），
+ *    非空值按 `timestamptz` 与 UTC ISO 无损互转；`expires_at <= created_at` 被存储层 CHECK 拒绝；
+ * 4. **迁移可逆**：`0015` 的回滚 DDL（`DROP COLUMN IF EXISTS expires_at`）从迁移文件本身取出，
+ *    在真实事务里执行并核对，随后整体回滚（演练不改变真实 schema）；
+ * 5. **归属隔离**：库里同时存在多个主体时只返回请求主体的记录；跨主体写回**一行都写不中**
  *    （`NOT_FOUND`，不外泄「该 ID 属于他人」），他人记录既不出库也不回流；
- * 4. **主键冲突**：同 ID 第二次 `create` 抛 `CONFLICT`，不静默覆盖既有导出请求；
- * 5. **条件写入**：重复推进同一请求抛 `TRANSITION_REJECTED`，且**历史结论逐字段不变**
+ * 6. **主键冲突**：同 ID 第二次 `create` 抛 `CONFLICT`，不静默覆盖既有导出请求；
+ * 7. **条件写入**：重复推进同一请求抛 `TRANSITION_REJECTED`，且**历史结论逐字段不变**
  *    （终态不被覆盖）；
- * 6. **绕过应用层也写不坏**：非法状态 / 非法资源 / 空字段数组 / 空 UUID / 状态与产物短引用不自洽
+ * 8. **绕过应用层也写不坏**：非法状态 / 非法资源 / 空字段数组 / 空 UUID / 状态与产物短引用不自洽
  *    一律被存储层 CHECK（23514）或 NOT NULL 拒绝；
- * 7. **存储 ID 域在进 SQL 之前判定**：非 UUID 主体 fail-closed（`INVALID_SUBJECT`），
+ * 9. **存储 ID 域在进 SQL 之前判定**：非 UUID 主体 fail-closed（`INVALID_SUBJECT`），
  *    且不产生任何行；
- * 8. **模块换绑工厂 + 真实执行器**：`createExportRepository` 在真库上直接闭环
+ * 10. **模块换绑工厂 + 真实执行器**：`createExportRepository` 在真库上直接闭环
  *    （这是「数据库已配置 ⇒ 导出端口走 PostgreSQL 实现」的端到端证据）。
  *
  * ## 为什么需要清理行
@@ -123,9 +131,27 @@ function newOwner(): string {
 /** 从服务端字段白名单派生，避免把「合法字段」抄成两份真相 */
 const FIELDS = EXPORTABLE_FIELDS[ExportResource.Profile].slice(0, 2);
 
+/**
+ * 服务端有效期样本（UTC 绝对时刻，**晚于**下面的 `createdAt`）：与迁移 `0015` 的
+ * `expires_at > created_at` 不变式一致。刻意用固定值而不是「当前时刻 + 1 小时」：
+ * 本套件的 `createdAt` 是固定值，两者的相对关系必须与真实时钟无关（否则用例会随运行时间漂移）。
+ */
+const EXPIRES_AT = '2026-10-10T04:00:00.000Z';
+
+/** 基础 INSERT（**不带** expires_at）：该列留空 ⇒ 存储 NULL，用于「历史行 / 未签发有效期」的分支 */
 const INSERT_SQL = `INSERT INTO export_jobs
   (id, requester_id, resource, fields, status, artifact_id, created_at, updated_at)
   VALUES ($1::uuid, $2::uuid, $3, $4::text[], $5, $6::uuid, now(), now())`;
+
+/**
+ * 带服务端有效期的 INSERT：`created_at`（`$8`）与 `updated_at`（`$9`）都显式给定，
+ * 因此「有效期与创建时间的先后关系」可以被精确构造（用于正向往返与 CHECK 反例）。
+ * 两个时间列**各自占一个占位符**（不复用 `$8`）：执行器把「同一序号出现两次」判为
+ * `PARAMETER_SLOT_DUPLICATE` 并拒绝执行，这里遵守同一口径。
+ */
+const INSERT_WITH_EXPIRY_SQL = `INSERT INTO export_jobs
+  (id, requester_id, resource, fields, status, artifact_id, expires_at, created_at, updated_at)
+  VALUES ($1::uuid, $2::uuid, $3, $4::text[], $5, $6::uuid, $7::timestamptz, $8::timestamptz, $9::timestamptz)`;
 
 async function query<T = Record<string, unknown>>(
   sql: string,
@@ -173,6 +199,7 @@ function recordFor(
     resource: ExportResource.Profile,
     fields: [...FIELDS],
     status: ExportStatus.Pending,
+    expiresAt: EXPIRES_AT,
     createdAt: '2026-10-10T00:00:00.000Z',
     updatedAt: '2026-10-10T00:00:00.000Z',
     ...overrides,
@@ -230,15 +257,15 @@ integrationDescribe(
       }
     });
 
-    it('export_jobs 由迁移 0013 建立：列清单恰好是 adapter 的 8 列，且一个内部列都没有', async () => {
+    it('export_jobs 由迁移 0013 + 0015 建立：列清单恰好是 adapter 的 9 列，且一个内部列都没有', async () => {
       const exists = await query<{ exists: boolean }>(
         'SELECT to_regclass($1::text) IS NOT NULL AS exists',
         [`public.${POSTGRES_EXPORT_TABLE}`],
       );
       expect(exists[0]?.exists).toBe(true);
 
-      const columns = await query<{ column_name: string }>(
-        'SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2',
+      const columns = await query<{ column_name: string; data_type: string; is_nullable: string }>(
+        'SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2',
         ['public', POSTGRES_EXPORT_TABLE],
       );
       const names = columns.map((row) => row.column_name).sort();
@@ -252,6 +279,14 @@ integrationDescribe(
       for (const pii of ['phone', 'id_card', 'student_no', 'email', 'name']) {
         expect(names).not.toContain(pii);
       }
+
+      // 服务端有效期列由迁移 0015 补出：必须是 `timestamptz`（绝对时刻，无时区歧义）且**可空**
+      // —— 可空是 fail-closed 语义的一部分（NULL = 没有服务端有效期 ⇒ 下载边界拒绝），
+      // 而不是「忘了加 NOT NULL」。
+      const expiry = columns.find((row) => row.column_name === 'expires_at');
+      expect(expiry).toBeDefined();
+      expect(expiry?.data_type).toBe('timestamp with time zone');
+      expect(expiry?.is_nullable).toBe('YES');
 
       const primaryKey = await query<{ column_name: string }>(
         `SELECT a.attname AS column_name
@@ -272,9 +307,12 @@ integrationDescribe(
       expect(ownerIndex?.indexdef).toMatch(/requester_id/iu);
       expect(ownerIndex?.indexdef).toMatch(/created_at/iu);
 
-      // 存储层 CHECK 镜像 adapter 契约：状态 / 资源闭集、产物与状态自洽、非空 UUID、字段非空
-      const constraints = await query<{ conname: string }>(
-        `SELECT conname FROM pg_constraint WHERE conrelid = 'public.export_jobs'::regclass AND contype = 'c'`,
+      // 存储层 CHECK 镜像 adapter 契约：状态 / 资源闭集、产物与状态自洽、非空 UUID、字段非空，
+      // 以及 0015 补出的「有效期必须在创建时间之后」（NULL 放行）
+      const constraints = await query<{ conname: string; definition: string | null }>(
+        `SELECT c.conname, pg_get_constraintdef(c.oid) AS definition
+           FROM pg_constraint c
+          WHERE c.conrelid = 'public.export_jobs'::regclass AND c.contype = 'c'`,
       );
       const constraintNames = constraints.map((row) => row.conname);
       for (const expected of [
@@ -285,9 +323,16 @@ integrationDescribe(
         'export_jobs_id_not_nil',
         'export_jobs_requester_id_not_nil',
         'export_jobs_artifact_id_not_nil',
+        'export_jobs_expires_at_after_created_at',
       ]) {
         expect(constraintNames).toContain(expected);
       }
+      const expiryCheck = constraints.find(
+        (row) => row.conname === 'export_jobs_expires_at_after_created_at',
+      );
+      // NULL 必须放行（fail-closed 的合法存储形态），因此约束定义里必须有 IS NULL 分支
+      expect(expiryCheck?.definition).toMatch(/expires_at IS NULL/iu);
+      expect(expiryCheck?.definition).toMatch(/expires_at > created_at/iu);
     }, 60_000);
 
     it('读写闭环：create（入口 pending）→ save（推进 completed + 服务端短引用）→ 按主体取数逐字段往返', async () => {
@@ -299,14 +344,17 @@ integrationDescribe(
       expect(entry.status).toBe(ExportStatus.Pending);
       expect(entry.artifactId).toBeUndefined();
       expect(entry.ownerUserId).toBe(owner);
+      // 服务端有效期随创建写入并如实读回（UTC ISO 形态）
+      expect(entry.expiresAt).toBe(EXPIRES_AT);
 
-      // 库里确实只有一条 pending，且没有产物短引用
-      const stored = await query<{ status: string; artifact_id: string | null }>(
-        'SELECT status, artifact_id FROM export_jobs WHERE id = $1::uuid',
+      // 库里确实只有一条 pending，且没有产物短引用，有效期已经落库
+      const stored = await query<{ status: string; artifact_id: string | null; expires_at: Date }>(
+        'SELECT status, artifact_id, expires_at FROM export_jobs WHERE id = $1::uuid',
         [id],
       );
       expect(stored[0]?.status).toBe(ExportStatus.Pending);
       expect(stored[0]?.artifact_id).toBeNull();
+      expect(stored[0]?.expires_at.toISOString()).toBe(EXPIRES_AT);
 
       const artifactId = randomUUID();
       const completed = await repository().save({
@@ -317,6 +365,8 @@ integrationDescribe(
       });
       expect(completed.status).toBe(ExportStatus.Completed);
       expect(completed.artifactId).toBe(artifactId);
+      // 写回不得改写服务端有效期（不可变列）
+      expect(completed.expiresAt).toBe(EXPIRES_AT);
 
       // 按主体取数：逐字段往返，且返回对象**只有**端口契约的字段
       const mine = await repository().listByOwnerId(owner);
@@ -325,6 +375,7 @@ integrationDescribe(
       expect(Object.keys(mine[0] ?? {}).sort()).toEqual([
         'artifactId',
         'createdAt',
+        'expiresAt',
         'fields',
         'id',
         'ownerUserId',
@@ -333,6 +384,8 @@ integrationDescribe(
         'updatedAt',
       ]);
       // 位置 / 凭据 / 签名 / 原始 PII 字段名一个都不在返回对象上
+      // （`expiresAt` **在**返回对象上：它是服务端有效期，下载边界需要它做判定；
+      //   它只是不进入公开视图，因此它在上面的字段清单里、不在这份禁止清单里）
       for (const forbidden of [
         'fileName',
         'filePath',
@@ -346,7 +399,6 @@ integrationDescribe(
         'resourceSnapshot',
         'filters',
         'errorMessage',
-        'expiresAt',
         'downloadedAt',
         'idempotencyKey',
         'phone',
@@ -356,6 +408,127 @@ integrationDescribe(
       }
       // 时间取服务端时钟（save 改写了 updatedAt），且是 ISO 形态
       expect(mine[0]?.updatedAt).toBe('2026-10-10T00:00:01.000Z');
+    }, 60_000);
+
+    it('服务端有效期：NULL 往返为「字段缺省」，且「有效期必须晚于创建时间」由存储层强制', async () => {
+      const owner = newOwner();
+
+      // 1) 没有服务端有效期（绕过 adapter 直接落 NULL，模拟 0015 之前的历史行）：
+      //    读回来是**字段缺省**，而不是空串 / 哨兵值 —— 下载边界据此 fail-closed
+      const legacyId = await seedRow(owner, {
+        status: ExportStatus.Completed,
+        artifactId: randomUUID(),
+      });
+      const legacy = await repository().findByIdForOwner(legacyId, owner);
+      expect(legacy).toBeDefined();
+      expect(legacy).not.toHaveProperty('expiresAt');
+      const legacyRow = await query<{ expires_at: Date | null }>(
+        'SELECT expires_at FROM export_jobs WHERE id = $1::uuid',
+        [legacyId],
+      );
+      expect(legacyRow[0]?.expires_at).toBeNull();
+
+      // 2) 有服务端有效期：写入 → 读出逐字节往返（`timestamptz` 与 ISO UTC 互为无损形态）
+      const withExpiryId = randomUUID();
+      createdIds.add(withExpiryId);
+      const created = await repository().create(recordFor(withExpiryId, owner));
+      expect(created.expiresAt).toBe(EXPIRES_AT);
+      const readBack = await repository().findByIdForOwner(withExpiryId, owner);
+      expect(readBack?.expiresAt).toBe(EXPIRES_AT);
+
+      // 3) 存储层不变式：有效期**必须晚于创建时间**（NULL 放行）。
+      //    `expires_at <= created_at` 是「一出生就过期」的写坏数据，必须被 CHECK 拒绝（23514）。
+      const expectConstraintViolation = async (parameters: readonly unknown[]): Promise<string> => {
+        try {
+          await (connection as SqlConnection).query(INSERT_WITH_EXPIRY_SQL, parameters);
+        } catch (error) {
+          expect(error).toBeInstanceOf(PostgresExecutorError);
+          return (error as PostgresExecutorError).issues[0]?.code ?? '';
+        }
+        throw new Error('存储层没有拒绝违规写入：CHECK 失效');
+      };
+      const baseCreatedAt = new Date('2026-10-10T00:00:00.000Z');
+      const equalId = (): string => {
+        const value = randomUUID();
+        createdIds.add(value);
+        return value;
+      };
+      /** `created_at` = `updated_at` = 给定时刻；`expires_at` 由调用方给出 */
+      const insertWithExpiry = (
+        id: string,
+        expiresAt: Date,
+        createdAt: Date,
+      ): readonly unknown[] => [
+        id,
+        owner,
+        ExportResource.Profile,
+        [...FIELDS],
+        ExportStatus.Pending,
+        null,
+        expiresAt.toISOString(),
+        createdAt.toISOString(),
+        createdAt.toISOString(),
+      ];
+      // 有效期恰好等于创建时间
+      expect(
+        await expectConstraintViolation(insertWithExpiry(equalId(), baseCreatedAt, baseCreatedAt)),
+      ).toBe('23514');
+      // 有效期早于创建时间
+      expect(
+        await expectConstraintViolation(
+          insertWithExpiry(equalId(), new Date(baseCreatedAt.getTime() - 3_600_000), baseCreatedAt),
+        ),
+      ).toBe('23514');
+      // 反向对照：有效期晚于创建时间是合法写入（证明上面的拒绝来自不变式，而不是「一律拒绝」）
+      const validId = equalId();
+      await (connection as SqlConnection).query(
+        INSERT_WITH_EXPIRY_SQL,
+        insertWithExpiry(validId, new Date(baseCreatedAt.getTime() + 3_600_000), baseCreatedAt),
+      );
+      const validRow = await query<{ expires_at: Date }>(
+        'SELECT expires_at FROM export_jobs WHERE id = $1::uuid',
+        [validId],
+      );
+      expect(validRow[0]?.expires_at.toISOString()).toBe('2026-10-10T01:00:00.000Z');
+    }, 60_000);
+
+    it('迁移 0015 可逆：回滚 DDL 能真的把 expires_at 卸掉（在事务里演练，不动真实 schema）', async () => {
+      // 「可回滚」不是注释里的一句话：本用例把迁移头部登记的**回滚 DDL** 取出来，
+      // 在一次真实事务里执行并核对效果，然后整体 ROLLBACK —— 因此演练完 schema 逐列不变。
+      const migrationPath = resolveMigrationsDirectory();
+      const source = readFileSync(join(migrationPath, '0015_export_jobs_expiry.sql'), 'utf8');
+
+      // 回滚 DDL 必须真的写在迁移里（提取而不是另抄一份，避免两份真相漂移）
+      const rollbackMatch =
+        /ALTER\s+TABLE\s+export_jobs\s+DROP\s+COLUMN\s+IF\s+EXISTS\s+expires_at/iu.exec(source);
+      expect(rollbackMatch?.[0]).toBeDefined();
+
+      const columnExists = async (executor: SqlExecutor): Promise<boolean> => {
+        const rows = await executor.query<{ present: boolean }>(
+          `SELECT EXISTS (
+             SELECT 1 FROM information_schema.columns
+              WHERE table_schema = 'public' AND table_name = $1 AND column_name = 'expires_at'
+           ) AS present`,
+          [POSTGRES_EXPORT_TABLE],
+        );
+        return rows.rows[0]?.present === true;
+      };
+
+      // 演练必须**整体回滚**：`transaction()` 只在回调抛错时才 ROLLBACK，因此这里刻意抛出一个
+      // 哨兵错误 —— 若回调正常返回，事务会 COMMIT，回滚 DDL 就会被真的提交（把真实 schema 改坏）。
+      // 这也是「回滚 DDL 只能用于降级演练、不能顺手提交」这条纪律的可执行形态。
+      const ROLLBACK_SENTINEL = 'RM_EXPORT_0015_ROLLBACK_DRILL';
+      await expect(
+        (connection as SqlConnection).transaction(async (executor) => {
+          expect(await columnExists(executor)).toBe(true);
+          // 回滚语句由迁移文件本身给出（正则大小写不敏感，这里按文件原文执行）
+          await executor.query(rollbackMatch?.[0] ?? '');
+          expect(await columnExists(executor)).toBe(false);
+          throw new Error(ROLLBACK_SENTINEL);
+        }),
+      ).rejects.toThrow(ROLLBACK_SENTINEL);
+      // 事务已回滚：真实 schema 仍然有该列（演练不产生持久影响）
+      expect(await columnExists(connection as SqlConnection)).toBe(true);
     }, 60_000);
 
     it('归属隔离：多个主体同表时只返回请求主体的记录；跨主体写回一行都写不中，他人记录不出库', async () => {

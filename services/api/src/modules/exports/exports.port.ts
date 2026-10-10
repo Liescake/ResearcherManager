@@ -9,7 +9,9 @@
  *
  * **真实文件生成、字段级脱敏、有效期与清理、管理端 `POST /admin/exports`**
  * （`export:{resource}:create`，见 docs/P2-API契约基线.md §「统计、导出、配置」）仍属于后续切片：
- * 下载切片只把「已完成导出的产物能不能被本人取走」这一段收敛到契约内，
+ * 下载切片只把「已完成导出的产物能不能被本人取走」这一段收敛到契约内
+ * （含**服务端有效期**：创建时由服务端写入、下载时按绝对时刻判定，过期与不存在同形收敛到统一拒绝；
+ * **清理 / 回收 / 撤销 / 续期**仍属后续切片），
  * 产物内容由 `ExportArtifactStore` 的显式端口给出（真实实现留给后续切片），
  * 本切片**不伪造生产文件下载**，也不声称任何实现可生产可用。
  *
@@ -84,11 +86,26 @@ export function isExportStatus(value: unknown): value is ExportStatus {
  * - `id` / `artifactId`：服务端生成的主键与产物句柄（UUID），非客户端输入；
  * - `ownerUserId`：会话主体（`SESSION_SUBJECT_RESOLVER` 解析值），非客户端输入；
  * - `status`：由状态机写入（入口恒为 `pending`），客户端提交同名字段一律 400；
- * - `createdAt` / `updatedAt`：服务端时钟。
+ * - `createdAt` / `updatedAt`：服务端时钟；
+ * - `expiresAt`：**服务端创建**的产物有效期（绝对时刻，见下）。
  *
  * 记录里**没有**文件名、路径、下载地址与存储 key：产物位置只存在于
  * `ExportArtifactStore` 内部（内存基线里是内部 Map 的存储键），
  * 因此「输出泄露文件路径 / 内部存储」在数据结构层面就没有可泄露的字段来源。
+ *
+ * ## `expiresAt`：服务端创建、只读、fail-closed
+ *
+ * - **服务端创建**：值由 service 在创建入口用**服务端时钟**算出（`now + EXPORT_DOWNLOAD_TTL_MS`），
+ *   与 `createdAt` 取自同一次时钟读取；客户端提交的 `expiresAt`（请求体或查询串）一律 400，
+ *   该列在写回（`save`）路径上属于**不可变列**，谁都不能改写它；
+ * - **绝对时刻语义**：值是 UTC 的 ISO 8601（`YYYY-MM-DDTHH:mm:ss.sssZ`），比较的是**瞬时点**，
+ *   与本地时区 / 夏令时无关；存储侧对应 `timestamptz`（见 `db/migrations/0015_export_jobs_expiry.sql`）；
+ * - **可选（fail-closed）**：存储里该列可缺省（数据库 `NULL` 的领域形）。缺省**不表示永不过期**，
+ *   而是「没有可用的服务端有效期」：下载边界把「缺省 / 非法形态 / 早于当前时刻」一律判为不可下载，
+ *   并与「不存在 / 跨主体 / 未完成 / 产物缺失」收敛到**同一个稳定拒绝**，因此既不会放行，
+ *   也不会泄露「这条导出是否存在、处于什么状态」；
+ * - **绝不进入公开视图**：到期时刻不外发（`EXPORT_REQUEST_VIEW_FIELDS` 里没有它），
+ *   与 `ownerUserId` / `artifactId` 同属「只承载、不外发」的内部事实。
  */
 export interface ExportRequest {
   readonly id: string;
@@ -102,6 +119,11 @@ export interface ExportRequest {
   readonly status: ExportStatus;
   /** 服务端产物句柄（仅 `completed` 存在）：**不透明标识**，绝不进入任何 API 输出 */
   readonly artifactId?: string;
+  /**
+   * 服务端产物有效期（UTC ISO 8601 绝对时刻，服务端唯一写入方）：
+   * 缺省 = 存储侧 `NULL` = 「没有可用的服务端有效期」⇒ 下载边界 fail-closed。
+   */
+  readonly expiresAt?: string;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -174,7 +196,11 @@ export interface ExportRepository {
    * - `id` 来自服务端已通过形态校验的路由参数，`ownerUserId` 只来自服务端会话主体；
    * - **归属必须下推进存储**（SQL：`WHERE id = $1 AND requester_id = $2`）；
    * - 记录不存在**或不属于该主体**都返回 `undefined`（两者不可区分，因此不会泄露存在性）；
-   * - 返回的记录不经过任何公开视图裁剪，调用方必须自行复核读取契约与归属；
+   * - 返回的记录不经过任何公开视图裁剪，调用方必须自行复核读取契约与归属，
+   *   并**自行判定服务端有效期**（`expiresAt` 由本端口原样承载，可以是缺省 = 存储 `NULL`）；
+   *   本端口**不做**过期过滤：过期与否是下载边界的判定，不是取数语义（把过期做成
+   *   「取不到」会让「不存在」与「已过期」在端口层就不可区分，也让内存基线与数据库实现的
+   *   语义凭空多出一处需要同步的实现细节）；
    * - 存储故障（执行器异常、行契约损坏、ID 不在存储域）必须**抛错**（fail-closed），
    *   绝不能被伪装成「不存在」。
    */
@@ -365,8 +391,8 @@ export const EXPORT_ARTIFACT_STORE = Symbol('EXPORT_ARTIFACT_STORE');
  * 下载审计结果**闭集**：只记「这次下载尝试的结果码」，不记原因、不记任何业务取值。
  *
  * - `success`：内容已交付；
- * - `unavailable`：**统一安全拒绝**（不存在 / 跨主体 / 未完成 / 产物缺失收敛到同一结果），
- *   因此审计本身也不泄露「该导出是否存在、处于什么状态」；
+ * - `unavailable`：**统一安全拒绝**（不存在 / 跨主体 / 未完成 / 产物缺失 / 已过期 / 无服务端有效期
+ *   收敛到同一结果），因此审计本身也不泄露「该导出是否存在、处于什么状态、是否已过期」；
  * - `failed`：fail-closed（产物读取故障、内容超过硬上限、存储记录违反读取契约）；
  * - 未登记取值一律视为存储损坏，绝不作为合法结果外发。
  */

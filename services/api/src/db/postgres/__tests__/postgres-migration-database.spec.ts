@@ -229,6 +229,7 @@ describe('createPostgresMigrationDatabase：全新数据库（记账表缺失）
       '0012',
       '0013',
       '0014',
+      '0015',
     ]);
     expect(report.appliedAfter).toEqual([
       '0001',
@@ -245,6 +246,7 @@ describe('createPostgresMigrationDatabase：全新数据库（记账表缺失）
       '0012',
       '0013',
       '0014',
+      '0015',
     ]);
 
     // 记账表由 0001 建立，且建表之后就写入了 0001 的记账行（同事务）
@@ -259,7 +261,7 @@ describe('createPostgresMigrationDatabase：全新数据库（记账表缺失）
     ]);
 
     // 每条迁移一个事务；事务外只有「读记账表」两次（执行前 / 执行后）
-    expect(connection.transactions).toBe(14);
+    expect(connection.transactions).toBe(15);
     expect(connection.outsideStatements).toEqual([
       SCHEMA_MIGRATIONS_SELECT_SQL,
       SCHEMA_MIGRATIONS_SELECT_SQL,
@@ -292,6 +294,7 @@ describe('createPostgresMigrationDatabase：全新数据库（记账表缺失）
       '0012',
       '0013',
       '0014',
+      '0015',
     ]);
     expect(status.upToDate).toBe(false);
 
@@ -349,6 +352,7 @@ describe('createPostgresMigrationDatabase：重复 status 与幂等重跑', () =
       '0012',
       '0013',
       '0014',
+      '0015',
     ];
     expect(first.applied).toEqual(versions);
     expect(first.upToDate).toBe(true);

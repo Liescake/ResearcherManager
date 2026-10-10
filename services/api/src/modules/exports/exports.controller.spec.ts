@@ -34,6 +34,7 @@ import {
 import {
   EXPORTABLE_FIELDS,
   EXPORTABLE_FIELD_NAME_VALUES,
+  EXPORT_DOWNLOAD_TTL_MS,
   EXPORT_MAX_FIELD_COUNT,
   EXPORT_QUERY_FIELDS,
   EXPORT_REQUEST_INTEGRITY_MESSAGE,
@@ -149,6 +150,21 @@ const FORGED_DOWNLOAD_URL =
 const FORGED_STORAGE_HANDLE = 'arn:aws:s3:::internal-bucket/exports/secret-export.csv';
 /** 客户端伪造的传输层跟踪 ID：只作为响应 meta，不进入存储 */
 const FORGED_REQUEST_ID = 'client-trace-00000001';
+/**
+ * 客户端伪造的**服务端有效期**（远期）：有效期是服务端独占事实，请求体/查询串里出现它
+ * 必须 400 且不回显；存储里的有效期必须仍然是服务端签发的值。
+ */
+const FORGED_EXPIRES_AT = '2099-12-31T23:59:59.000Z';
+
+/**
+ * 服务端有效期夹具（未来 1 小时）：种子记录默认**有效**。
+ *
+ * 相对当前时刻派生而不是硬编码日期：有效期是「相对服务端当前时钟」的性质，
+ * 硬编码的未来日期会在某天变成过去，让成功用例悄悄变成过期用例。
+ */
+function futureExpiry(offsetMs = 3_600_000): string {
+  return new Date(Date.now() + offsetMs).toISOString();
+}
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 /** 500 的统一对外文案（内部完整性文案绝不外发） */
@@ -214,6 +230,8 @@ function fixtureExportRequest(overrides: Partial<ExportRequest> = {}): ExportReq
     fields: profileFields(),
     status: ExportStatus.Completed,
     artifactId: randomUUID(),
+    // 种子记录默认带**服务端签发的未来有效期**：下载成功路径必须真的在有效期内
+    expiresAt: futureExpiry(),
     createdAt: '2026-01-06T00:00:00.000Z',
     updatedAt: '2026-01-06T00:00:05.000Z',
   };
@@ -516,9 +534,9 @@ describe('导出切片：成功路径（真实 HTTP + 统一响应信封）', ()
     expect(view.updatedAt <= after).toBe(true);
     expect(view.createdAt <= view.updatedAt).toBe(true);
 
-    // 归属、产物句柄与产物位置都不随响应回传
+    // 归属、产物句柄、**服务端有效期**与产物位置都不随响应回传（有效期是服务端判定用的事实）
     const content = contentText(res);
-    for (const field of ['ownerUserId', 'userId', 'roles', 'scope', 'groupId']) {
+    for (const field of ['ownerUserId', 'userId', 'roles', 'scope', 'groupId', 'expiresAt']) {
       expect(content).not.toContain(`"${field}"`);
     }
     expect(content).not.toContain(STUDENT_1);
@@ -533,6 +551,18 @@ describe('导出切片：成功路径（真实 HTTP + 统一响应信封）', ()
     expect(saved?.ownerUserId).toBe(STUDENT_1);
     expect(saved?.fields).toEqual(profileFields());
     expect(saved?.artifactId).toMatch(UUID_PATTERN);
+    // **服务端签发有效期**：恰好是 createdAt + 服务端 TTL（UTC 绝对时刻），
+    // 且请求体/查询串里的任何客户端取值都不参与（伪造值已在闭集门禁处 400）
+    expect(saved?.expiresAt).toBeDefined();
+    expect(saved?.expiresAt).toBe(
+      new Date(Date.parse(String(saved?.createdAt)) + EXPORT_DOWNLOAD_TTL_MS).toISOString(),
+    );
+    expect(saved?.expiresAt).not.toBe(FORGED_EXPIRES_AT);
+    expect(Date.parse(String(saved?.expiresAt))).toBeGreaterThan(
+      Date.parse(String(saved?.createdAt)),
+    );
+    // 有效期不在响应里回显（也不作为响应头）
+    expect(res.text).not.toContain(String(saved?.expiresAt));
 
     const descriptor = app.artifacts.findArtifactDescriptor(saved?.artifactId ?? '');
     expect(descriptor).toBeDefined();
@@ -936,6 +966,12 @@ describe('导出切片：输入拒绝 400（VALIDATION_FAILED，不取数/不落
       leaked: '2026-01-01T00:00:00.000Z',
     },
     {
+      name: 'expiresAt（有效期只由服务端签发）',
+      body: { resource: ExportResource.Profile, expiresAt: FORGED_EXPIRES_AT },
+      expected: '禁止设置服务端字段 expiresAt',
+      leaked: FORGED_EXPIRES_AT,
+    },
+    {
       name: 'rows（导出内容）',
       body: { resource: ExportResource.Profile, rows: [PII_SECRET] },
       expected: '禁止设置服务端字段 rows',
@@ -1030,6 +1066,11 @@ describe('导出切片：输入拒绝 400（VALIDATION_FAILED，不取数/不落
         query: `storageHandle=${encodeURIComponent(FORGED_STORAGE_HANDLE)}`,
         expected: '禁止使用查询参数 storageHandle',
         leaked: FORGED_STORAGE_HANDLE,
+      },
+      {
+        query: `expiresAt=${encodeURIComponent(FORGED_EXPIRES_AT)}`,
+        expected: '禁止使用查询参数 expiresAt',
+        leaked: FORGED_EXPIRES_AT,
       },
       { query: 'page=1&pageSize=10', expected: '本端点不接受查询参数 page' },
     ];
@@ -2091,7 +2132,7 @@ describe('导出切片：装配边界与纯函数门禁', () => {
     );
   });
 
-  it('内存仓储：主键唯一、未知 ID 不可更新、归属不可改写、按主体取数、无删除入口、返回副本', async () => {
+  it('内存仓储：主键唯一、未知 ID 不可更新、归属与有效期不可改写、按主体取数、无删除入口、返回副本', async () => {
     const repository = new InMemoryExportRepository(loadEnv({}));
     const record = fixtureExportRequest();
     await repository.create(record);
@@ -2109,6 +2150,13 @@ describe('导出切片：装配边界与纯函数门禁', () => {
     await expect(
       repository.save(fixtureExportRequest({ id: record.id, ownerUserId: STUDENT_2 })),
     ).rejects.toThrow(/导出请求归属不一致/u);
+
+    // **服务端有效期不得在写回中被改写**（续期 / 清空都被拒绝）：
+    // 与数据库 adapter 的 `expires_at` 不可变列 + 写回逐列复核同语义，
+    // 否则「把已过期的交付物续期回可下载状态」会成为一条静默可达的路径
+    await expect(
+      repository.save({ ...record, expiresAt: futureExpiry(7_200_000) }),
+    ).rejects.toThrow(/有效期不可改写/u);
 
     // 本切片没有删除/归档能力
     for (const forbidden of ['update', 'delete', 'remove', 'archive', 'softDelete']) {
@@ -2246,6 +2294,16 @@ describe('导出切片：装配边界与纯函数门禁', () => {
       { record: { ...valid, path: FORGED_PATH }, path: 'path' },
       { record: { ...valid, storageKey: FORGED_STORAGE_KEY }, path: 'storageKey' },
       { record: { ...valid, fileName: FORGED_FILE_NAME }, path: 'fileName' },
+      // 服务端有效期：非法形态属于存储被写坏 ⇒ 读取契约违规（fail-closed 500）；
+      // 注意**缺省不是违规**（见下面的显式断言）：缺省是「没有服务端有效期」的合法存储形态，
+      // 由下载边界统一 404，而不是把记录判成损坏（那会泄露「记录存在但缺字段」）
+      { record: { ...valid, expiresAt: '2026/01/07' }, path: 'expiresAt' },
+      { record: { ...valid, expiresAt: 'not-a-time' }, path: 'expiresAt' },
+      { record: { ...valid, expiresAt: '2026-01-07' }, path: 'expiresAt' },
+      { record: { ...valid, expiresAt: '2026-01-07T00:00:00.000+08:00' }, path: 'expiresAt' },
+      { record: { ...valid, expiresAt: 1767744000000 }, path: 'expiresAt' },
+      { record: { ...valid, expiresAt: null }, path: 'expiresAt' },
+      { record: { ...valid, expiresAt: '' }, path: 'expiresAt' },
     ];
 
     for (const { record, path } of cases) {
@@ -2280,6 +2338,15 @@ describe('导出切片：装配边界与纯函数门禁', () => {
         ).ok,
       ).toBe(true);
     }
+
+    // 有效期是**可选**字段：缺省（存储 NULL / 本迁移之前的历史行）仍然是合法记录，
+    // 由下载边界 fail-closed；把它判成违规会让拒绝从稳定的 404 变成 500。
+    const { expiresAt: _expiresAt, ...withoutExpiry } = fixtureExportRequest();
+    expect(parseStoredExportRequest(withoutExpiry).ok).toBe(true);
+    // 合法未来时刻同样是合法记录
+    expect(
+      parseStoredExportRequest(fixtureExportRequest({ expiresAt: FORGED_EXPIRES_AT })).ok,
+    ).toBe(true);
   });
 
   it('请求体/查询串闭集门禁：无输入不报错，服务端字段与未声明字段给出可区分的拒绝原因', () => {

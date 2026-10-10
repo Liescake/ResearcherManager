@@ -158,6 +158,7 @@ describe('readMigrationDirectory：与仓库真实迁移对齐', () => {
       '0012_user_compliance.sql',
       '0013_export_jobs.sql',
       '0014_ai_match_records_guards.sql',
+      '0015_export_jobs_expiry.sql',
     ]);
     expect(descriptors.map((item) => item.version)).toEqual([
       '0001',
@@ -174,10 +175,12 @@ describe('readMigrationDirectory：与仓库真实迁移对齐', () => {
       '0012',
       '0013',
       '0014',
+      '0015',
     ]);
     // 全部迁移都必须是「可回滚」：建表迁移由 DROP TABLE IF EXISTS 恢复，约束迁移由
-    // ALTER TABLE ... DROP CONSTRAINT IF EXISTS 恢复
+    // ALTER TABLE ... DROP CONSTRAINT IF EXISTS 恢复，加列迁移由 DROP COLUMN IF EXISTS 恢复
     expect(descriptors.map((item) => item.reversible)).toEqual([
+      true,
       true,
       true,
       true,
@@ -232,6 +235,29 @@ describe('readMigrationDirectory：与仓库真实迁移对齐', () => {
     }
     expect(matchingConstraintMigration).not.toMatch(/CREATE\s+TABLE\b/iu);
     expect(matchingConstraintMigration).not.toMatch(/CREATE\s+(?:UNIQUE\s+)?INDEX\b/iu);
+
+    // 0015 是**加列迁移**（不建表、不建索引）：它必须真的给 0013 建出的 export_jobs 加出
+    // 服务端有效期列与服务端有效期不变式，而不是只在注释里声明
+    const expiryMigration = readFileSync(
+      join(repoRoot, 'db', 'migrations', '0015_export_jobs_expiry.sql'),
+      'utf8',
+    );
+    expect(expiryMigration).toMatch(/ALTER\s+TABLE\s+export_jobs\b/iu);
+    expect(expiryMigration).toMatch(
+      /ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+expires_at\s+timestamptz/iu,
+    );
+    expect(expiryMigration).toContain('ADD CONSTRAINT export_jobs_expires_at_after_created_at');
+    // 过期判定是 fail-closed 的：列必须可空（NULL 表示「没有服务端有效期」），
+    // 因此加列语句里不得出现 NOT NULL，也不得给 DEFAULT（存储层不得自行发明有效期）
+    const addColumn = /ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+expires_at[^;]*/iu.exec(
+      expiryMigration,
+    )?.[0];
+    expect(addColumn).toBeDefined();
+    expect(addColumn).not.toMatch(/\bNOT\s+NULL\b/iu);
+    expect(addColumn).not.toMatch(/\bDEFAULT\b/iu);
+    // 列迁移不得顺手建表 / 建索引（一份迁移只做一件事）
+    expect(expiryMigration).not.toMatch(/CREATE\s+TABLE\b/iu);
+    expect(expiryMigration).not.toMatch(/CREATE\s+(?:UNIQUE\s+)?INDEX\b/iu);
 
     // 0008 是**约束补齐**（不建表）：它必须真的给 0004 建出的表加约束，而不是只在注释里声明
     const constraintMigration = readFileSync(

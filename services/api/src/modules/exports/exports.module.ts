@@ -23,9 +23,10 @@ import { ExportsService } from './exports.service';
  * - `GET  /me/exports` 本人导出请求列表与状态；
  * - `GET  /me/exports/:exportId/download` 下载本人已完成导出的产物内容。
  *
- * 真实文件生成与字段级脱敏、有效期与清理、管理端 `POST /admin/exports`
- * （`export:{resource}:create`）、列表分页与筛选属于后续切片，必须继续留在本模块内，
- * 不得跨模块直接调用其他领域模块的仓储（导出范围只由本模块的服务端字段白名单决定）。
+ * 真实文件生成与字段级脱敏、**过期产物的清理**（本切片只落地服务端有效期与过期拒绝）、
+ * 管理端 `POST /admin/exports`（`export:{resource}:create`）、列表分页与筛选属于后续切片，
+ * 必须继续留在本模块内，不得跨模块直接调用其他领域模块的仓储（导出范围只由本模块的服务端
+ * 字段白名单决定）。
  *
  * 依赖方向（单向、无环，见 `access-control.module.spec.ts` 的模块图回归）：
  * `exports → access-control（AuthorizationGuard）→ ruoyi-adapter（端口）→ authorization-policy`
@@ -35,7 +36,7 @@ import { ExportsService } from './exports.service';
  * | 条件 | 绑定 | 依据 |
  * |---|---|---|
  * | 未解析出 `DATABASE_URL` | `InMemoryExportRepository` | 开发/测试保持现状；生产环境它自身拒绝构造 |
- * | 已解析出 `DATABASE_URL` 且有 `SQL_CONNECTION_FACTORY` | `createLazyPostgresExportRepository` | 延迟建连（`export_jobs`，迁移 `0013`）；生产准入由启动期依赖就绪门禁判定 |
+ * | 已解析出 `DATABASE_URL` 且有 `SQL_CONNECTION_FACTORY` | `createLazyPostgresExportRepository` | 延迟建连（`export_jobs`，迁移 `0013` 建表、`0015` 补服务端有效期列 `expires_at`）；生产准入由启动期依赖就绪门禁判定 |
  * | 已解析出 `DATABASE_URL` 但没有执行器工厂 | **抛错** | fail-closed：绝不悄悄退回内存导出存储 |
  *
  * 「延迟建连」很关键：装配阶段不碰数据库，所以「数据库已配置但执行器未 attest / 依赖未就绪」

@@ -21,7 +21,9 @@ import {
   buildExportDownloadFilename,
   digestExportId,
   exportDownloadIdSchema,
+  exportExpiresAtFrom,
   exportRequestInputSchema,
+  isExportDownloadExpired,
   parseExportRequestView,
   parseStoredExportRequest,
   readArtifactId,
@@ -85,17 +87,23 @@ import { EXPORT_ENTRY_STATUS, assertExportTransition } from './exports.state-mac
  *    视图**不含**归属、产物句柄、文件名、路径、下载地址与存储 key（那些字段在记录里就不存在）。
  * 7. **下载只交付内容，不交付位置**（`GET /me/exports/:exportId/download`）：
  *    - 归属同时来自**会话主体**与**服务端记录**（取数语句把归属下推进存储：`findByIdForOwner`），
- *      客户端提交的 `userId` / `ownerUserId` / `artifactId` / `fileUrl` / 自定义路径与自定义头
- *      一律不参与判定（查询串闭集直接 400，控制器也不读任何自定义头）；
- *    - 「不存在 / 跨主体 / 未完成 / 产物缺失 / 空产物」收敛到**同一个稳定拒绝**（404 + 同一条文案），
- *      因此拒绝本身不泄露存在性或状态；仓储故障、产物读取故障、内容超限、
- *      存储记录违约则是 fail-closed 500（不把基础设施故障伪装成业务结论）；
+ *      客户端提交的 `userId` / `ownerUserId` / `artifactId` / `fileUrl` / `expiresAt` / 自定义路径与
+ *      自定义头一律不参与判定（查询串闭集直接 400，控制器也不读任何自定义头）；
+ *    - 「不存在 / 跨主体 / 未完成 / 产物缺失 / 空产物 / **已过期** / **无服务端有效期**」收敛到
+ *      **同一个稳定拒绝**（404 + 同一条文案 + 同一个审计结果码），因此拒绝本身不泄露存在性、
+ *      状态或「是否已过期」；仓储故障、产物读取故障、内容超限、存储记录违约则是 fail-closed 500
+ *      （不把基础设施故障伪装成业务结论）；
+ *    - **有效期是服务端独占事实**：`expiresAt` 由 service 在创建入口用服务端时钟算出
+ *      （`createdAt + EXPORT_DOWNLOAD_TTL_MS`，UTC 绝对时刻），客户端提交的同名字段一律 400，
+ *      写回路径不改写它；下载时只读一次服务端时钟做**绝对时刻**比较，边界时刻判为过期，
+ *      缺省 / 非法形态按 fail-closed 拒绝（绝不解释成「永不过期」）；
  *    - 产物内容由 `ExportArtifactStore.read` 给出：**只有字节**，没有 storage key / 路径 /
  *      下载地址 / 签名地址；响应头取值（Content-Type / Content-Disposition 文件名）由服务端
  *      常量派生并再过一次「控制字符 / 路径 / 引号」门禁，命中即 500 且一个字节都不写出；
  *    - 内容有**硬上限**（`EXPORT_DOWNLOAD_MAX_BYTES`），超限不截断、不分片、不流式降级；
  *    - 下载留痕只写**脱敏三元组**（服务端生成的 requestId、导出 ID 的单向摘要、结果码），
- *      不写内容、产物位置、归属、请求侧输入或 PII；留痕失败即 500（不做「没有留痕的成功下载」）。
+ *      不写内容、产物位置、有效期、归属、请求侧输入或 PII；留痕失败即 500
+ *      （不做「没有留痕的成功下载」）。
  *
  * 授权口径（已知偏差，与审计/通知/统计切片的处理同构，属后续版本项）：权限目录是**闭集**
  * （docs/P2-权限目录与状态机.md §1「未列出即拒绝」），其中 `export:{resource}:create` 的默认范围
@@ -110,7 +118,8 @@ import { EXPORT_ENTRY_STATUS, assertExportTransition } from './exports.state-mac
  * 属后续版本项；本切片**不新增权限点**。`resource=profile` 时入口与资源两段门控点相同：
  * 两段语义独立（入口 = 本人导出入口；资源 = 该资源的本人读取），重复判定不改变结果。
  *
- * 尚不包含（明确留给后续切片）：真实文件生成与字段级脱敏、文件有效期与清理、
+ * 尚不包含（明确留给后续切片）：真实文件生成与字段级脱敏、**过期产物的清理 / 回收**
+ * （本切片只判定「过期即拒绝下载」，不做删除、不做撤销、不做游标）、有效期续期或撤销入口、
  * 管理端 `POST /admin/exports` 与按资源/范围的导出、列表分页与筛选、
  * 幂等键与元数据落库、下载限流与审计的持久化查询面。
  * 下载切片已落地的是**交付边界**本身（归属、状态、授权、硬上限、响应头、留痕脱敏），
@@ -182,9 +191,15 @@ export class ExportsService {
     // 6. 字段白名单归一化（白名单之外的取值一律 400，且不回显取值）
     const fields = resolveExportFields(input.resource, input.fields);
 
-    const now = new Date().toISOString();
+    // 7. **服务端时钟只读一次**：`createdAt` 与 `expiresAt` 必须来自同一次读取，
+    //    否则「有效期在创建时间之后」这条存储层不变式会因为两次时钟读取的漂移而出现边界噪音。
+    //    `expiresAt` 由服务端 TTL 派生（UTC 绝对时刻），**绝不取自请求体**：
+    //    客户端的同名字段在闭集门禁处就已经 400（见 exports.contract.ts 的禁止字段清单）。
+    const nowMs = Date.now();
+    const now = new Date(nowMs).toISOString();
+    const expiresAt = exportExpiresAtFrom(nowMs);
 
-    // 7. 入口记录：状态恒为 pending、无产物句柄；此时不得声称导出已生成
+    // 8. 入口记录：状态恒为 pending、无产物句柄；此时不得声称导出已生成
     const exportRequestId = randomUUID();
     const created = await this.repository.create({
       id: exportRequestId,
@@ -192,21 +207,23 @@ export class ExportsService {
       resource: input.resource,
       fields,
       status: EXPORT_ENTRY_STATUS,
+      expiresAt,
       createdAt: now,
       updatedAt: now,
     });
 
-    // 8. 入口写回复核（**先于任何产物副作用**）：仓储返回的记录必须与本次写入同一身份与范围。
-    //    被替换的记录（他人归属/别的资源/别的字段）说明存储或调用链已损坏：立即 500，
+    // 9. 入口写回复核（**先于任何产物副作用**）：仓储返回的记录必须与本次写入同一身份与范围。
+    //    被替换的记录（他人归属/别的资源/别的字段/别的有效期）说明存储或调用链已损坏：立即 500，
     //    绝不为他人或别的导出范围产出服务端产物。
     this.assertRecordedEntry(created, {
       id: exportRequestId,
       ownerUserId: subject.userId,
       resource: input.resource,
       fields,
+      expiresAt,
     });
 
-    // 9. 状态机门禁：本切片在同一个请求内把 `pending` 推进到终态，因此「推进目标」是服务端常量
+    // 10. 状态机门禁：本切片在同一个请求内把 `pending` 推进到终态，因此「推进目标」是服务端常量
     //    `completed`；仓储若返回非 `pending` 记录（重复处理 / 数据被改写）→ 409
     //    `STATE_TRANSITION_INVALID`。产物生成失败时结论改判 `failed`
     //    （`pending -> failed` 同样由状态机表允许）。
@@ -214,12 +231,15 @@ export class ExportsService {
 
     const outcome = this.materialize(created);
 
-    // 10. 写回结论。**唯一的错误边界**：端口在条件写入未命中（并发重复推进 / 记录已到终态）时
+    // 11. 写回结论。**唯一的错误边界**：端口在条件写入未命中（并发重复推进 / 记录已到终态）时
     //     按端口标记 `EXPORT_TRANSITION_REJECTED` 抛错，这是客户端可见冲突，必须映射为与状态机
     //     门禁**同一个** 409 `STATE_TRANSITION_INVALID`，而不是冒泡成 500。判定只读结构化 `code`，
     //     不解析消息、不匹配错误名：错误消息里的 SQL / 归属 / 路径 / PII 既不参与判定也不外发。
     //     其余失败（未知 id / 归属不符 / 行契约损坏 / 执行器故障）仍是服务端缺陷，原样向上抛，
     //     由统一出口 fail-closed 为 500。
+    //     注意 `expiresAt` 随 `...created` 一起回写：有效期是**不可变**的服务端事实，
+    //     写回路径不得改写它（数据库 adapter 的 `POSTGRES_EXPORT_IMMUTABLE_COLUMNS` 是同一规则的
+    //     存储层镜像：写回后逐列复核，被改写即 fail-closed）。
     let saved: ExportRequest;
     try {
       saved = await this.repository.save({
@@ -235,7 +255,7 @@ export class ExportsService {
       throw error;
     }
 
-    // 11. 写回复核：仓储必须如实持久化本次结论（状态与产物句柄）
+    // 12. 写回复核：仓储必须如实持久化本次结论（状态与产物句柄）
     this.assertRecordedOutcome(saved, outcome);
 
     return this.toOwnedView(saved, subject.userId);
@@ -247,19 +267,22 @@ export class ExportsService {
    * 判定顺序（被测试固定）：
    * 1. 入口授权（服务端常量，`profile:self:read` + `SELF`）→ 拒绝即 403，此时**仓储、产物存储、
    *    审计出口一次都不会被调用**；
-   * 2. 查询串闭集：任何查询参数（`?userId=`/`?ownerUserId=`/`?artifactId=`/`?fileUrl=`/`?path=`…）
-   *    一律 400，且**不回显取值**；自定义头从不进入判定（控制器只读 `authorization`）；
+   * 2. 查询串闭集：任何查询参数（`?userId=`/`?ownerUserId=`/`?artifactId=`/`?fileUrl=`/`?path=`/
+   *    `?expiresAt=`…）一律 400，且**不回显取值**；自定义头从不进入判定（控制器只读 `authorization`）；
    * 3. 路径参数形态：非 UUID 与「不存在」走**同一个拒绝出口**（不进任何存储）；
    * 4. 取数：`findByIdForOwner(exportId, subject.userId)` —— 归属来自**会话主体**并下推进存储，
    *    因此「他人的导出」与「不存在的导出」不可区分（都是 `undefined`）；
    * 5. 读取契约 + 归属复核（纵深防御）→ 违规即 fail-closed 500；
    * 6. 状态必须为 `completed` 且有服务端产物句柄，否则收敛到统一拒绝；
-   * 7. 资源级授权（权限点由**记录里的服务端资源**映射）；
-   * 8. 产物读取：故障 fail-closed，缺失（或空内容）收敛到统一拒绝，超过硬上限 fail-closed；
-   * 9. 响应头取值由服务端常量派生并通过「控制字符 / 路径 / 引号」门禁；
-   * 10. 留痕（脱敏三元组）成功后返回内容 —— **留痕失败即 500**。
+   * 7. **服务端有效期**必须存在且严格晚于服务端当前时刻，否则收敛到**同一个**统一拒绝
+   *    （`expiresAt` 缺失 = 存储 `NULL` ⇒ fail-closed；边界时刻判为过期）；
+   * 8. 资源级授权（权限点由**记录里的服务端资源**映射）；
+   * 9. 产物读取：故障 fail-closed，缺失（或空内容）收敛到统一拒绝，超过硬上限 fail-closed；
+   * 10. 响应头取值由服务端常量派生并通过「控制字符 / 路径 / 引号」门禁；
+   * 11. 留痕（脱敏三元组）成功后返回内容 —— **留痕失败即 500**。
    *
-   * 返回的载荷只含**内容字节**与两个服务端常量派生值（文件名、内容类型），不含存储位置。
+   * 返回的载荷只含**内容字节**与两个服务端常量派生值（文件名、内容类型），不含存储位置，
+   * 也不含有效期：到期时刻是服务端判定用的事实，不进响应体也不进响应头。
    */
   async downloadMyExport(
     subject: AuthorizationSubject,
@@ -313,10 +336,26 @@ export class ExportsService {
       return this.rejectDownload(requestId, exportIdDigest);
     }
 
-    // 9. 资源级授权：权限点由记录里的服务端资源映射，客户端无法影响
+    // 9. **服务端有效期门禁**（唯一判定点，纯函数，见 `isExportDownloadExpired`）：
+    //    - 时钟：只读一次服务端时钟（`Date.now()`，UTC 瞬时点），客户端提交的任何时间类取值
+    //      都不参与判定（`?expiresAt=` 在查询串闭集处就已经 400）；
+    //    - 比较：绝对时刻比较（存储值由 `exportExpiresAtFrom` 产出为 UTC ISO `Z` 形态），
+    //      因此与本地时区 / 夏令时无关；边界时刻**判为过期**（没有「到期后还能取走一次」的窗口）；
+    //    - **fail-closed**：`expiresAt` 缺失（数据库 `NULL` 的领域形）或形态非法都判为不可下载，
+    //      绝不解释成「永不过期」；
+    //    - **不泄露存在性**：过期与「不存在 / 跨主体 / 未完成 / 产物缺失」收敛到**同一个**稳定拒绝
+    //      （同一状态码、同一错误码、同一文案、同一审计结果码），因此调用方无法据此区分
+    //      「这条导出不存在」与「它已过期」；过期判定刻意排在**资源级授权之前**，
+    //      使「已过期」在任何权限状态下都是同一个 404，不会因权限差异变成 403 而暴露状态。
+    const nowMs = Date.now();
+    if (isExportDownloadExpired(parsed.value.expiresAt, nowMs)) {
+      return this.rejectDownload(requestId, exportIdDigest);
+    }
+
+    // 10. 资源级授权：权限点由记录里的服务端资源映射，客户端无法影响
     this.authorizeResource(subject, parsed.value.resource);
 
-    // 10. 产物读取：故障 fail-closed；缺失收敛到统一拒绝
+    // 11. 产物读取：故障 fail-closed；缺失收敛到统一拒绝
     let content: ExportArtifactContent | undefined;
     try {
       content = await this.artifacts.read(artifactId);
@@ -340,7 +379,7 @@ export class ExportsService {
       return this.failDownload(requestId, exportIdDigest, '产物超过下载硬上限');
     }
 
-    // 11. 响应头取值由服务端常量派生，再过一次头注入门禁（CRLF / 路径 / 引号 ⇒ fail-closed）
+    // 12. 响应头取值由服务端常量派生，再过一次头注入门禁（CRLF / 路径 / 引号 ⇒ fail-closed）
     let fileName: string;
     try {
       fileName = buildExportDownloadFilename(parsedId.data);
@@ -350,15 +389,16 @@ export class ExportsService {
       return this.failDownload(requestId, exportIdDigest, `响应头不合法(${errorName(error)})`);
     }
 
-    // 12. 留痕成功后才交付内容：审计不可用时绝不返回「看起来成功但没有留痕」的下载
+    // 13. 留痕成功后才交付内容：审计不可用时绝不返回「看起来成功但没有留痕」的下载
     await this.recordDownloadAudit(requestId, exportIdDigest, ExportDownloadAuditResult.Success);
 
     return { bytes, fileName, contentType: EXPORT_DOWNLOAD_CONTENT_TYPE };
   }
 
   /**
-   * **统一安全拒绝**出口：不存在 / 跨主体 / 未完成 / 产物缺失 / 空产物全部收敛到这里，
-   * 状态码、错误码与文案完全一致，因此调用方无法据此区分「有没有这条导出、它是什么状态」。
+   * **统一安全拒绝**出口：不存在 / 跨主体 / 未完成 / 产物缺失 / **已过期** / **无服务端有效期**
+   * 全部收敛到这里，状态码、错误码与文案完全一致，因此调用方无法据此区分
+   * 「有没有这条导出、它是什么状态、它是否已经过期」。
    */
   private async rejectDownload(requestId: string, exportIdDigest: string): Promise<never> {
     await this.recordDownloadAudit(
@@ -482,9 +522,12 @@ export class ExportsService {
       created.id !== expected.id ||
       created.ownerUserId !== expected.ownerUserId ||
       created.resource !== expected.resource ||
+      created.expiresAt !== expected.expiresAt ||
       !sameFields
     ) {
-      this.logger.error('[exports] 仓储返回的入口记录与写入不一致（主键/归属/资源/字段被替换）');
+      this.logger.error(
+        '[exports] 仓储返回的入口记录与写入不一致（主键/归属/资源/字段/有效期被替换）',
+      );
       throw new InternalServerErrorException(EXPORT_REQUEST_INTEGRITY_MESSAGE);
     }
   }
@@ -561,12 +604,17 @@ interface ExportMaterializationOutcome {
   readonly artifactId?: string;
 }
 
-/** 入口写入的服务端期望值：用于复核仓储是否如实保存了本次入口记录 */
+/**
+ * 入口写入的服务端期望值：用于复核仓储是否如实保存了本次入口记录。
+ * `expiresAt` 也在这里：有效期是服务端独占事实（客户端不可提交、写回不可改写），
+ * 仓储若把它丢掉或换成别的值，属于服务端缺陷而不是「可以继续」的小差异。
+ */
 interface ExportEntryExpectation {
   readonly id: string;
   readonly ownerUserId: string;
   readonly resource: ExportResource;
   readonly fields: readonly string[];
+  readonly expiresAt: string;
 }
 
 /**

@@ -47,6 +47,7 @@ import { EXPORT_ENTRY_STATUS, EXPORT_STATUS_TRANSITIONS } from './exports.state-
  * | `create` 同 ID 冲突抛错（不静默覆盖） | `INSERT … ON CONFLICT (id) DO NOTHING` 无返回行 → `CONFLICT` |
  * | `save` 未知 id 抛错（不退化成插入） | 条件写入 0 行 → 归属范围内诊断查询 → `NOT_FOUND` |
  * | `save` 归属被改写抛错 | `WHERE id = $1 AND requester_id = $2` 钉住归属 + 返回行逐列复核 → `OWNER_VIOLATION` |
+ * | `save` 有效期被改写抛错 | `expires_at` 不在 `SET` 列表（不可变列）+ 返回行逐列复核 → `IDENTITY_MISMATCH` |
  * | `listByOwnerId` 只返回该主体名下记录 | `WHERE requester_id = $1::uuid`（归属下推）+ 逐条复核 |
  * | `findByIdForOwner` 不存在 / 属于他人都是 `undefined` | `WHERE id = $1::uuid AND requester_id = $2::uuid` → 0 行即 `undefined`（两者不可区分） |
  * | 端口没有删除 / 归档方法 | adapter 同样没有：`delete` / `archive` / `purge` / `truncate` / `upsert` 一个都不存在 |
@@ -54,7 +55,8 @@ import { EXPORT_ENTRY_STATUS, EXPORT_STATUS_TRANSITIONS } from './exports.state-
  * 与内存基线的**唯一刻意差异**：内存基线不做读取契约校验（存储层损坏必须能被出口门禁看见），
  * 而数据库实现必须把「存储层不变量」写成**严格行契约**（未知列、未知资源 / 状态枚举、坏时间戳、
  * 非 UUID 标识、字段白名单之外的字段一律拒绝），因为数据库是外部可变状态，行内容可能被任意来源
- * 写坏。
+ * 写坏。有效期 `NULL` 是这条差异里唯一的**例外**：它在两条实现里都被保留为「字段缺省」，
+ * 由上层下载边界统一 fail-closed（见行契约的 `expires_at` 说明）。
  *
  * ## 状态机（`pending -> completed | failed`）在存储层的两条硬约束
  * 1. `create` 只接受**入口状态** `pending`（`EXPORT_ENTRY_STATUS`）；携带终态与产物句柄的记录
@@ -84,11 +86,12 @@ import { EXPORT_ENTRY_STATUS, EXPORT_STATUS_TRANSITIONS } from './exports.state-
  *    并且**把归属下推进 SQL**：`listByOwnerId` 只返回请求主体的记录，`save` 的 `WHERE` 同时钉住
  *    `id` 与归属（拿他人的作业 ID 也写不中他人数据）；返回行上再逐条复核归属（不一致即
  *    `OWNER_VIOLATION`）——他人作业既不出库、也不得回流；
- * 4. **公开视图不携带归属、产物句柄与存储侧内部列**：adapter 只在**内部存储记录**上承载
- *    `ownerUserId` 与 `artifactId`（不静默丢弃，service 需要它们做归属复核与下载切片关联），
- *    对外裁剪由 `exports.contract.ts` 的 `toExportRequestView` 负责（恰好 `EXPORT_REQUEST_VIEW_FIELDS`）；
+ * 4. **公开视图不携带归属、产物句柄、服务端有效期与存储侧内部列**：adapter 只在**内部存储记录**上
+ *    承载 `ownerUserId` / `artifactId` / `expiresAt`（不静默丢弃，service 需要它们做归属复核、
+ *    下载切片关联与过期判定），对外裁剪由 `exports.contract.ts` 的 `toExportRequestView` 负责
+ *    （恰好 `EXPORT_REQUEST_VIEW_FIELDS`，其中**没有** `expiresAt`——到期时刻不外发）；
  *    本文件显式声明**存储侧内部列**（`POSTGRES_EXPORT_INTERNAL_COLUMNS`：文件名 / 路径 / 下载地址 /
- *    存储 key / 对象 key / 产物句柄 / 文件体 / 内部资源内容与筛选条件 / 原始错误文本 / 有效期与
+ *    存储 key / 对象 key / 产物句柄别名 / 文件体 / 内部资源内容与筛选条件 / 原始错误文本 /
  *    下载簿记）与**公开输出裁剪列**（`POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS`），并在模块加载期
  *    自检「裁剪列、其映射字段名及其驼峰形绝不落在公开视图白名单内」
  *    （`assertExportViewExclusion`）以及「内部列与列清单零交集」（`assertExportInternalColumnsAbsent`）；
@@ -106,9 +109,11 @@ import { EXPORT_ENTRY_STATUS, EXPORT_STATUS_TRANSITIONS } from './exports.state-
  *
  * ## 尚未解决 / 已登记的前置（因此 productionReady 恒为 false）
  * 本切片已落地的部分：`export_jobs` 的迁移（`0013_export_jobs.sql`，列与
- * `POSTGRES_EXPORT_COLUMNS` 逐列一致，含 `artifact_id` 与 `fields text[]`）、运行时可换绑的
+ * `POSTGRES_EXPORT_COLUMNS` 的建表列一致，含 `artifact_id` 与 `fields text[]`；
+ * `0015_export_jobs_expiry.sql` 补出服务端有效期列 `expires_at timestamptz`（可空，
+ * NULL 由下载边界 fail-closed）与「有效期必须在创建时间之后」的 CHECK）、运行时可换绑的
  * 延迟建连工厂、对真实 PostgreSQL 的集成验证（建表、`id` 主键冲突、按 `requester_id` 取数与排序、
- * 条件写入 0 行、公开视图裁剪）。
+ * 条件写入 0 行、公开视图裁剪、有效期的写入 / 读出 / NULL 往返）。
  * **仍然未完成**：会话主体 `u-student-1` 形不在存储 ID 域内（数据库路径对非 UUID 主体
  * fail-closed）；`productionReady` 的提升还需要封存声明与已登记证据（依赖就绪契约），
  * 这一点**不是**本 adapter 能自行声称的。
@@ -121,14 +126,18 @@ export const POSTGRES_EXPORT_TABLE = 'export_jobs';
 /**
  * 列清单：同时定义 `SELECT` 输出列、`INSERT` 列顺序、`UPDATE` 的 `RETURNING` 输出列。
  *
- * 刻意不写 `SELECT *`：存储层新增列（文件名 / 路径 / 下载地址 / 存储 key / 对象 key / 产物句柄 /
- * 文件体 / 内部资源内容 / 筛选条件 / 原始错误文本 / 有效期与下载簿记）不会因为本文件没更新就自动
+ * 刻意不写 `SELECT *`：存储层新增列（文件名 / 路径 / 下载地址 / 存储 key / 对象 key / 产物句柄别名 /
+ * 文件体 / 内部资源内容 / 筛选条件 / 原始错误文本 / 下载簿记）不会因为本文件没更新就自动
  * 流进领域对象；配合行契约的 `.strict()`，未登记列会被显式拒绝而不是被静默带出。
+ * `expires_at` 是**本清单内**的列（9 列）：它是下载边界唯一需要的**服务端有效期**，
+ * 因此必须被显式投影出来；它仍然不进入公开视图（见 `POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS`），
+ * 所以「有效期是可读的服务端事实」与「有效期不外发」是两件事，分别由本清单与裁剪清单各管一段。
  *
  * 列名以 docs/P2-ER图.md 的 `export_jobs(id, requester_id, resource, filters, fields, status,
  * expires_at, downloaded_at)` 为准：归属列是 **`requester_id`**，而端口把同一概念命名为
  * `ownerUserId`。因此本 adapter 有且只有一处**非同名映射** `requester_id → ownerUserId`
- * （见 `POSTGRES_EXPORT_COLUMN_FIELDS`），这正是「显式字段映射」要解决的错位。
+ * （见 `POSTGRES_EXPORT_COLUMN_FIELDS`），这正是「显式字段映射」要解决的错位；
+ * `expires_at → expiresAt` 只是 snake_case → camelCase 的约定形，不是重命名。
  */
 export const POSTGRES_EXPORT_COLUMNS = [
   'id',
@@ -137,6 +146,7 @@ export const POSTGRES_EXPORT_COLUMNS = [
   'fields',
   'status',
   'artifact_id',
+  'expires_at',
   'created_at',
   'updated_at',
 ] as const;
@@ -149,6 +159,7 @@ export const POSTGRES_EXPORT_COLUMN_FIELDS = Object.freeze({
   fields: 'fields',
   status: 'status',
   artifact_id: 'artifactId',
+  expires_at: 'expiresAt',
   created_at: 'createdAt',
   updated_at: 'updatedAt',
 } as const satisfies Record<(typeof POSTGRES_EXPORT_COLUMNS)[number], keyof ExportRequest>);
@@ -169,6 +180,7 @@ export const POSTGRES_EXPORT_FIELD_COLUMNS = Object.freeze({
   fields: 'fields',
   status: 'status',
   artifactId: 'artifact_id',
+  expiresAt: 'expires_at',
   createdAt: 'created_at',
   updatedAt: 'updated_at',
 } as const satisfies Record<keyof ExportRequest, (typeof POSTGRES_EXPORT_COLUMNS)[number]>);
@@ -190,8 +202,13 @@ export const POSTGRES_EXPORT_OWNER_COLUMNS: readonly (typeof POSTGRES_EXPORT_COL
  * - **内部资源内容与筛选条件**（资源 ID、资源快照、筛选条件）：字典标注「内部」，且快照可能
  *   含未脱敏的资源内部字段（例如画像 / 成果的归属与证据文件指针）；
  * - **原始错误文本**（失败原因、错误消息、堆栈）：可能含内部路径、连接串与字段取值；
- * - **存储侧簿记**（有效期、下载时间、软删除时间、幂等键）：属于存储实现细节与后续切片，
+ * - **存储侧簿记**（下载时间、软删除时间、幂等键）：属于存储实现细节与后续切片，
  *   不属于本切片对外契约。
+ *
+ * 注意 `expires_at` **不在**本清单里：有效期不再是「没有写入方的簿记列」——它由 service 在
+ * 创建入口用服务端时钟写入、由下载边界读取判定，因此是**列清单内的真实列**
+ * （迁移 `0015_export_jobs_expiry.sql` 补出）。它仍然**不进入公开视图**，因此被登记进
+ * `POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS`（见下），而不是留在这里变成「既不投影也不用」的假声明。
  *
  * 它们**不进 SELECT / RETURNING / INSERT / UPDATE**，因此既不进领域记录、也不进公开视图；
  * 把它们显式登记出来，是为了让「不泄露文件路径 / URL / 存储 key / 产物句柄 / 内部资源字段 /
@@ -213,7 +230,6 @@ export const POSTGRES_EXPORT_INTERNAL_COLUMNS = Object.freeze([
   'error_message',
   'failure_reason',
   'stack_trace',
-  'expires_at',
   'downloaded_at',
   'deleted_at',
   'idempotency_key',
@@ -221,34 +237,43 @@ export const POSTGRES_EXPORT_INTERNAL_COLUMNS = Object.freeze([
 export type PostgresExportInternalColumn = (typeof POSTGRES_EXPORT_INTERNAL_COLUMNS)[number];
 
 /**
- * 高敏列：**归属 + 全部存储侧内部列**（与 `POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS` 同源，
- * 只少一个 `artifact_id`）。
+ * 高敏列：**归属 + 服务端有效期 + 全部存储侧内部列**（与 `POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS`
+ * 同源，只少一个 `artifact_id`）。
  *
  * 立场是 **fail-closed**：凡**不进入公开视图**的列一律按高敏处理——归属标识、产物位置与文件体
  * （位置即能力）、文件摘要、内部资源标识与快照、筛选条件、原始错误文本（可能含内部路径与连接
- * 信息），以及存储侧簿记（有效期 / 下载时间 / 软删除时间 / 幂等键），都**绝不**写进错误消息与日志。
+ * 信息），以及存储侧簿记（下载时间 / 软删除时间 / 幂等键），都**绝不**写进错误消息与日志。
  *
- * 它们在**存储**范围内是合法内容，因此不裁剪为「不可读」（本 adapter 根本不投影它们，
- * 见上面的内部列清单）；这里把内部列**整体**登记为高敏，是为了让「高敏声明覆盖全部内部列」
- * 成为**可机器校验**的边界（同名 spec 逐列断言），而不是靠人工逐列比对——任何新增的内部列
- * 都会自动进入本清单，不会被漏登记。
+ * `expires_at` 也在这里：到期时刻本身不是个人信息，但本切片**不外发**它（公开视图白名单里没有
+ * `expiresAt`），按「凡不进入公开视图的列一律按高敏处理」这一 fail-closed 口径与其余裁剪列一并
+ * 登记，避免出现「既不投影、又没登记」的暗列。
+ *
+ * 它们在**存储**范围内是合法内容，因此不裁剪为「不可读」（本 adapter 根本不投影这些列）；
+ * 这里把内部列**整体**登记为高敏，是为了让「高敏声明覆盖全部内部列」成为**可机器校验**的边界
+ * （同名 spec 逐列断言），而不是靠人工逐列比对——任何新增的内部列都会自动进入本清单，
+ * 不会被漏登记。
  */
 export const POSTGRES_EXPORT_PII_COLUMNS: readonly string[] = Object.freeze([
   'requester_id',
+  'expires_at',
   ...POSTGRES_EXPORT_INTERNAL_COLUMNS,
 ]);
 
 /**
  * 本 adapter 侧**不进入公开输出**的列：归属（`requester_id → ownerUserId`）+ 产物句柄
- * （`artifact_id → artifactId`）+ 全部存储侧内部列。
+ * （`artifact_id → artifactId`）+ 服务端有效期（`expires_at → expiresAt`）+ 全部存储侧内部列。
  *
  * 对外裁剪由 `toExportRequestView` 负责（逐字段显式赋值、不展开），本清单用于机器校验
- * 「adapter 不把归属、产物句柄与内部列投影出去」。注意 `resource` / `fields` / `status` /
- * `created_at` / `updated_at` **不在**本清单里：它们是公开视图白名单的组成部分。
+ * 「adapter 不把归属、产物句柄、有效期与内部列投影出去」。把 `expires_at` 登记进来还有一层
+ * 具体作用：`findExportViewExclusionLeaks` 会同时探测列名、其驼峰形与映射字段名，
+ * 因此「顺手把 `expiresAt` 加进公开视图」这类改动会在模块加载期就 fail-closed。
+ * 注意 `resource` / `fields` / `status` / `created_at` / `updated_at` **不在**本清单里：
+ * 它们是公开视图白名单的组成部分。
  */
 export const POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS: readonly string[] = Object.freeze([
   'requester_id',
   'artifact_id',
+  'expires_at',
   ...POSTGRES_EXPORT_INTERNAL_COLUMNS,
 ] as const);
 
@@ -256,10 +281,11 @@ export const POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS: readonly string[] = Object.f
  * 写回（`save`）允许变更的列：状态机推进只改这些（`status` 是结论，`artifact_id` 是产物句柄，
  * `updated_at` 是服务端时钟）。
  *
- * 刻意**不含** `id` / `requester_id` / `resource` / `fields` / `created_at`：它们由
- * `POSTGRES_EXPORT_IMMUTABLE_COLUMNS` 声明为不可变，写回后逐条复核（不一致即
+ * 刻意**不含** `id` / `requester_id` / `resource` / `fields` / `created_at` / `expires_at`：
+ * 它们由 `POSTGRES_EXPORT_IMMUTABLE_COLUMNS` 声明为不可变，写回后逐条复核（不一致即
  * `IDENTITY_MISMATCH` / `OWNER_VIOLATION`），因此「改写归属」「改导出资源」「改字段白名单」
- * 「改创建时间」四条路径在存储层被关闭，而不是靠调用方自律。
+ * 「改创建时间」「改有效期」五条路径在存储层被关闭，而不是靠调用方自律。
+ * 有效期尤其不能落在可变列里：允许改写它等于允许把已过期的交付物「续期」回可下载状态。
  */
 export const POSTGRES_EXPORT_MUTABLE_COLUMNS = [
   'status',
@@ -273,6 +299,7 @@ export const POSTGRES_EXPORT_IMMUTABLE_COLUMNS = [
   'requester_id',
   'resource',
   'fields',
+  'expires_at',
   'created_at',
 ] as const satisfies readonly (typeof POSTGRES_EXPORT_COLUMNS)[number][];
 
@@ -525,6 +552,7 @@ const COLUMN_PARAMETER_CASTS: Partial<Record<(typeof POSTGRES_EXPORT_COLUMNS)[nu
   id: '::uuid',
   requester_id: '::uuid',
   artifact_id: '::uuid',
+  expires_at: '::timestamptz',
   created_at: '::timestamptz',
   updated_at: '::timestamptz',
 };
@@ -636,6 +664,12 @@ const postgresExportTimestampSchema = z.union([z.date(), z.string().datetime()])
  * `resource` / `status` 用**闭集**校验，因此未知资源或未知状态在这里就被拦下（一律 fail-closed，
  * 不会当成合法值返回给上层）。`fields` 必须是**字符串数组**（字典的 JSON 列在 `text[]` 与 `jsonb`
  * 下的自然形态），元素形状与「必须是该资源白名单子集且不重复」由读取契约兜底。
+ *
+ * `expires_at` 是可空的（与迁移 `0015` 的列一致）：`NULL` **不是**行契约违规，而是
+ * 「这条记录没有服务端写入的有效期」这一 **fail-closed** 存储形态。它因此被映射成「领域记录里
+ * 没有 `expiresAt`」，由下载边界统一拒绝（与「不存在 / 跨主体 / 未完成 / 产物缺失」同一出口），
+ * 而**不是**在这里判成 `INVALID_ROW`：那会把稳定的 404 变成 500，反而泄露「这条记录存在」。
+ * 非空时必须满足严格时间契约（`Date` 或 ISO datetime 字符串），非法形态仍 fail-closed。
  */
 const postgresExportRowSchema = z
   .object({
@@ -645,6 +679,7 @@ const postgresExportRowSchema = z
     fields: z.array(z.string().min(1).max(64)).min(1).max(EXPORT_MAX_FIELD_COUNT),
     status: z.enum(EXPORT_STATUS_VALUES),
     artifact_id: storageUuidSchema.nullable(),
+    expires_at: postgresExportTimestampSchema.nullable(),
     created_at: postgresExportTimestampSchema,
     updated_at: postgresExportTimestampSchema,
   })
@@ -726,6 +761,12 @@ function mapRow(row: unknown): ExportRequest {
     status: dbRow.status,
     // 产物句柄：仅 completed 存在，adapter 只承载不外发（公开视图白名单里没有它）
     ...(dbRow.artifact_id === null ? {} : { artifactId: dbRow.artifact_id }),
+    // 服务端有效期：`NULL` 映射为**字段缺省**（不是空串、不是任意哨兵值），
+    // 因此「有没有有效期」在领域层是一个明确的二值事实，下载边界据此 fail-closed。
+    // 非空值统一归一为 UTC ISO（`toIsoTimestamp` 走 `toISOString()`），与写入侧同形态。
+    ...(dbRow.expires_at === null
+      ? {}
+      : { expiresAt: toIsoTimestamp(dbRow.expires_at, 'expires_at') }),
     createdAt: toIsoTimestamp(dbRow.created_at, 'created_at'),
     updatedAt: toIsoTimestamp(dbRow.updated_at, 'updated_at'),
   };
@@ -980,7 +1021,7 @@ async function runQuery(
 /**
  * 写入参数：**由列清单派生**（列 → 字段 → 值），因此参数顺序永远与 SQL 占位符一致；
  * `Record<keyof ExportRequest, unknown>` 让「新增领域字段但忘记补参数」成为编译错误。
- * 缺失的可选字段（`artifactId`）写 `NULL`（而不是 `undefined` 或省略列）。
+ * 缺失的可选字段（`artifactId` / `expiresAt`）写 `NULL`（而不是 `undefined` 或省略列）。
  * `fields` 传数组副本（不把调用方的可变引用交给驱动），顺序原样保留。
  */
 function writeParameters(record: ExportRequest): readonly unknown[] {
@@ -991,6 +1032,7 @@ function writeParameters(record: ExportRequest): readonly unknown[] {
     fields: [...record.fields],
     status: record.status,
     artifactId: record.artifactId ?? null,
+    expiresAt: record.expiresAt ?? null,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
   };
@@ -1028,9 +1070,12 @@ function sameFields(left: readonly string[], right: readonly string[]): boolean 
  *
  * 复核是为了拦住「存储层触发器 / SQL 被改写 / 驱动串行错位」这类纵深风险，并让「改写归属」
  * 有专属错误码：`id` → `IDENTITY_MISMATCH`、`requester_id` → `OWNER_VIOLATION`，
- * 其余 `POSTGRES_EXPORT_IMMUTABLE_COLUMNS`（`resource` / `fields` / `created_at`）以及本次写入的
- * `status` / `artifact_id` / `updated_at` → `IDENTITY_MISMATCH`。
+ * 其余 `POSTGRES_EXPORT_IMMUTABLE_COLUMNS`（`resource` / `fields` / `expires_at` / `created_at`）
+ * 以及本次写入的 `status` / `artifact_id` / `updated_at` → `IDENTITY_MISMATCH`。
  * 列清单与实现的对应关系由同名 spec 的**逐列行为断言**钉住（翻转任一列都会失败）。
+ * `expires_at` 的复核对本切片尤其重要：有效期的**唯一写入时机是创建**，
+ * 写回语句的 `SET` 里没有它，因此一旦它变化就说明存储被旁路改写过——那正是「把已过期交付物
+ * 续期」的实现方式，必须 fail-closed。
  */
 function assertWriteRoundTrip(requested: ExportRequest, stored: ExportRequest): void {
   if (stored.id !== requested.id) {
@@ -1051,6 +1096,7 @@ function assertWriteRoundTrip(requested: ExportRequest, stored: ExportRequest): 
     ['resource', requested.resource, stored.resource],
     ['status', requested.status, stored.status],
     ['artifact_id', requested.artifactId, stored.artifactId],
+    ['expires_at', requested.expiresAt, stored.expiresAt],
     ['created_at', requested.createdAt, stored.createdAt],
     ['updated_at', requested.updatedAt, stored.updatedAt],
   ] as const) {

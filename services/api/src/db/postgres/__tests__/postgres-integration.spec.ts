@@ -342,7 +342,7 @@ integrationDescribe('真实 PostgreSQL 集成（TEST_DATABASE_URL / 测试库 DA
     expect(executorError.message).toContain('does not exist');
   });
 
-  it('迁移：真实执行 0001–0014，且幂等重跑不再执行任何 SQL', async () => {
+  it('迁移：真实执行 0001–0015，且幂等重跑不再执行任何 SQL', async () => {
     const applied = await connection.query<{ version: string }>(
       'SELECT version FROM schema_migrations ORDER BY version',
     );
@@ -361,6 +361,7 @@ integrationDescribe('真实 PostgreSQL 集成（TEST_DATABASE_URL / 测试库 DA
       '0012',
       '0013',
       '0014',
+      '0015',
     ]);
 
     // 四张统计来源表必须真的由迁移建立（不是测试临时建表），且带统计所需的归属列
@@ -422,6 +423,7 @@ integrationDescribe('真实 PostgreSQL 集成（TEST_DATABASE_URL / 测试库 DA
       '0012',
       '0013',
       '0014',
+      '0015',
     ];
     expect(first.guard.violations).toEqual([]);
     expect(first.appliedBefore).toEqual([]);
@@ -472,7 +474,7 @@ integrationDescribe('真实 PostgreSQL 集成（TEST_DATABASE_URL / 测试库 DA
     }
 
     const failing = [
-      '-- migration: 0015_rm_it_failing',
+      '-- migration: 0016_rm_it_failing',
       '-- description: 集成测试：必然失败的迁移',
       '-- reversible: 否（测试夹具）',
       '-- owner: integration-test',
@@ -485,7 +487,7 @@ integrationDescribe('真实 PostgreSQL 集成（TEST_DATABASE_URL / 测试库 DA
       'COMMIT;',
       '',
     ].join('\n');
-    writeFileSync(join(directory, '0015_rm_it_failing.sql'), failing, 'utf8');
+    writeFileSync(join(directory, '0016_rm_it_failing.sql'), failing, 'utf8');
 
     const database = createPostgresMigrationDatabase(connection);
     await expect(
@@ -505,7 +507,7 @@ integrationDescribe('真实 PostgreSQL 集成（TEST_DATABASE_URL / 测试库 DA
 
     const recorded = await connection.query<{ version: string }>(
       'SELECT version FROM schema_migrations WHERE version = $1',
-      ['0015'],
+      ['0016'],
     );
     expect(recorded.rows).toEqual([]);
   }, 60_000);

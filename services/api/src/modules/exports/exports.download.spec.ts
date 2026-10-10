@@ -33,6 +33,7 @@ import {
   EXPORT_DOWNLOAD_NOSNIFF,
   EXPORT_DOWNLOAD_QUERY_FIELDS,
   EXPORT_DOWNLOAD_RESPONSE_HEADER_NAMES,
+  EXPORT_DOWNLOAD_TTL_MS,
   EXPORT_DOWNLOAD_UNAVAILABLE_MESSAGE,
   EXPORT_QUERY_FIELDS,
   FORBIDDEN_EXPORT_DOWNLOAD_AUDIT_FIELDS,
@@ -42,6 +43,8 @@ import {
   buildExportDownloadFilename,
   digestExportId,
   exportDownloadAuditEntrySchema,
+  exportExpiresAtFrom,
+  isExportDownloadExpired,
   parseExportDownloadAuditEntry,
 } from './exports.contract';
 import { InMemoryExportDownloadAuditSink } from './exports.download-audit.in-memory';
@@ -65,7 +68,11 @@ import { EXPORT_ENTRY_PERMISSION, EXPORT_RESOURCE_READ_PERMISSIONS } from './exp
  *   `Content-Disposition` 文件名 / `Content-Length` / `no-store` / `nosniff`，且响应里没有
  *   存储 key、路径、产物句柄、归属；
  * - **统一安全拒绝（404 + 同一文案）**：不存在 / 跨主体 / `pending` / `failed` / 产物缺失 /
- *   空产物，六种情形的状态码、错误码与文案完全一致（逐字节比较），不泄露存在性与状态；
+ *   空产物 / **已过期** / **无服务端有效期**，八种情形的状态码、错误码与文案完全一致
+ *   （逐字节比较），不泄露存在性、状态与「是否已过期」；
+ * - **服务端有效期**：TTL 是服务端常量（24 小时）、由 epoch 毫秒派生为 UTC 绝对时刻；
+ *   有效当且仅当当前时刻**严格早于**有效期（边界时刻即判过期）；缺省 / 非法形态一律 fail-closed；
+ *   有效期**不在任何响应里回显**（既不进响应体，也不生成 `Expires` 类报头）；
  * - **fail-closed（500）**：产物读取故障、内容超限、内容形态非法、存储记录违约、仓储取数故障、
  *   审计留痕失败；对外只有统一内部错误，不带原始错误文本；
  * - 伪造输入：查询参数（`userId` / `ownerUserId` / `artifactId` / `fileUrl` / `path` / `status` /
@@ -99,6 +106,10 @@ const OWN_FAILED_ID = '33333333-3333-4333-8333-333333333333';
 const OWN_NO_ARTIFACT_ID = '44444444-4444-4444-8444-444444444444';
 const OTHER_COMPLETED_ID = '55555555-5555-4555-8555-555555555555';
 const OWN_ACHIEVEMENT_ID = '66666666-6666-4666-8666-666666666666';
+/** 已过期的 completed（产物真实存在、状态合法，但有效期已过） */
+const OWN_EXPIRED_ID = '88888888-8888-4888-8888-888888888888';
+/** 没有服务端有效期（存储 NULL / 历史行）的 completed */
+const OWN_NO_EXPIRY_ID = '99999999-9999-4999-8999-999999999998';
 /** 完全不存在于任何主体的导出 ID */
 const UNKNOWN_ID = '77777777-7777-4777-8777-777777777777';
 
@@ -109,6 +120,31 @@ const FORGED_FILE_URL = 'https://files.example.com/exports/secret-export.csv';
 const FORGED_STORAGE_KEY = 's3://internal-bucket/exports/secret-export.csv';
 const FORGED_REQUEST_ID = 'client-trace-00000001';
 const PII_ID_CARD = '110101199003071234';
+/** 客户端伪造的有效期（过去 / 未来两种形态都不得影响判定） */
+const FORGED_EXPIRES_FUTURE = '2099-12-31T23:59:59.000Z';
+const FORGED_EXPIRES_PAST = '2000-01-01T00:00:00.000Z';
+
+/**
+ * 未来有效期：默认夹具（仍然可下载）。
+ *
+ * 刻意用**相对当前时刻**的取值而不是硬编码日期：有效期是「相对于服务端当前时钟」的性质，
+ * 硬编码的「未来日期」会在某天变成过去，从而让成功用例悄悄变成过期用例（测试自身过期）。
+ */
+function futureExpiry(offsetMs = 3_600_000): string {
+  return new Date(Date.now() + offsetMs).toISOString();
+}
+
+/** 已过期（严格早于当前时刻）的有效期 */
+function pastExpiry(offsetMs = 60_000): string {
+  return new Date(Date.now() - offsetMs).toISOString();
+}
+
+/** 去掉服务端有效期：模拟存储 `NULL` / 本迁移之前写入的历史行 */
+function withoutExpiry(record: ExportRequest): ExportRequest {
+  const copy: { expiresAt?: string } = { ...record };
+  delete copy.expiresAt;
+  return copy as ExportRequest;
+}
 
 /** 禁止出现在任何下载响应里的「产物位置 / 内部存储」形态 */
 const STORAGE_LEAK_MARKERS: readonly string[] = [
@@ -140,6 +176,10 @@ interface SeededExports {
   readonly ownCompletedWithoutArtifact: ExportRequest;
   readonly otherCompleted: ExportRequest;
   readonly ownCompletedAchievement: ExportRequest;
+  /** 已完成、产物真实存在，但服务端有效期已过 */
+  readonly ownExpired: ExportRequest;
+  /** 已完成、产物真实存在，但存储里没有服务端有效期（NULL） */
+  readonly ownWithoutExpiry: ExportRequest;
 }
 
 interface TestApp {
@@ -171,6 +211,9 @@ function fixtureExportRequest(overrides: Partial<ExportRequest> = {}): ExportReq
     fields: profileFields(),
     status: ExportStatus.Completed,
     artifactId: randomUUID(),
+    // 默认**有效**（未来 1 小时）：成功路径的夹具必须真的在有效期内，
+    // 否则「过期拒绝」会把所有成功用例一起拒掉，测不出任何区分度
+    expiresAt: futureExpiry(),
     createdAt: '2026-01-06T00:00:00.000Z',
     updatedAt: '2026-01-06T00:00:05.000Z',
   };
@@ -179,7 +222,9 @@ function fixtureExportRequest(overrides: Partial<ExportRequest> = {}): ExportReq
 
 /**
  * 种子数据：产物的 `artifactId` 由**真实产物存储**生成（因此成功路径读的是真实内容），
- * 待 / 失败 / 缺产物三类记录则刻意覆盖各自的状态机分支。
+ * 待 / 失败 / 缺产物 / **已过期** / **无有效期** 各类记录则刻意覆盖各自的分支。
+ * 已过期与无有效期两条记录都带**真实存在的产物**，因此它们的拒绝只可能来自有效期判定，
+ * 而不是「产物读不到」。
  */
 async function seedExports(
   repository: InMemoryExportRepository,
@@ -201,6 +246,18 @@ async function seedExports(
   const otherArtifact = artifacts.store({
     exportRequestId: OTHER_COMPLETED_ID,
     ownerUserId: STUDENT_2,
+    resource: ExportResource.Profile,
+    fields: profileFields(),
+  });
+  const expiredArtifact = artifacts.store({
+    exportRequestId: OWN_EXPIRED_ID,
+    ownerUserId: STUDENT_1,
+    resource: ExportResource.Profile,
+    fields: profileFields(),
+  });
+  const noExpiryArtifact = artifacts.store({
+    exportRequestId: OWN_NO_EXPIRY_ID,
+    ownerUserId: STUDENT_1,
     resource: ExportResource.Profile,
     fields: profileFields(),
   });
@@ -238,6 +295,16 @@ async function seedExports(
       fields: achievementFields(),
       artifactId: achievementArtifact.artifactId,
     }),
+    // 已过期：状态与产物都合法，只有服务端有效期落在过去
+    ownExpired: fixtureExportRequest({
+      id: OWN_EXPIRED_ID,
+      artifactId: expiredArtifact.artifactId,
+      expiresAt: pastExpiry(),
+    }),
+    // 无服务端有效期：字段缺省（存储 `NULL` 的领域形）⇒ fail-closed
+    ownWithoutExpiry: withoutExpiry(
+      fixtureExportRequest({ id: OWN_NO_EXPIRY_ID, artifactId: noExpiryArtifact.artifactId }),
+    ),
   };
 
   if (seed) {
@@ -438,6 +505,15 @@ describe('导出下载：成功路径（本人 completed，真实字节 + 固定
     for (const marker of STORAGE_LEAK_MARKERS) {
       expect(res.text).not.toContain(marker);
     }
+    // **服务端有效期不外发**：既没有报头，也没有出现在响应体里
+    // （到期时刻是服务端判定用的事实；调用方只需要知道「现在能不能取」）
+    const seededExpiry = app.seeded.ownCompleted.expiresAt;
+    expect(seededExpiry).toBeDefined();
+    expect(res.headers['expires']).toBeUndefined();
+    expect(res.headers['expires-at']).toBeUndefined();
+    expect(res.headers['x-expires-at']).toBeUndefined();
+    expect(res.text).not.toContain('expiresAt');
+    expect(res.text).not.toContain(String(seededExpiry));
     // 内部存储键与产物句柄都只存在于服务端内存里
     expect(res.text).not.toContain(app.seeded.ownCompleted.artifactId ?? 'no-artifact');
     expect(
@@ -505,8 +581,8 @@ describe('导出下载：成功路径（本人 completed，真实字节 + 固定
   });
 });
 
-describe('导出下载：统一安全拒绝（不存在 / 跨主体 / 未完成 / 产物缺失）', () => {
-  it('六种情形状态码、错误码与文案逐字节一致，且不发出任何下载头', async () => {
+describe('导出下载：统一安全拒绝（不存在 / 跨主体 / 未完成 / 产物缺失 / 已过期 / 无有效期）', () => {
+  it('八种情形状态码、错误码与文案逐字节一致，且不发出任何下载头', async () => {
     const app = await startDownloadApp();
     const headers = bearer(SESSION_STUDENT_1);
 
@@ -523,20 +599,46 @@ describe('导出下载：统一安全拒绝（不存在 / 跨主体 / 未完成 
       await rawCall(app.baseUrl, 'GET', downloadPath(OWN_FAILED_ID), { headers }),
       // 产物缺失（completed 但存储里没有该句柄）
       await rawCall(app.baseUrl, 'GET', downloadPath(OWN_NO_ARTIFACT_ID), { headers }),
+      // **已过期**（状态 completed、产物真实存在，只有服务端有效期落在过去）
+      await rawCall(app.baseUrl, 'GET', downloadPath(OWN_EXPIRED_ID), { headers }),
+      // **无服务端有效期**（存储 NULL / 历史行的领域形）⇒ fail-closed，不是「永不过期」
+      await rawCall(app.baseUrl, 'GET', downloadPath(OWN_NO_EXPIRY_ID), { headers }),
     ];
 
     const contents = cases.map((res) => expectUniformRejection(res));
-    // 逐字节一致：拒绝本身不泄露「有没有这条导出、它是什么状态」
+    // 逐字节一致：拒绝本身不泄露「有没有这条导出、它是什么状态、它是否已过期」
     for (const content of contents) {
       expect(content).toBe(contents[0]);
     }
 
-    // 每一次尝试都留痕为同一个结果码（审计同样不泄露原因）
+    // 每一次尝试都留痕为同一个结果码（审计同样不泄露原因：过期与缺失、跨主体同码）
     const entries = app.audit.entries();
     expect(entries).toHaveLength(cases.length);
     for (const entry of entries) {
       expect(entry.result).toBe(ExportDownloadAuditResult.Unavailable);
     }
+  });
+
+  it('已过期 / 无有效期在产物读取之前就被拒绝：产物存储一次都不被调用', async () => {
+    const app = await startDownloadApp();
+    const spies = spyOnDownloadPorts(app);
+
+    expectUniformRejection(
+      await rawCall(app.baseUrl, 'GET', downloadPath(OWN_EXPIRED_ID), {
+        headers: bearer(SESSION_STUDENT_1),
+      }),
+    );
+    expectUniformRejection(
+      await rawCall(app.baseUrl, 'GET', downloadPath(OWN_NO_EXPIRY_ID), {
+        headers: bearer(SESSION_STUDENT_1),
+      }),
+    );
+
+    // 过期判定只依赖服务端记录与服务端时钟：不需要读产物，也就不会因为「读到了内容」而产生
+    // 任何可观测差异（产物存储与资源级授权都不该被触达）
+    expect(spies.read).not.toHaveBeenCalled();
+    expect(spies.findById).toHaveBeenCalledTimes(2);
+    expect(spies.audit).toHaveBeenCalledTimes(2);
   });
 
   it('跨主体请求使用本人的凭证也无法拿到他人导出：与「不存在」完全同形', async () => {
@@ -778,7 +880,8 @@ describe('导出下载：伪造输入（查询串与自定义头）', () => {
       ['storageKey', FORGED_STORAGE_KEY],
       ['status', ExportStatus.Completed],
       ['fileName', 'secret.csv'],
-      ['expiresAt', '1999999999'],
+      // 有效期是服务端独占事实：伪造「很久以后才过期」或「已经过期」都必须 400
+      ['expiresAt', FORGED_EXPIRES_FUTURE],
     ];
 
     for (const [key, value] of cases) {
@@ -816,6 +919,9 @@ describe('导出下载：伪造输入（查询串与自定义头）', () => {
         'x-storage-key': FORGED_STORAGE_KEY,
         'x-filename': 'evil-secret-export.csv',
         'x-request-id': FORGED_REQUEST_ID,
+        // 伪造「有效期」（把到期时刻推到很远）不得改变判定：有效期只来自服务端记录
+        'x-expires-at': FORGED_EXPIRES_FUTURE,
+        'expires-at': FORGED_EXPIRES_PAST,
       },
     });
 
@@ -830,6 +936,12 @@ describe('导出下载：伪造输入（查询串与自定义头）', () => {
     for (const marker of STORAGE_LEAK_MARKERS) {
       expect(res.text).not.toContain(marker);
     }
+    // 伪造的有效期既没有缩短有效期（否则这里会是 404）、也没有被回显，
+    // 更没有变成任何表示「有效期」的响应头
+    expect(res.text).not.toContain(FORGED_EXPIRES_FUTURE);
+    expect(res.text).not.toContain(FORGED_EXPIRES_PAST);
+    expect(res.headers['expires']).toBeUndefined();
+    expect(res.headers['x-expires-at']).toBeUndefined();
     // 判定入参只有会话主体与**服务端常量**
     for (const authCall of checkAuthorization.mock.calls) {
       expect(authCall[0]).toEqual({ userId: STUDENT_1, roles: [Role.Student] });
@@ -875,6 +987,67 @@ describe('导出下载：伪造输入（查询串与自定义头）', () => {
       expect(Object.keys(entry).sort()).toEqual(['exportIdDigest', 'requestId', 'result']);
       expect(entry.exportIdDigest).toMatch(EXPORT_DOWNLOAD_AUDIT_DIGEST_PATTERN);
     }
+  });
+});
+
+describe('导出下载：服务端有效期契约（纯函数 · UTC 绝对时刻 · fail-closed）', () => {
+  /** 固定样本：全部显式给出，避免把「当前时刻」混进契约断言的期望值 */
+  const BASE_MS = Date.parse('2026-10-10T00:00:00.000Z');
+
+  it('TTL 是服务端常量：24 小时，且由 epoch 毫秒派生出 UTC（Z 结尾）绝对时刻', () => {
+    expect(EXPORT_DOWNLOAD_TTL_MS).toBe(24 * 60 * 60 * 1000);
+    const expiresAt = exportExpiresAtFrom(BASE_MS);
+    expect(expiresAt).toBe('2026-10-11T00:00:00.000Z');
+    // 形态固定：UTC 绝对时刻（Z 结尾、带毫秒），因此与运行机器的时区 / 夏令时无关
+    expect(expiresAt.endsWith('Z')).toBe(true);
+    expect(expiresAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u);
+    // 纯 epoch 毫秒运算：epoch 0 派生出的就是 1970-01-02T00:00:00.000Z（+24h），
+    // 没有任何本地时区 / 夏令时参与
+    expect(exportExpiresAtFrom(0)).toBe('1970-01-02T00:00:00.000Z');
+    expect(Date.parse(exportExpiresAtFrom(BASE_MS)) - BASE_MS).toBe(EXPORT_DOWNLOAD_TTL_MS);
+  });
+
+  it('有效当且仅当当前时刻严格早于有效期：边界时刻即判过期（半开区间）', () => {
+    const expiresAt = '2026-10-11T00:00:00.000Z';
+    const expiresAtMs = Date.parse(expiresAt);
+
+    expect(isExportDownloadExpired(expiresAt, expiresAtMs - 1)).toBe(false);
+    // 边界：`now == expiresAt` ⇒ 已过期（不存在「到期后还能取走一次」的窗口）
+    expect(isExportDownloadExpired(expiresAt, expiresAtMs)).toBe(true);
+    expect(isExportDownloadExpired(expiresAt, expiresAtMs + 1)).toBe(true);
+    // 过期很久同样是过期
+    expect(isExportDownloadExpired(expiresAt, expiresAtMs + 400 * 86_400_000)).toBe(true);
+  });
+
+  it('fail-closed：缺省 / 非法形态 / 非字符串一律判为不可下载（绝不解释成「永不过期」）', () => {
+    const nowMs = BASE_MS;
+    for (const invalid of [
+      undefined,
+      null,
+      '',
+      'not-a-date',
+      '2026/10/11',
+      '2026-10-11', // 无时间部分
+      '2026-10-11T00:00:00', // 无毫秒 / 无时区
+      '2026-11-11T00:00:00.000+08:00', // 带偏移：只接受 UTC 形
+      '2026-10-11T00:00:00.000z', // 小写 z 不是契约形
+      1767186000000,
+      {},
+      [],
+      true,
+    ]) {
+      expect(isExportDownloadExpired(invalid, nowMs)).toBe(true);
+    }
+    // 合法未来时刻是唯一放行形态（小数秒可选，因此无毫秒的 UTC 形同样合法）
+    expect(isExportDownloadExpired('2026-10-11T00:00:00.000Z', nowMs)).toBe(false);
+    expect(isExportDownloadExpired('2026-10-11T00:00:00Z', nowMs)).toBe(false);
+  });
+
+  it('时区无关：同一瞬时点的不同**本地**日期写法不改变判定（比较的是绝对时刻）', () => {
+    // 2026-10-11T00:00:00.000Z 在 UTC+8 是 08:00；判定只看瞬时点，不受宿主时区影响
+    const expiresAt = '2026-10-11T00:00:00.000Z';
+    expect(isExportDownloadExpired(expiresAt, Date.parse('2026-10-10T23:59:59.999Z'))).toBe(false);
+    expect(isExportDownloadExpired(expiresAt, Date.parse('2026-10-11T00:00:00.000Z'))).toBe(true);
   });
 });
 
@@ -1174,5 +1347,26 @@ describe('导出下载：仓储单条取数的归属隔离（内存基线）', (
     for (const forbidden of ['findById', 'findByOwner', 'findAll', 'query', 'delete', 'upsert']) {
       expect(repository[forbidden]).toBeUndefined();
     }
+  });
+
+  it('内存基线不得改写服务端有效期（与数据库 adapter 的不可变列同语义）', async () => {
+    const repository = new InMemoryExportRepository(loadEnv({ NODE_ENV: 'test' }));
+    const stored = fixtureExportRequest({ id: OWN_COMPLETED_ID });
+    expect(stored.expiresAt).toBeDefined();
+    await repository.create(stored);
+
+    // 1) 续期（把过期时间往后推）被拒绝：否则「已过期的交付物」能被静默救回可下载状态
+    await expect(
+      repository.save({ ...stored, expiresAt: futureExpiry(7_200_000) }),
+    ).rejects.toThrow(/有效期不可改写/u);
+
+    // 2) 清空有效期（模拟「记为永不过期」）同样被拒绝
+    await expect(repository.save(withoutExpiry(stored))).rejects.toThrow(/有效期不可改写/u);
+
+    // 3) 有效期不变时，正常的写回（状态推进）仍然成功，且存储里的有效期逐字节不变
+    const saved = await repository.save({ ...stored, status: ExportStatus.Completed });
+    expect(saved.expiresAt).toBe(stored.expiresAt);
+    const reread = await repository.findByIdForOwner(OWN_COMPLETED_ID, STUDENT_1);
+    expect(reread?.expiresAt).toBe(stored.expiresAt);
   });
 });

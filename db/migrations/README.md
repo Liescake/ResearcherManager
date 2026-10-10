@@ -20,7 +20,9 @@ db/migrations/
 ├─ 0010_notifications.sql      站内通知表（PostgreSQL 通知仓储切片 · 归属隔离 + read 状态机）
 ├─ 0011_research_groups.sql    科研小组表（PostgreSQL 小组仓储切片）
 ├─ 0012_user_compliance.sql    本人合规状态聚合读模型（PostgreSQL 合规格切片）
-└─ 0013_export_jobs.sql        导出请求事实表（PostgreSQL 导出仓储切片 · 状态读 / 创建 / 完成）
+├─ 0013_export_jobs.sql        导出请求事实表（PostgreSQL 导出仓储切片 · 状态读 / 创建 / 完成）
+├─ 0014_ai_match_records_guards.sql  ai_match_records 存储层守卫补齐（存储 ID 域 + 结果行形状）
+└─ 0015_export_jobs_expiry.sql 导出请求事实表补服务端有效期列（导出下载切片 · 过期拒绝）
 ```
 
 `0002`–`0005` 是第一个真实业务持久化切片（本人统计聚合读）所需的四张来源表：每张表都带
@@ -61,10 +63,21 @@ db/migrations/
 时存在」这条跨字段不变式 —— 它正是状态机与读取契约在存储层的镜像）。取数索引
 `(requester_id, created_at, id)` 覆盖 adapter 的 `ORDER BY created_at ASC, id ASC` 与归属谓词。
 表里刻意**不**建产物位置与文件体（文件名 / 路径 / 下载地址 / 签名地址 / 存储 key / 对象 key /
-文件体 / 摘要）、内部资源内容与筛选条件、原始错误文本，以及存储侧簿记（有效期 / 下载时间 /
-软删除时间 / 幂等键）：原始 PII、文件路径、对象存储凭据与下载签名**都不得落库**，本表只保存
-受控状态与服务端生成的短引用，因此这些列既不在迁移里，也不在 adapter 的列清单里（adapter 的
+文件体 / 摘要）、内部资源内容与筛选条件、原始错误文本，以及下载簿记（下载时间 / 软删除时间 /
+幂等键）：原始 PII、文件路径、对象存储凭据与下载签名**都不得落库**，本表只保存受控状态与服务端
+生成的短引用，因此这些列既不在迁移里，也不在 adapter 的列清单里（adapter 的
 `POSTGRES_EXPORT_INTERNAL_COLUMNS` 把它们登记为「不进 SELECT / RETURNING」）。
+
+`0015` 给 `export_jobs` **补出服务端有效期列** `expires_at timestamptz`（可空、无 DEFAULT）与
+「有效期必须在创建时间之后」的 CHECK `export_jobs_expires_at_after_created_at`。
+`0013` 已应用且校验和钉住、不可改写，因此加列只能走新迁移；`expires_at` 也由此从
+「没有写入方的簿记列」变成 adapter 列清单里的真实列（第 9 列，下载边界读取它做过期判定），
+但仍然**不进入公开视图**，所以同时被登记进 `POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS`。
+可空是**语义**而不是遗漏：`NULL` = 「这条记录没有服务端写入的有效期」，下载边界按 fail-closed
+拒绝（与「不存在 / 跨主体 / 未完成 / 产物缺失」同一出口），绝不解释为「永不过期」；
+不加 DEFAULT 同样是有意的 —— 有效期只能由服务端时钟写入，存储层不得自行发明一个到期时刻。
+回滚方式登记在迁移头部：`ALTER TABLE export_jobs DROP COLUMN IF EXISTS expires_at`
+（只回滚本迁移新增的列与约束，不动 `0013` 建出的表、其它列与既有数据）。
 
 ## 命名与顺序
 

@@ -29,13 +29,18 @@ import type { ExportDownloadAuditEntry } from './exports.port';
  *
  * 输出白名单（`EXPORT_REQUEST_VIEW_FIELDS`）：对外视图**恰好**是
  * `id` / `resource` / `fields` / `status` / `createdAt` / `updatedAt`，
- * 不含归属 `ownerUserId`、不含产物句柄 `artifactId`，也**不含任何文件路径、下载地址、
- * 存储 key 或文件名**——这些字段在存储记录与端口返回值里就不存在（见 `exports.port.ts`）。
+ * 不含归属 `ownerUserId`、不含产物句柄 `artifactId`、**也不含服务端有效期 `expiresAt`**
+ * （到期时刻不外发：它只用于服务端判定，少一个对外事实就少一处可用来推断交付窗口的信息），
+ * 更**不含任何文件路径、下载地址、存储 key 或文件名**——这些字段在存储记录与端口返回值里
+ * 就不存在（见 `exports.port.ts`）。因此本切片不扩大对外响应面：视图字段一个都不新增。
  *
  * 读取契约（存储记录离开进程前的最后一道门）：字段闭集（`.strict()`）、枚举闭集、
- * 字段白名单子集与去重、状态与产物句柄自洽、ISO 时间戳。任一项违规都属于服务端缺陷：
- * 按 500 处理，**且日志与错误详情只写字段路径与违规类型、不写取值**，
- * 因此即便存储里被塞进了证件号或文件路径，也不会经由本切片的任何响应或日志外发。
+ * 字段白名单子集与去重、状态与产物句柄自洽、**可选的服务端有效期（UTC ISO 或缺失）**、
+ * ISO 时间戳。任一项违规都属于服务端缺陷：按 500 处理，**且日志与错误详情只写字段路径与
+ * 违规类型、不写取值**，因此即便存储里被塞进了证件号或文件路径，也不会经由本切片的任何
+ * 响应或日志外发。注意「有效期缺失」**不是**读取契约违规：缺失是 fail-closed 的合法存储
+ * 形态（数据库 `NULL`），由下载边界统一拒绝，而不是把整条记录判成损坏（否则拒绝会从
+ * 稳定的 404 变成 500，反而泄露「这条记录存在且缺字段」）。
  */
 
 /**
@@ -210,6 +215,11 @@ const storedExportRequestObjectSchema = z
     fields: z.array(z.string().min(1).max(64)).min(1).max(EXPORT_MAX_FIELD_COUNT),
     status: z.enum(EXPORT_STATUS_VALUES),
     artifactId: uuidSchema.optional(),
+    // 服务端有效期：**缺省即 fail-closed**（见 `isExportDownloadExpired`）。
+    // `z.string().datetime()` 默认只接受以 `Z` 结尾的 UTC 形（小数秒可选），因此
+    // 「本地时间 / 带时区偏移 / 非 ISO 形态」的取值在这里就被拒绝，
+    // 不会以「某个本地时刻」的语义流入判定。
+    expiresAt: z.string().datetime().optional(),
     createdAt: z.string().datetime(),
     updatedAt: z.string().datetime(),
   })
@@ -567,6 +577,62 @@ function throwUnexpectedFields(
  * （与「不存在」同一个出口），因此非法形态既不会进入存储，也不会泄露存在性。
  */
 export const exportDownloadIdSchema = uuidSchema;
+
+/**
+ * 产物**短期有效期**（服务端 TTL）：创建时刻起 24 小时。
+ *
+ * 为什么是「短期」且写在契约层：导出产物是「一次性取走」的交付物，交付窗口越长，
+ * 落盘的脱敏文件被旁路读取/残留的时间就越长。把 TTL 固定成**服务端常量**（而不是配置项、
+ * 更不是客户端可提交的参数）之后，「有效期有多长」这件事在部署之间没有漂移面，
+ * 也不会出现「某个环境悄悄配成 10 年」这种把短期有效期变成永久交付的改动。
+ *
+ * 写入方只有一处：`ExportsService.createMyExportRequest` 用服务端时钟算出
+ * `expiresAt = now + EXPORT_DOWNLOAD_TTL_MS`（见 `exportExpiresAtFrom`），
+ * 客户端提交的同名字段一律 400（见 `FORBIDDEN_EXPORT_REQUEST_FIELDS` /
+ * `FORBIDDEN_EXPORT_QUERY_FIELDS`），写回（`save`）路径也不得改写它。
+ */
+export const EXPORT_DOWNLOAD_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * 由服务端时钟（epoch 毫秒）派生有效期：**UTC 绝对时刻**的 ISO 8601 形态
+ * （`YYYY-MM-DDTHH:mm:ss.sssZ`）。
+ *
+ * 刻意只接受 epoch 毫秒、且只产出 `Z` 结尾的形态：调用方无法在这里传入本地时间字符串、
+ * 时区偏移或日期字面量，因此「有效期落在哪个瞬时点」不依赖运行机器的时区设置与夏令时规则。
+ * TTL 恒为正（见上），所以 `expiresAt > createdAt` 这条存储层不变式天然成立。
+ */
+export function exportExpiresAtFrom(nowMs: number): string {
+  return new Date(nowMs + EXPORT_DOWNLOAD_TTL_MS).toISOString();
+}
+
+/**
+ * 过期判定（纯函数，服务端唯一判定点）：**有效当且仅当**存在一个严格的 UTC 时刻且当前时刻
+ * 严格早于它。
+ *
+ * 返回 `true` 表示「不可下载」，四类取值都收敛到 `true`（**fail-closed**）：
+ * - `undefined` / 非字符串 —— 存储里没有服务端有效期（数据库 `NULL` 的领域形）；
+ * - 非法时间形态（非 ISO 8601、非 UTC `Z` 结尾、`NaN`）—— 存储被写坏；
+ * - 恰好等于当前时刻 —— 边界判定为**已过期**（半开区间 `[expiresAt, +∞)` 都不可下载，
+ *   因此不存在「到期后还能取走一次」的窗口）；
+ * - 早于当前时刻 —— 正常过期。
+ *
+ * 比较发生在**绝对时刻**上（`Date.parse` 把 ISO `Z` 形态解析成 UTC 瞬时点），
+ * 与本地时区、夏令时切换、机器时钟的时区设置都无关；两个被比较的量一个来自服务端存储，
+ * 一个来自调用方传入的服务端时钟读数（`Date.now()`），调用方不得传入客户端可影响的取值。
+ */
+export function isExportDownloadExpired(expiresAt: unknown, nowMs: number): boolean {
+  if (typeof expiresAt !== 'string') {
+    return true;
+  }
+  if (!z.string().datetime().safeParse(expiresAt).success) {
+    return true;
+  }
+  const expiresAtMs = Date.parse(expiresAt);
+  if (!Number.isFinite(expiresAtMs)) {
+    return true;
+  }
+  return !(nowMs < expiresAtMs);
+}
 
 /** 下载端点声明的查询参数闭集：**空集**（与 `/me/exports` 的读写口径一致） */
 export const EXPORT_DOWNLOAD_QUERY_FIELDS = EXPORT_QUERY_FIELDS;

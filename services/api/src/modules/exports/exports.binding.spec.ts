@@ -87,6 +87,8 @@ function rowFor(
     fields: [...FIELDS],
     status: ExportStatus.Pending,
     artifact_id: null,
+    // 服务端有效期：本夹具默认**没有**（存储 NULL），对应「字段缺省 ⇒ 下载边界 fail-closed」
+    expires_at: null,
     created_at: TIMESTAMP,
     updated_at: TIMESTAMP,
     ...overrides,
@@ -196,9 +198,11 @@ describe('导出仓储的持久化分流（createExportRepository）', () => {
 
     const [sql] = harness.sql();
     expect(sql).toBeDefined();
-    // 显式列清单：不使用 SELECT *，且不选中任何内部列
+    // 显式列清单：不使用 SELECT *，且不选中任何内部列。
+    // 服务端有效期 `expires_at` **在**清单内（下载边界必须读它做过期判定），
+    // 但它不进入公开视图（见 adapter 的 POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS）。
     expect(sql).toContain(
-      'SELECT id, requester_id, resource, fields, status, artifact_id, created_at, updated_at',
+      'SELECT id, requester_id, resource, fields, status, artifact_id, expires_at, created_at, updated_at',
     );
     expect(sql).not.toContain('*');
     // 归属下推进 SQL，且是占位符绑定；没有任何内部列（位置 / 凭据 / 原始错误）被选中
@@ -216,7 +220,6 @@ describe('导出仓储的持久化分流（createExportRepository）', () => {
       'filters',
       'error_message',
       'stack_trace',
-      'expires_at',
       'downloaded_at',
       'idempotency_key',
     ]) {
@@ -225,6 +228,45 @@ describe('导出仓储的持久化分流（createExportRepository）', () => {
     // 取值绝不出现在 SQL 文本里
     expect(sql).not.toContain(OWNER);
     expect(harness.parameters()[0]).toEqual([OWNER]);
+  });
+
+  it('服务端有效期经换绑点原样承载：NULL → 字段缺省、非空 → UTC ISO；且 SQL 里是显式列 + 参数', async () => {
+    // 1) 存储 NULL（历史行 / 未签发）⇒ 领域记录里**没有** expiresAt（下载边界据此 fail-closed）
+    const withoutExpiry = countingFactory([rowFor(OWNER)]);
+    const legacy = createExportRepository(
+      loadEnv({ NODE_ENV: 'test', DATABASE_URL: LOOPBACK_URL }),
+      withoutExpiry.factory,
+    );
+    const legacyRecords = await legacy.listByOwnerId(OWNER);
+    expect(legacyRecords).toEqual([recordFor(OWNER)]);
+    expect(legacyRecords[0]).not.toHaveProperty('expiresAt');
+
+    // 2) 存储 timestamptz ⇒ 领域记录是 UTC ISO 绝对时刻（与 service 写入侧同形）
+    const expiresAt = '2026-10-11T00:00:00.000Z';
+    const withExpiry = countingFactory([
+      rowFor(OWNER, {
+        expires_at: new Date(expiresAt),
+        status: ExportStatus.Completed,
+        artifact_id: ARTIFACT_ID,
+      }),
+    ]);
+    const bound = createExportRepository(
+      loadEnv({ NODE_ENV: 'test', DATABASE_URL: LOOPBACK_URL }),
+      withExpiry.factory,
+    );
+    await expect(bound.listByOwnerId(OWNER)).resolves.toEqual([
+      recordFor(OWNER, {
+        status: ExportStatus.Completed,
+        artifactId: ARTIFACT_ID,
+        expiresAt,
+      }),
+    ]);
+    // 有效期是**显式列**（不是 SELECT *），且取值只出现在参数里
+    const [sql] = withExpiry.sql();
+    expect(sql).toContain('expires_at');
+    expect(sql).not.toContain('*');
+    expect(sql).not.toContain(expiresAt);
+    expect(withExpiry.parameters()[0]).toEqual([OWNER]);
   });
 
   it('存储 ID 域先判、再建连：非 UUID 会话主体在进入 SQL 之前就被拒绝', async () => {

@@ -15,7 +15,8 @@ import type { ExportRepository, ExportRepositoryCapabilities, ExportRequest } fr
  * - 不做授权判定、不生成归属/状态/时间戳：这些只由 service 从服务端会话、状态机与时钟写入；
  * - **不做读取契约校验**：存储层损坏（未知枚举、字段不在白名单、状态与产物不自洽）必须能被
  *   出口的 fail-closed 门禁看见，因此基线不代替出口做校验，也不静默修正非法记录；
- *   写入只保证「主键唯一」「归属不可改写」这两条存储自身的完整性约束；
+ *   写入只保证「主键唯一」「归属不可改写」「服务端有效期不可改写」这三条存储自身的完整性约束
+ *   （第三条与数据库 adapter 的 `expires_at` 不可变列同语义）；
  * - **没有**删除/归档方法：本切片不提供「删除导出请求」的能力；
  * - **没有**不带归属条件的单条读取：单条读取只有 `findByIdForOwner(id, ownerUserId)`，
  *   归属是取数条件本身（不存在 `findById` / `findByOwner` / `query` 这类入口）。
@@ -56,6 +57,13 @@ export class InMemoryExportRepository implements ExportRepository {
     if (existing.ownerUserId !== request.ownerUserId) {
       // 归属不得在更新中被改写：归属只来自服务端会话主体的首次写入
       throw new Error(`导出请求归属不一致，拒绝更新: ${request.id}`);
+    }
+    if (existing.expiresAt !== request.expiresAt) {
+      // **有效期不可改写**（与实测的存储层不变式同语义：数据库 adapter 的
+      // `POSTGRES_EXPORT_IMMUTABLE_COLUMNS` 含 `expires_at`，写回后逐列复核）。
+      // 有效期只是「这条记录什么时候到期」这一服务端事实，写回路径（状态机推进）没有
+      // 任何理由改动它；允许改写就等于允许把已过期的交付物「续期」回可下载状态。
+      throw new Error(`导出请求有效期不可改写，拒绝更新: ${request.id}`);
     }
     this.requests.set(request.id, copyRequest(request));
     return copyRequest(request);

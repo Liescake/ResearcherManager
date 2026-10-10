@@ -181,6 +181,12 @@ const HEX_ARTIFACT_ID_UPPER = 'B1C2D3E4-F5A6-4789-8BCD-EF0123456789';
 const NIL_UUID = '00000000-0000-0000-0000-000000000000';
 const CREATED_AT = '2026-01-02T03:04:05.000Z';
 const LATER_AT = '2026-01-03T04:05:06.000Z';
+/**
+ * 服务端有效期样本（UTC 绝对时刻，**晚于** `CREATED_AT`）：与迁移 `0015` 的
+ * `expires_at > created_at` 不变式一致。它是「服务端创建、只读」的事实，因此是记录夹具的
+ * 固定组成部分（协议上可缺省，缺省 = 存储 `NULL` = 下载边界 fail-closed）。
+ */
+const EXPIRES_AT = '2026-01-02T04:04:05.000Z';
 /** 注入载荷：只允许出现在参数里，绝不允许出现在 SQL 文本或错误信息里 */
 const INJECTION = "x'); DROP TABLE export_jobs; --";
 /** 伪造的产物路径（含疑似身份证号）：绝不允许入库到领域对象或外发 */
@@ -199,6 +205,7 @@ const PENDING_JOB: ExportRequest = {
   resource: ExportResource.Profile,
   fields: ['college', 'major'],
   status: ExportStatus.Pending,
+  expiresAt: EXPIRES_AT,
   createdAt: CREATED_AT,
   updatedAt: CREATED_AT,
 };
@@ -237,6 +244,8 @@ function rowFromJob(
     fields: [...job.fields],
     status: job.status,
     artifact_id: job.artifactId === undefined ? null : job.artifactId,
+    // 领域字段缺省 ⇒ 存储 NULL（不是省略键：PG 对 SELECT 列表中的列一定返回键）
+    expires_at: job.expiresAt === undefined ? null : new Date(job.expiresAt),
     created_at: new Date(job.createdAt),
     updated_at: new Date(job.updatedAt),
     ...overrides,
@@ -527,6 +536,7 @@ describe('PostgreSQL 导出仓储：能力声明与交付边界', () => {
       'requester_id',
       'resource',
       'fields',
+      'expires_at',
       'created_at',
     ]);
     // 可变列 ∪ 不可变列 === 列清单，且两者不相交
@@ -537,23 +547,40 @@ describe('PostgreSQL 导出仓储：能力声明与交付边界', () => {
     expect(
       [...POSTGRES_EXPORT_MUTABLE_COLUMNS, ...POSTGRES_EXPORT_IMMUTABLE_COLUMNS].sort(),
     ).toEqual([...POSTGRES_EXPORT_COLUMNS].sort());
-    // 写回不得触碰身份 / 归属 / 导出范围
-    for (const forbidden of ['id', 'requester_id', 'resource', 'fields', 'created_at']) {
+    // 写回不得触碰身份 / 归属 / 导出范围 / 有效期
+    for (const forbidden of [
+      'id',
+      'requester_id',
+      'resource',
+      'fields',
+      'expires_at',
+      'created_at',
+    ]) {
       expect(POSTGRES_EXPORT_MUTABLE_COLUMNS).not.toContain(forbidden);
     }
   });
 
-  it('PII 与公开输出裁剪列覆盖归属、产物句柄与全部内部列，且不含公开视图字段', () => {
+  it('PII 与公开输出裁剪列覆盖归属、产物句柄、服务端有效期与全部内部列，且不含公开视图字段', () => {
     expect([...POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS]).toEqual([
       'requester_id',
       'artifact_id',
+      'expires_at',
       ...POSTGRES_EXPORT_INTERNAL_COLUMNS,
     ]);
-    for (const column of ['requester_id', 'artifact_id', ...POSTGRES_EXPORT_INTERNAL_COLUMNS]) {
-      expect(POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS).toContain(column);
-    }
     for (const column of [
       'requester_id',
+      'artifact_id',
+      'expires_at',
+      ...POSTGRES_EXPORT_INTERNAL_COLUMNS,
+    ]) {
+      expect(POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS).toContain(column);
+    }
+    // 有效期是本切片新引入的「不进公开视图」的列：它必须在裁剪清单里，
+    // 否则「顺手把 expiresAt 加进公开视图」就不会被模块加载期自检拦下
+    expect(POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS).toContain('expires_at');
+    for (const column of [
+      'requester_id',
+      'expires_at',
       'file_name',
       'file_path',
       'download_url',
@@ -571,7 +598,7 @@ describe('PostgreSQL 导出仓储：能力声明与交付边界', () => {
       expect(POSTGRES_EXPORT_PII_COLUMNS).toContain(column);
     }
     // 高敏声明必须覆盖**全部**内部列（fail-closed：凡不进入公开视图的列一律按高敏处理）
-    for (const column of ['requester_id', ...POSTGRES_EXPORT_INTERNAL_COLUMNS]) {
+    for (const column of ['requester_id', 'expires_at', ...POSTGRES_EXPORT_INTERNAL_COLUMNS]) {
       expect(POSTGRES_EXPORT_PII_COLUMNS).toContain(column);
     }
     // 高敏集合与公开视图字段零交集（公开字段绝不能被登记为高敏）
@@ -604,14 +631,32 @@ describe('PostgreSQL 导出仓储：能力声明与交付边界', () => {
       'utf8',
     );
     expect(migration).toMatch(/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+export_jobs\s*\(/u);
-    // 迁移的列清单必须覆盖 adapter 的**每一个**输出列（少了任何一列，读取路径立刻 fail-closed）
+    // 迁移的列清单必须覆盖 adapter 的**每一个**输出列（少了任何一列，读取路径立刻 fail-closed）。
+    // 唯一例外是服务端有效期 `expires_at`：0013 已应用且校验和钉住、不可改写，因此它由
+    // **后续迁移 0015** 补出（迁移不可改写 ⇒ 加列必须新增迁移，而不是回头改 0013）。
     for (const column of POSTGRES_EXPORT_COLUMNS) {
-      expect(migration).toMatch(new RegExp(`\\b${column}\\b`, 'u'));
+      if (column === 'expires_at') continue;
+      expect(migration).toMatch(
+        new RegExp(`^\\s+${column}\\s+(?:uuid|varchar|text|timestamptz)`, 'mu'),
+      );
     }
+    // 0013 里 `expires_at` 只允许出现在「刻意不建」的说明注释里，不得是真实列定义
+    expect(migration).not.toMatch(/^\s+expires_at\s+(?:uuid|varchar|text|timestamptz)/mu);
+    // 0015 必须真的把该列加出来（不是只在注释里声明），且列类型是 timestamptz（绝对时刻）
+    const expiryMigration = readFileSync(
+      join(REPO_ROOT, 'db', 'migrations', '0015_export_jobs_expiry.sql'),
+      'utf8',
+    );
+    expect(expiryMigration).toMatch(/ALTER\s+TABLE\s+export_jobs\b/iu);
+    expect(expiryMigration).toMatch(/expires_at\s+timestamptz/iu);
+    expect(expiryMigration).not.toMatch(/CREATE\s+TABLE\b/iu);
     // 存储侧内部列（产物位置 / 文件路径 / 下载与签名地址 / 存储 key / 文件体 / 原始错误 / 簿记）
     // 一律不得被声明成真实列——它们只允许出现在「刻意不建」的说明注释里
     for (const column of POSTGRES_EXPORT_INTERNAL_COLUMNS) {
       expect(migration).not.toMatch(
+        new RegExp(`^\\s+${column}\\s+(?:uuid|varchar|text|timestamptz)`, 'mu'),
+      );
+      expect(expiryMigration).not.toMatch(
         new RegExp(`^\\s+${column}\\s+(?:uuid|varchar|text|timestamptz)`, 'mu'),
       );
     }
@@ -794,7 +839,8 @@ describe('PostgreSQL 导出仓储：参数化 SQL 与固定标识符', () => {
     for (const value of [OWNER, JOB_ID, 'profile', 'college', 'major', CREATED_AT]) {
       expect(sql).not.toContain(value);
     }
-    // 参数顺序由列清单派生：id, requester_id, resource, fields, status, artifact_id, created_at, updated_at
+    // 参数顺序由列清单派生：id, requester_id, resource, fields, status, artifact_id, expires_at,
+    // created_at, updated_at
     expect(call?.parameters).toEqual([
       JOB_ID,
       OWNER,
@@ -802,11 +848,13 @@ describe('PostgreSQL 导出仓储：参数化 SQL 与固定标识符', () => {
       ['college', 'major'],
       'pending',
       null,
+      EXPIRES_AT,
       CREATED_AT,
       CREATED_AT,
     ]);
     expect(parameterAt(call, 'requester_id')).toBe(OWNER);
     expect(parameterAt(call, 'artifact_id')).toBeNull();
+    expect(parameterAt(call, 'expires_at')).toBe(EXPIRES_AT);
     expect(parameterAt(call, 'created_at')).toBe(CREATED_AT);
   });
 
@@ -843,7 +891,7 @@ describe('PostgreSQL 导出仓储：参数化 SQL 与固定标识符', () => {
       for (const internal of POSTGRES_EXPORT_INTERNAL_COLUMNS) {
         expect(containsWord(call.sql, internal)).toBe(false);
       }
-      // 归属与产物句柄是列清单内的裁剪列：可以出现在 SQL 里，但绝不能进入公开视图
+      // 归属、产物句柄与服务端有效期是列清单内的裁剪列：可以出现在 SQL 里，但绝不能进入公开视图
       for (const excluded of POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS) {
         if (
           POSTGRES_EXPORT_COLUMNS.includes(excluded as (typeof POSTGRES_EXPORT_COLUMNS)[number])
@@ -857,7 +905,7 @@ describe('PostgreSQL 导出仓储：参数化 SQL 与固定标识符', () => {
       POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS.filter((column) =>
         POSTGRES_EXPORT_COLUMNS.includes(column as (typeof POSTGRES_EXPORT_COLUMNS)[number]),
       ),
-    ).toEqual(['requester_id', 'artifact_id']);
+    ).toEqual(['requester_id', 'artifact_id', 'expires_at']);
   });
 
   it('表名与列名都是裸小写标识符（杜绝用标识符夹带 SQL 片段）', () => {
@@ -958,7 +1006,6 @@ describe('PostgreSQL 导出仓储：严格行契约与未知列', () => {
       'requester_id',
       'owner_user_id',
       'user_id',
-      'artifactId',
       'artifact_id',
       'filePath',
       'file_path',
@@ -967,7 +1014,7 @@ describe('PostgreSQL 导出仓储：严格行契约与未知列', () => {
       'roles',
       'scope',
       'groupId',
-      'expiresAt',
+      'expires_at',
       'deletedAt',
       'idempotencyKey',
     ]) {
@@ -1022,6 +1069,14 @@ describe('PostgreSQL 导出仓储：严格行契约与未知列', () => {
       { updated_at: '2026-13-45T99:99:99.000Z' },
       { updated_at: new Date(Number.NaN) },
       { updated_at: {} },
+      // 服务端有效期同样只接受 Date / ISO datetime：**非法形态 fail-closed**，
+      // 但「缺省」是合法的（见下一条用例），两者必须被区分对待
+      { expires_at: '2026/01/05' },
+      { expires_at: 'not-a-date' },
+      { expires_at: 1767323045000 },
+      { expires_at: '' },
+      { expires_at: {} },
+      { expires_at: new Date(Number.NaN) },
     ]) {
       const { repository } = repoWith({
         rows: [rowFromJob(COMPLETED_JOB, overrides)],
@@ -1031,6 +1086,70 @@ describe('PostgreSQL 导出仓储：严格行契约与未知列', () => {
       expect(error.code).toBe('INVALID_ROW');
       expectNoValueLeak(error);
     }
+  });
+
+  it('服务端有效期：非空可往返、NULL 映射为字段缺省（fail-closed 而不是行契约违规）', async () => {
+    // 1) 非空：仍然走严格时间契约，且映射回领域层时是**同一个** UTC ISO 形态（写入侧同形）
+    const withExpiry = repoWith({ rows: [rowFromJob(COMPLETED_JOB)], rowCount: 1 });
+    await expect(withExpiry.repository.listByOwnerId(OWNER)).resolves.toEqual([COMPLETED_JOB]);
+
+    // 2) NULL：映射为「没有 expiresAt」，**不是** INVALID_ROW。
+    //    理由是安全属性：NULL 必须由下载边界统一 fail-closed（与「不存在 / 跨主体 / 未完成 /
+    //    产物缺失」同一 404），若在这里判成 500，「这条记录存在但缺有效期」就被外发出来了。
+    const withoutExpiry = repoWith({
+      rows: [rowFromJob(COMPLETED_JOB, { expires_at: null })],
+      rowCount: 1,
+    });
+    const records = await withoutExpiry.repository.listByOwnerId(OWNER);
+    expect(records).toHaveLength(1);
+    expect(records[0]).not.toHaveProperty('expiresAt');
+    expect(Object.keys(records[0] ?? {}).sort()).toEqual(
+      [
+        'artifactId',
+        'createdAt',
+        'fields',
+        'id',
+        'ownerUserId',
+        'resource',
+        'status',
+        'updatedAt',
+      ].sort(),
+    );
+
+    // 3) 缺省字段写入 ⇒ 参数是 NULL（**列仍然出现在 INSERT 里**，绝不因为缺省就省略列，
+    //    否则参数与占位符会错位），返回行也不带 expiresAt（往返一致）
+    const entry = { ...PENDING_JOB } as Record<string, unknown>;
+    delete entry['expiresAt'];
+    const created = repoWith({
+      rows: [rowFromJob(entry as unknown as ExportRequest)],
+      rowCount: 1,
+    });
+    const written = await created.repository.create(entry as unknown as ExportRequest);
+    expect(written).not.toHaveProperty('expiresAt');
+    expect(parameterAt(callAt(created.executor, 0), 'expires_at')).toBeNull();
+  });
+
+  it('写回路径不得改写服务端有效期：返回行被旁路改写成别的有效期 ⇒ IDENTITY_MISMATCH', async () => {
+    // 写回语句的 SET 里没有 expires_at（不可变列），因此存储层返回的值必须与请求记录逐字节一致。
+    // 若存储被旁路改写（触发器 / SQL 被替换），这里必须 fail-closed —— 否则「把已过期的交付物
+    // 续期回可下载状态」会成为一条静默可达的路径。
+    const tampered = repoWith({
+      rows: [rowFromJob(COMPLETED_JOB, { expires_at: new Date('2027-01-01T00:00:00.000Z') })],
+      rowCount: 1,
+    });
+    const error = await captureRepoError(() => tampered.repository.save(COMPLETED_JOB));
+    expect(error.code).toBe('IDENTITY_MISMATCH');
+    expectIssueOn(error, 'expires_at');
+    expectNoValueLeak(error);
+    // 反向：有效期被**清空**（NULL）同样是改写，不得被当作「记为缺失」而放行
+    const cleared = repoWith({
+      rows: [rowFromJob(COMPLETED_JOB, { expires_at: null })],
+      rowCount: 1,
+    });
+    const clearedError = await captureRepoError(() => cleared.repository.save(COMPLETED_JOB));
+    expect(clearedError.code).toBe('IDENTITY_MISMATCH');
+    expectIssueOn(clearedError, 'expires_at');
+    expectNoValueLeak(clearedError);
   });
 
   it('行内的存储标识必须落在存储 ID 域（规范小写、非空 UUID）', async () => {
@@ -1936,7 +2055,7 @@ describe('PostgreSQL 导出仓储：单条取数的归属隔离（下载切片�
     const call = callAt(executor, 0);
     const sql = call?.sql ?? '';
     expect(sql).toContain(
-      'SELECT id, requester_id, resource, fields, status, artifact_id, created_at, updated_at',
+      'SELECT id, requester_id, resource, fields, status, artifact_id, expires_at, created_at, updated_at',
     );
     expect(sql).not.toContain('*');
     expect(sql).toContain('WHERE id = $1::uuid AND requester_id = $2::uuid');
