@@ -2,6 +2,8 @@ import { Body, Controller, Get, Headers, Inject, Post } from '@nestjs/common';
 import { requireSubject } from '../auth/require-subject';
 import { SESSION_SUBJECT_RESOLVER } from '../auth/session-subject.port';
 import type { SessionSubjectResolver } from '../auth/session-subject.port';
+import { ok } from '@rm/shared';
+import type { ApiEnvelope } from '@rm/shared';
 import type { MatchingRequestView } from './matching.contract';
 import { MatchingService } from './matching.service';
 
@@ -44,10 +46,11 @@ export class MatchingController {
   async createMyMatchingRequest(
     @Headers('authorization') authorization: string | undefined,
     @Body() body: unknown,
-  ): Promise<MatchingRequestView> {
-    return this.matching.createMyMatchingRequest(
+  ): Promise<ApiEnvelope<MatchingRequestView>> {
+    const view = await this.matching.createMyMatchingRequest(
       await requireSubject(this.sessions, authorization),
       body,
     );
+    return ok(view, { fallbackUsed: view.fallbackUsed, modelVersion: view.modelVersion });
   }
 }

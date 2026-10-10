@@ -357,6 +357,8 @@ describe('匹配：成功路径（真实 HTTP + 统一响应信封）', () => {
     expect(res.status).toBe(201);
     expect(Object.keys(res.body).sort()).toEqual(['data', 'error', 'meta']);
     expect(res.body.error).toBeNull();
+    expect(res.body.meta.fallbackUsed).toBe(true);
+    expect(res.body.meta.modelVersion).toBe('test-model');
     const view = viewOf(res.body);
     expect(Object.keys(view).sort()).toEqual([...MATCHING_REQUEST_VIEW_FIELDS].sort());
     expect(view.id).toMatch(UUID_V4);
@@ -471,6 +473,8 @@ describe('匹配：成功路径（真实 HTTP + 统一响应信封）', () => {
       headers: bearer(SESSION_STUDENT_1),
     });
     expect(res.status).toBe(201);
+    expect(res.body.meta.fallbackUsed).toBe(false);
+    expect(res.body.meta.modelVersion).toBe('test-model');
     expect(viewOf(res.body).fallbackUsed).toBe(false);
     expect(viewOf(res.body).degradationCode).toBeUndefined();
     expect(recommendationsOf(res.body)).toEqual([
