@@ -9,6 +9,7 @@ import {
   DEMO_SELF_STATISTICS,
   buildDemoApplicationPage,
   demoExportItems,
+  demoNotificationItems,
 } from './demo-data';
 import { ENDPOINTS, endpointPath, endpointRef } from './endpoints';
 import {
@@ -18,6 +19,7 @@ import {
   readExportView,
 } from './export-view';
 import { looksLikePendingEndpoint, toUiError } from './errors';
+import { readNotificationList, readNotificationView } from './notification-view';
 import { ADMIN_STATISTICS_SOURCES } from './types';
 import type {
   AdminApplicationPage,
@@ -26,6 +28,7 @@ import type {
   ExportRequestView,
   HealthView,
   MyExportPage,
+  NotificationView,
   SelfStatisticsView,
   StatisticsSourceResult,
   StudentProfileView,
@@ -84,6 +87,24 @@ export interface AdminGateway {
    * 且演示网关不持有任何 `ApiClient`，因此结构上不可能发出请求。
    */
   revokeExport(exportId: string): Promise<ExportRequestView>;
+  /**
+   * **本人通知列表**（`GET /me/notifications`）。
+   *
+   * 端点不接受任何查询参数（`?userId=`/`?roles=`/`?scope=`/`?groupId=` 一律 400），因此这里既不
+   * 拼查询串、也没有任何「按归属筛选」的口子：归属由服务端的会话主体决定。响应按白名单读取，
+   * 形状不符即抛契约违规错误（宁可显示「响应不符合接口契约」，也不把未知形状渲染成通知）。
+   */
+  loadMyNotifications(): Promise<NotificationView[]>;
+  /**
+   * **标记本人通知已读**（`PATCH /me/notifications/{notificationId}/read`）。
+   *
+   * 入参只有路径参数 `notificationId`：不发请求体、不带查询串，因此不存在「客户端提交已读状态 /
+   * 已读时间 / 归属」的入口。服务端只推进唯一前向边 `unread -> read` 且**幂等**（已读记录原样返回，
+   * 不改写 `readAt`）；「不存在 / 非本人所有」统一收敛为同一个 404，界面不区分原因。
+   * 演示模式**拒绝**该写操作（`DEMO_READ_ONLY`），且演示网关不持有任何 `ApiClient`，
+   * 因此结构上不可能发出请求，也不可能返回本地「假装已读成功」的结果。
+   */
+  markNotificationRead(notificationId: string): Promise<NotificationView>;
 }
 
 export interface MyExportsQuery {
@@ -207,6 +228,39 @@ export function createLiveGateway(client: ApiClient): AdminGateway {
       }
       return view;
     },
+
+    /**
+     * 本人通知列表：**不带任何查询串**（服务端查询参数闭集是空集），响应按白名单逐条读取。
+     * 任一条形态非法即抛契约违规错误：不静默丢行，也不把未知形状当成「没有通知」。
+     */
+    async loadMyNotifications(): Promise<NotificationView[]> {
+      const envelope = await client.getEnvelope<unknown>(ENDPOINTS.myNotifications.path);
+      const items = readNotificationList(envelope.data);
+      if (items === null) {
+        throw contractError();
+      }
+      return items;
+    },
+
+    /**
+     * 标记本人通知已读：**没有请求体、没有查询串**，唯一输入是路径里的通知 ID。
+     *
+     * `client.patchJson(path, undefined)` 刻意把请求体传成 `undefined` 而不是 `{}`：客户端只在
+     * 请求体不是 `undefined` 时才发送 `content-type` 与请求体，因此服务端的「不接受任何请求体
+     * 字段」闭集在线上被真实满足——`{ status: 'read' }` 之类在结构上就没有提交入口。
+     * 路径参数经 `endpointPath` 单点校验与转义（含 `/`、空串一律 fail fast）。
+     */
+    async markNotificationRead(notificationId: string): Promise<NotificationView> {
+      const data = await client.patchJson<unknown>(
+        endpointPath(ENDPOINTS.notificationRead, { notificationId }),
+        undefined,
+      );
+      const view = readNotificationView(data);
+      if (view === null) {
+        throw contractError();
+      }
+      return view;
+    },
   };
 }
 
@@ -233,6 +287,8 @@ export function createMisconfiguredGateway(error: ApiClientError): AdminGateway 
     loadApplications: () => reject(),
     loadMyExports: () => reject(),
     revokeExport: () => reject(),
+    loadMyNotifications: () => reject(),
+    markNotificationRead: () => reject(),
   };
 }
 
@@ -329,6 +385,24 @@ export function createDemoGateway(options: DemoGatewayOptions = {}): AdminGatewa
      * 也返回本地「假装撤销成功」的结果——那正是本项目禁止的（见 `DEMO_READ_ONLY_MESSAGE`）。
      */
     async revokeExport(): Promise<ExportRequestView> {
+      await wait();
+      throw new ApiClientError('DEMO_READ_ONLY', DEMO_READ_ONLY_MESSAGE);
+    },
+
+    /**
+     * 演示通知列表：一次性返回夹具（两种阅读状态各有覆盖）。
+     * 夹具由 `demoNotificationItems()` 返回**副本**，页面对返回值做任何事都不会污染夹具。
+     */
+    async loadMyNotifications(): Promise<NotificationView[]> {
+      await wait();
+      return demoNotificationItems();
+    },
+
+    /**
+     * 演示模式**拒绝**标记已读：这是写操作。演示网关既不持有 `ApiClient`（结构上发不出请求），
+     * 也不返回本地「假装已读」的结果——那正是本项目禁止的（见 `DEMO_READ_ONLY_MESSAGE`）。
+     */
+    async markNotificationRead(): Promise<NotificationView> {
       await wait();
       throw new ApiClientError('DEMO_READ_ONLY', DEMO_READ_ONLY_MESSAGE);
     },

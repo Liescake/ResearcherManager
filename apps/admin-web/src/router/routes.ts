@@ -11,6 +11,8 @@ export const ROUTE_IDS = [
   'applications',
   'reviews',
   'reviewDetail',
+  'notifications',
+  'exports',
   'profile',
   'notFound',
 ] as const;
@@ -45,6 +47,22 @@ export const ROUTES: Record<RouteId, RouteDefinition> = {
     title: '统计概览',
     nav: true,
     summary: '本人记录概览（已实现）、管理端统计边界（待后端切片）与共享口径自检。',
+  },
+  notifications: {
+    id: 'notifications',
+    path: '/notifications',
+    requiresAuth: true,
+    title: '我的通知',
+    nav: true,
+    summary: '本人站内通知：服务端白名单字段展示与标记已读（无请求体、幂等、失败不伪造成功）。',
+  },
+  exports: {
+    id: 'exports',
+    path: '/exports',
+    requiresAuth: true,
+    title: '我的导出',
+    nav: true,
+    summary: '本人导出请求的状态与撤销（确认弹窗、幂等、防重复提交；不提供下载入口）。',
   },
   applications: {
     id: 'applications',
@@ -91,13 +109,42 @@ export const ROUTES: Record<RouteId, RouteDefinition> = {
 export const LOGIN_PATH = ROUTES.login.path;
 export const HOME_PATH = ROUTES.overview.path;
 
-/** 主导航顺序：概览 → 申请列表 → 审核（预留）→ 个人资料 */
-export const NAV_ROUTES: readonly RouteDefinition[] = [
-  ROUTES.overview,
-  ROUTES.applications,
-  ROUTES.reviews,
-  ROUTES.profile,
+/**
+ * 主导航分组（信息架构的单一来源）：
+ * - 工作台：进入系统后的第一屏；
+ * - 申请管理：管理职责（列表 + 预留审核），后端切片未上线的部分在标题里就标注「预留」；
+ * - 个人中心：一切「只关于本人」的数据（通知 / 导出 / 资料），归属只由服务端会话主体判定。
+ *
+ * 把「本人」与「管理」分开，是为了让使用者在导航层就能分清数据范围，
+ * 而不是在同一页里混排本人记录与管理视图。
+ */
+export interface NavGroup {
+  readonly id: 'workspace' | 'management' | 'personal';
+  readonly title: string;
+  readonly routes: readonly RouteDefinition[];
+}
+
+export const NAV_GROUPS: readonly NavGroup[] = [
+  { id: 'workspace', title: '工作台', routes: [ROUTES.overview] },
+  { id: 'management', title: '申请管理', routes: [ROUTES.applications, ROUTES.reviews] },
+  {
+    id: 'personal',
+    title: '个人中心',
+    routes: [ROUTES.notifications, ROUTES.exports, ROUTES.profile],
+  },
 ];
+
+/** 主导航顺序（扁平视图，与分组顺序一致） */
+export const NAV_ROUTES: readonly RouteDefinition[] = NAV_GROUPS.flatMap((group) => group.routes);
+
+/**
+ * 导航高亮归属：不在导航里的子路由（审核详情）高亮其父入口，
+ * 使用者因此始终知道自己「在哪一块」。
+ */
+export function navOwnerOf(routeId: RouteId): RouteId | null {
+  if (routeId === 'reviewDetail') return 'reviews';
+  return ROUTES[routeId].nav ? routeId : null;
+}
 
 /** 按注册顺序匹配（先具体、后兜底 `*`） */
 export const ROUTE_MATCH_ORDER: readonly RouteDefinition[] = [
@@ -106,6 +153,8 @@ export const ROUTE_MATCH_ORDER: readonly RouteDefinition[] = [
   ROUTES.overview,
   ROUTES.applications,
   ROUTES.reviews,
+  ROUTES.notifications,
+  ROUTES.exports,
   ROUTES.profile,
   ROUTES.notFound,
 ];

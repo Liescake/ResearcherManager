@@ -13,11 +13,13 @@ import {
   DEMO_ADMIN_STATISTICS,
   DEMO_APPLICATIONS,
   DEMO_EDUCATION_RECORDS,
+  DEMO_NOTIFICATIONS,
   DEMO_PROFILE,
   DEMO_SELF_STATISTICS,
   buildDemoApplicationPage,
+  demoNotificationItems,
 } from './demo-data';
-import { ADMIN_STATISTICS_SOURCES } from './types';
+import { ADMIN_STATISTICS_SOURCES, NOTIFICATION_STATUS_VALUES } from './types';
 
 describe('演示夹具与共享契约保持一致', () => {
   it('申请条目的枚举取值都在共享闭集内', () => {
@@ -67,6 +69,38 @@ describe('演示夹具与共享契约保持一致', () => {
     expect(result.excludedPreparing).toBe(1);
     expect(result.excludedNotApproved).toBe(1);
     expect(result.rate).toBeCloseTo(2 / 3, 5);
+  });
+
+  it('通知夹具只含服务端白名单字段：状态在闭集内、已读必带 readAt，且不含归属 / 渠道', () => {
+    expect(DEMO_NOTIFICATIONS.length).toBeGreaterThan(0);
+    const allowed = ['body', 'createdAt', 'id', 'readAt', 'status', 'title', 'type', 'updatedAt'];
+    for (const item of DEMO_NOTIFICATIONS) {
+      expect(NOTIFICATION_STATUS_VALUES).toContain(item.status);
+      expect(item.id.length).toBeGreaterThan(0);
+      expect(item.title.length).toBeGreaterThan(0);
+      expect(Number.isNaN(Date.parse(item.createdAt))).toBe(false);
+      expect(Number.isNaN(Date.parse(item.updatedAt))).toBe(false);
+      if (item.status === 'read') {
+        expect(item.readAt).toBeDefined();
+        expect(Number.isNaN(Date.parse(item.readAt ?? ''))).toBe(false);
+      } else {
+        expect(item.readAt).toBeUndefined();
+      }
+      // 归属、会话票据、深链路径、投递渠道都不是接口视图字段，夹具里也不许出现
+      for (const key of Object.keys(item)) {
+        expect(allowed).toContain(key);
+      }
+    }
+  });
+
+  it('通知夹具返回副本：就地修改不污染夹具', () => {
+    const items = demoNotificationItems();
+    const first = items[0];
+    expect(first).toBeDefined();
+    if (first !== undefined) {
+      first.title = '被就地修改';
+    }
+    expect(DEMO_NOTIFICATIONS[0]?.title).not.toBe('被就地修改');
   });
 });
 

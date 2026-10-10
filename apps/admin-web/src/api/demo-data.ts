@@ -11,6 +11,7 @@ import type {
   AdminApplicationListItem,
   DashboardMetric,
   ExportRequestView,
+  NotificationView,
   StudentProfileView,
   SelfStatisticsView,
 } from './types';
@@ -169,6 +170,67 @@ export const DEMO_EXPORTS: readonly ExportRequestView[] = [
 /** 返回**副本**：演示页面就地修改返回值不得污染夹具（与申请列表夹具同口径） */
 export function demoExportItems(): ExportRequestView[] {
   return DEMO_EXPORTS.map((item) => ({ ...item, fields: [...item.fields] }));
+}
+
+/**
+ * 本人通知夹具：**两种阅读状态各有覆盖**，用来走查「哪些能标记已读、哪些必须没有入口」。
+ *
+ * 与其它夹具同一条纪律：全部是合成数据（假 UUID、演示标题与正文），不含任何真实用户信息，
+ * 也**不含归属字段**（`userId` / `ownerUserId`）、会话票据、深链路径、投递渠道 / provider——
+ * 这些既不是接口视图的字段，也不该出现在界面的任何位置。正文刻意写成普通演示文本，
+ * 不含身份证号 / 密钥之类高敏内容的形状。
+ */
+function demoNotificationView(
+  index: number,
+  overrides: Pick<NotificationView, 'type' | 'title' | 'body' | 'status'> &
+    Partial<Pick<NotificationView, 'readAt'>>,
+): NotificationView {
+  const day = String((index % 27) + 1).padStart(2, '0');
+  const createdAt = `2026-10-${day}T01:00:00.000Z`;
+  return {
+    id: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+    type: overrides.type,
+    title: overrides.title,
+    body: overrides.body,
+    status: overrides.status,
+    createdAt,
+    updatedAt: overrides.readAt ?? createdAt,
+    ...(overrides.readAt === undefined ? {} : { readAt: overrides.readAt }),
+  };
+}
+
+export const DEMO_NOTIFICATIONS: readonly NotificationView[] = [
+  demoNotificationView(1, {
+    type: 'membership_review',
+    title: '入组申请审核结果（演示）',
+    body: '你提交的入组申请已通过审核，可在小组页查看成员信息。（演示文本）',
+    status: 'unread',
+  }),
+  demoNotificationView(2, {
+    type: 'matching_result',
+    title: '匹配请求处理结果（演示）',
+    body: '你的匹配请求已有新结果，请在匹配页确认是否接受。（演示文本）',
+    status: 'unread',
+  }),
+  demoNotificationView(3, {
+    type: 'announcement',
+    title: '站内公告（演示）',
+    body: '本周六进行组会，请提前准备进展汇报。（演示文本）',
+    status: 'read',
+    readAt: '2026-10-04T03:00:00.000Z',
+  }),
+  demoNotificationView(4, {
+    type: 'achievement_review',
+    title: '成果审核结果（演示）',
+    body: '你登记的成果已通过审核。（演示文本）',
+    status: 'read',
+    readAt: '2026-10-05T03:00:00.000Z',
+  }),
+];
+
+/** 返回**副本**：演示页面就地修改返回值不得污染夹具（与其它夹具同口径） */
+export function demoNotificationItems(): NotificationView[] {
+  return DEMO_NOTIFICATIONS.map((item) => ({ ...item }));
 }
 
 export interface DemoApplicationQuery {

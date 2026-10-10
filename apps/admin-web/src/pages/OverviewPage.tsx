@@ -11,6 +11,7 @@ import { ADMIN_STATISTICS_SOURCES, type StatisticsSourceResult } from '../api/ty
 import { useAuth } from '../auth/AuthContext';
 import { AsyncStateView } from '../components/AsyncStateView';
 import { MyExportsPanel } from '../components/MyExportsPanel';
+import { MyNotificationsPanel } from '../components/MyNotificationsPanel';
 import {
   EmptyPanel,
   ErrorPanel,
@@ -18,6 +19,14 @@ import {
   PendingEndpointPanel,
 } from '../components/StatePanel';
 import { useLoader } from '../state/useLoader';
+import {
+  INITIAL_NOTIFICATION_FLOW,
+  markReadFailed,
+  markReadSucceeded,
+  dismissNotificationNotice,
+  startMarkRead,
+  type NotificationFlowState,
+} from '../state/notification-flow';
 import {
   INITIAL_REVOKE_FLOW,
   cancelRevoke,
@@ -127,6 +136,9 @@ export function OverviewPage(): ReactNode {
   const myExports = useLoader(() => gateway.loadMyExports(), [gateway], {
     endpoint: endpointRef(ENDPOINTS.myExports),
   });
+  const myNotifications = useLoader(() => gateway.loadMyNotifications(), [gateway], {
+    endpoint: endpointRef(ENDPOINTS.myNotifications),
+  });
 
   /**
    * 撤销流程状态。持有它的原因：撤销是写操作，它的时序（确认、提交中、成功、失败）
@@ -160,6 +172,41 @@ export function OverviewPage(): ReactNode {
     if (outcome.exportId === null) return;
     setRevokeFlow(outcome.state);
     void submitRevoke(outcome.exportId);
+  };
+
+  /**
+   * 标记通知已读的交互状态（纯函数状态机，见 `state/notification-flow.ts`）。
+   * 与撤销同样的理由：它是**写操作**，时序（双击、提交中、失败不伪造成功）必须在渲染之外被固定。
+   */
+  const [notificationFlow, setNotificationFlow] =
+    useState<NotificationFlowState>(INITIAL_NOTIFICATION_FLOW);
+  /**
+   * 防重复提交的**同步保险**（与撤销同构）：`notificationFlow.pendingId` 要等下一次渲染才生效，
+   * 一次极快的双击仍可能在上一次 setState 生效之前进入提交路径，ref 在同一 tick 内即可挡住。
+   * 真正的幂等判定仍在服务端（重复标记同样返回已读，不会改写已读时间）。
+   */
+  const markReadInFlight = useRef(false);
+
+  const submitMarkRead = async (notificationId: string): Promise<void> => {
+    if (markReadInFlight.current) return;
+    markReadInFlight.current = true;
+    try {
+      // 只提交路径参数：不发请求体、不带查询串，票据由 api client 注入（前端不读也不存）
+      const view = await gateway.markNotificationRead(notificationId);
+      setNotificationFlow((current) => markReadSucceeded(current, view));
+    } catch (caught) {
+      setNotificationFlow((current) => markReadFailed(current, caught));
+    } finally {
+      markReadInFlight.current = false;
+    }
+  };
+
+  const handleMarkRead = (target: { id: string; status: string }): void => {
+    const outcome = startMarkRead(notificationFlow, target);
+    // 不可标记或已在提交中时 outcome.notificationId 为 null：**不发出任何请求**
+    if (outcome.notificationId === null) return;
+    setNotificationFlow(outcome.state);
+    void submitMarkRead(outcome.notificationId);
   };
 
   const isDemo = gateway.mode === 'demo';
@@ -210,6 +257,15 @@ export function OverviewPage(): ReactNode {
         onConfirmRevoke={handleConfirmRevoke}
         onDismissNotice={() => setRevokeFlow((current) => dismissRevokeNotice(current))}
         onRetry={myExports.reload}
+      />
+
+      <MyNotificationsPanel
+        state={myNotifications.state}
+        mode={isDemo ? 'demo' : 'live'}
+        flow={notificationFlow}
+        onRequestMarkRead={handleMarkRead}
+        onDismissNotice={() => setNotificationFlow((current) => dismissNotificationNotice(current))}
+        onRetry={myNotifications.reload}
       />
 
       <section className="card" aria-labelledby="admin-stats-title">

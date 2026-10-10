@@ -7,6 +7,8 @@ import { NotFoundPage } from './pages/NotFoundPage';
 import { ApplicationsPage } from './pages/ApplicationsPage';
 import { LoginPage } from './pages/LoginPage';
 import { OverviewPage } from './pages/OverviewPage';
+import { NotificationsPage } from './pages/NotificationsPage';
+import { ExportsPage } from './pages/ExportsPage';
 import { ProfilePage } from './pages/ProfilePage';
 import { ReviewDetailPage, ReviewsPage } from './pages/ReviewsPage';
 import { matchRoute, navigate, resolveNavigation, useHashLocation } from './router/hash-router';
@@ -94,6 +96,18 @@ function RouteView(): ReactNode {
       return (
         <AppLayout currentRouteId="reviewDetail">
           <ReviewDetailPage applicationId={match.params['applicationId'] ?? ''} />
+        </AppLayout>
+      );
+    case 'notifications':
+      return (
+        <AppLayout currentRouteId="notifications">
+          <NotificationsPage />
+        </AppLayout>
+      );
+    case 'exports':
+      return (
+        <AppLayout currentRouteId="exports">
+          <ExportsPage />
         </AppLayout>
       );
     case 'profile':

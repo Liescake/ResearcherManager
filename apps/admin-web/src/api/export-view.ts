@@ -1,4 +1,4 @@
-import { INVALID_RESPONSE_CODE, INVALID_RESPONSE_MESSAGE, ApiClientError } from './client';
+import { contractError } from './client';
 import type { ExportRequestView, MyExportPage } from './types';
 
 /**
@@ -87,10 +87,11 @@ export function readExportPage(
   return { items, limit, hasNext, nextCursor };
 }
 
-/** 往返相同：把读取失败统一收敛为既有契约违规错误（HTTP 层可能仍是 200） */
-export function contractError(message: string = INVALID_RESPONSE_MESSAGE): ApiClientError {
-  return new ApiClientError(INVALID_RESPONSE_CODE, message, { status: 200 });
-}
+/**
+ * 往返相同：把读取失败统一收敛为既有契约违规错误（HTTP 层可能仍是 200）。
+ * 构造器已抽到 `api/client.ts`（通知切片的白名单读取器共用同一个），这里原样转出以保持引用路径。
+ */
+export { contractError };
 
 /**
  * 本人在列表端点声明的**唯一**查询参数是 `cursor`（`limit` 由服务端默认值决定，前端不提交）。

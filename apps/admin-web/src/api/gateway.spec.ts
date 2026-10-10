@@ -310,6 +310,12 @@ describe('基地址非法时的不可用网关', () => {
     });
     await expect(gateway.loadMyExports()).rejects.toMatchObject({ code: INVALID_BASE_URL_CODE });
     await expect(gateway.revokeExport('x')).rejects.toMatchObject({ code: INVALID_BASE_URL_CODE });
+    await expect(gateway.loadMyNotifications()).rejects.toMatchObject({
+      code: INVALID_BASE_URL_CODE,
+    });
+    await expect(gateway.markNotificationRead('x')).rejects.toMatchObject({
+      code: INVALID_BASE_URL_CODE,
+    });
   });
 });
 
@@ -481,5 +487,267 @@ describe('真实 API 客户端下的撤销（Authorization 注入与票据不落
 
     await createLiveGateway(client).revokeExport(EXPORT_VIEW.id);
     expect(requests[0]?.headers['authorization']).toBeUndefined();
+  });
+});
+
+const NOTIFICATION_VIEW = {
+  id: '00000000-0000-4000-8000-000000000001',
+  type: 'membership_review',
+  title: '入组申请审核结果（演示）',
+  body: '你的入组申请已通过审核。（演示文本）',
+  status: 'unread',
+  createdAt: '2026-10-10T01:00:00.000Z',
+  updatedAt: '2026-10-10T01:00:00.000Z',
+};
+
+const NOTIFICATION_VIEW_FIELDS = [
+  'body',
+  'createdAt',
+  'id',
+  'status',
+  'title',
+  'type',
+  'updatedAt',
+];
+
+describe('联调网关：本人通知', () => {
+  it('列表**不带任何查询串**，并按白名单裁掉归属 / 票据 / 路径 / provider', async () => {
+    const { client, calls } = stubClient({
+      getEnvelope: async () =>
+        ok([
+          {
+            ...NOTIFICATION_VIEW,
+            userId: '99999999-0000-4000-8000-000000000001',
+            ownerUserId: '99999999-0000-4000-8000-000000000002',
+            sessionTicket: 'ticket-super-secret',
+            deepLinkPath: 'pages/notifications/detail',
+            provider: 'wechat-subscribe',
+          },
+        ]),
+    });
+    const items = await createLiveGateway(client).loadMyNotifications();
+
+    // 查询参数闭集是空集：一个参数都不提交（userId / scope / groupId 都没有口子）
+    expect(calls[0]?.method).toBe('GET');
+    expect(calls[0]?.path).toBe('/me/notifications');
+    expect(calls[0]?.path).not.toContain('?');
+    expect(calls[0]?.path).not.toContain('userId');
+    expect(items).toHaveLength(1);
+    expect(Object.keys(items[0] ?? {}).sort()).toEqual(NOTIFICATION_VIEW_FIELDS);
+    const serialized = JSON.stringify(items);
+    expect(serialized).not.toContain('99999999');
+    expect(serialized).not.toContain('ticket-super-secret');
+    expect(serialized).not.toContain('pages/notifications/detail');
+    expect(serialized).not.toContain('wechat-subscribe');
+  });
+
+  it('列表 data 为 null 是空集（服务端空箱），不是崩溃', async () => {
+    const { client } = stubClient({
+      getEnvelope: async () => ({ data: null, meta: {}, error: null }),
+    });
+    expect(await createLiveGateway(client).loadMyNotifications()).toEqual([]);
+  });
+
+  it('列表形状违规 → 契约违规错误（不静默丢行、也不当成空箱）', async () => {
+    const { client } = stubClient({
+      getEnvelope: async () => ok([NOTIFICATION_VIEW, { ...NOTIFICATION_VIEW, id: 7 }]),
+    });
+    await expect(createLiveGateway(client).loadMyNotifications()).rejects.toMatchObject({
+      code: INVALID_RESPONSE_CODE,
+    });
+  });
+
+  it('列表跨字段不变式不自洽 → 契约违规错误（不自相矛盾地渲染状态）', async () => {
+    const { client } = stubClient({
+      getEnvelope: async () => ok([{ ...NOTIFICATION_VIEW, readAt: '2026-10-11T01:00:00.000Z' }]),
+    });
+    await expect(createLiveGateway(client).loadMyNotifications()).rejects.toMatchObject({
+      code: INVALID_RESPONSE_CODE,
+    });
+  });
+
+  it('标记已读：PATCH 到契约路径，**不带请求体**（已读状态 / 已读时间 / 归属都没有客户端入口）', async () => {
+    const { client, calls } = stubClient({
+      patchJson: async () => ({
+        ...NOTIFICATION_VIEW,
+        status: 'read',
+        readAt: '2026-10-11T01:00:00.000Z',
+      }),
+    });
+    const view = await createLiveGateway(client).markNotificationRead(NOTIFICATION_VIEW.id);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.method).toBe('PATCH');
+    expect(calls[0]?.path).toBe(`/me/notifications/${NOTIFICATION_VIEW.id}/read`);
+    expect(calls[0]?.body).toBeUndefined();
+    expect(JSON.stringify(calls[0])).not.toContain('owner');
+    expect(JSON.stringify(calls[0])).not.toContain('status');
+    expect(view.status).toBe('read');
+    expect(view.readAt).toBe('2026-10-11T01:00:00.000Z');
+  });
+
+  it('标记已读：服务端响应只保留白名单字段（归属 / 票据 / provider 不外泄到界面）', async () => {
+    const { client } = stubClient({
+      patchJson: async () => ({
+        ...NOTIFICATION_VIEW,
+        status: 'read',
+        readAt: '2026-10-11T01:00:00.000Z',
+        userId: '99999999-0000-4000-8000-000000000001',
+        sessionTicket: 'ticket-super-secret',
+        provider: 'wechat-subscribe',
+      }),
+    });
+    const view = await createLiveGateway(client).markNotificationRead(NOTIFICATION_VIEW.id);
+    expect(Object.keys(view).sort()).toEqual([...NOTIFICATION_VIEW_FIELDS, 'readAt'].sort());
+    expect(JSON.stringify(view)).not.toContain('99999999');
+    expect(JSON.stringify(view)).not.toContain('ticket-super-secret');
+  });
+
+  it('标记已读：401 / 403 / 503 原样抛出，状态码不被吞掉（由既有错误映射分类）', async () => {
+    for (const status of [401, 403, 503]) {
+      const { client } = stubClient({
+        patchJson: async () => {
+          throw new ApiClientError(`HTTP_${String(status)}`, 'x', { status });
+        },
+      });
+      await expect(
+        createLiveGateway(client).markNotificationRead(NOTIFICATION_VIEW.id),
+      ).rejects.toMatchObject({ status });
+    }
+  });
+
+  it('标记已读：空通知 ID fail fast，请求根本不会发出（不拼半截路径）', async () => {
+    const { client, calls } = stubClient({ patchJson: async () => NOTIFICATION_VIEW });
+    await expect(createLiveGateway(client).markNotificationRead('')).rejects.toThrow();
+    expect(calls).toHaveLength(0);
+  });
+
+  it('标记已读：路径穿越形态的通知 ID 被编码为单段路径，不被前端改写', async () => {
+    const { client, calls } = stubClient({ patchJson: async () => NOTIFICATION_VIEW });
+    await createLiveGateway(client).markNotificationRead('../../etc/passwd');
+    expect(calls[0]?.path).toBe('/me/notifications/..%2F..%2Fetc%2Fpasswd/read');
+  });
+
+  it('标记已读响应形状违规 → 契约违规错误（不把未知形状当成已读成功）', async () => {
+    const { client } = stubClient({ patchJson: async () => ({ status: 'read' }) });
+    await expect(
+      createLiveGateway(client).markNotificationRead(NOTIFICATION_VIEW.id),
+    ).rejects.toMatchObject({ code: INVALID_RESPONSE_CODE });
+  });
+});
+
+describe('演示网关：本人通知', () => {
+  it('返回受控夹具（未读与已读各有覆盖），且不模拟任何服务端能力', async () => {
+    const items = await createDemoGateway().loadMyNotifications();
+    expect(items.length).toBeGreaterThan(0);
+    expect(items.some((item) => item.status === 'unread')).toBe(true);
+    expect(items.some((item) => item.status === 'read')).toBe(true);
+    // 已读记录必须带服务端已读时间；未读记录不得携带（读取契约同口径）
+    for (const item of items) {
+      if (item.status === 'read') expect(item.readAt).toBeDefined();
+      else expect(item.readAt).toBeUndefined();
+    }
+    // 夹具不含任何归属 / 投递渠道字段
+    for (const item of items) {
+      expect(Object.keys(item)).not.toContain('userId');
+      expect(Object.keys(item)).not.toContain('ownerUserId');
+      expect(Object.keys(item)).not.toContain('provider');
+    }
+  });
+
+  it('夹具返回副本：就地修改不污染夹具', async () => {
+    const first = (await createDemoGateway().loadMyNotifications())[0];
+    expect(first).toBeDefined();
+    if (first !== undefined) {
+      first.title = '被就地修改';
+    }
+    const again = await createDemoGateway().loadMyNotifications();
+    expect(again[0]?.title).not.toBe('被就地修改');
+  });
+
+  it('演示模式拒绝标记已读：抛 DEMO_READ_ONLY，不返回任何已读结果', async () => {
+    await expect(
+      createDemoGateway().markNotificationRead(NOTIFICATION_VIEW.id),
+    ).rejects.toMatchObject({
+      code: 'DEMO_READ_ONLY',
+      message: DEMO_READ_ONLY_MESSAGE,
+    });
+  });
+});
+
+/**
+ * 真实客户端 + 真实网关的通知联调回归：证明标记已读**复用既有 API 客户端**（而不是另起一套请求），
+ * 并且会话票据只出现在 `Authorization` 头上——前端代码不读取、不保存、不展示它。
+ */
+describe('真实 API 客户端下的通知（Authorization 注入与票据不落地）', () => {
+  const TICKET = 'ticket-abcd1234';
+
+  interface RecordedNotificationRequest {
+    url: string;
+    method: string;
+    headers: Record<string, string>;
+    body: unknown;
+  }
+
+  function recordingFetch(body: unknown): {
+    fetchImpl: typeof fetch;
+    requests: RecordedNotificationRequest[];
+  } {
+    const requests: RecordedNotificationRequest[] = [];
+    const fetchImpl = (async (input: unknown, init?: RequestInit): Promise<Response> => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      requests.push({
+        url: String(input),
+        method: init?.method ?? 'GET',
+        headers,
+        body: init?.body,
+      });
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as unknown as typeof fetch;
+    return { fetchImpl, requests };
+  }
+
+  it('列表请求只经 Authorization 注入票据，URL 里不出现归属或票据', async () => {
+    const { fetchImpl, requests } = recordingFetch(ok([NOTIFICATION_VIEW]));
+    const client = createApiClient({
+      baseUrl: 'http://127.0.0.1:3000/api/v1',
+      fetchImpl,
+      tokenProvider: () => TICKET,
+    });
+
+    const items = await createLiveGateway(client).loadMyNotifications();
+    const url = requests[0]?.url ?? '';
+    expect(url).toBe('http://127.0.0.1:3000/api/v1/me/notifications');
+    expect(url).not.toContain(TICKET);
+    expect(url).not.toContain('userId');
+    expect(requests[0]?.headers['authorization']).toBe(`Bearer ${TICKET}`);
+    expect(JSON.stringify(items)).not.toContain(TICKET);
+  });
+
+  it('标记已读：带 Authorization、**无请求体、无 content-type**；界面拿到的视图不含票据', async () => {
+    const { fetchImpl, requests } = recordingFetch(
+      ok({ ...NOTIFICATION_VIEW, status: 'read', readAt: '2026-10-11T01:00:00.000Z' }),
+    );
+    const client = createApiClient({
+      baseUrl: 'http://127.0.0.1:3000/api/v1',
+      fetchImpl,
+      tokenProvider: () => TICKET,
+    });
+
+    const view = await createLiveGateway(client).markNotificationRead(NOTIFICATION_VIEW.id);
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.url).toBe(
+      `http://127.0.0.1:3000/api/v1/me/notifications/${NOTIFICATION_VIEW.id}/read`,
+    );
+    expect(requests[0]?.method).toBe('PATCH');
+    expect(requests[0]?.headers['authorization']).toBe(`Bearer ${TICKET}`);
+    // 服务端不接受任何请求体字段：既没有 body，也没有 content-type
+    expect(requests[0]?.body).toBeUndefined();
+    expect(requests[0]?.headers['content-type']).toBeUndefined();
+    expect(JSON.stringify(view)).not.toContain(TICKET);
   });
 });

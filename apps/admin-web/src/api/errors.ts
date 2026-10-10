@@ -41,6 +41,9 @@ export interface UiError {
   endpoint?: string;
 }
 
+/** 非 API 客户端异常的固定安全文案；不得把原始异常文本带入用户界面。 */
+export const UNEXPECTED_ERROR_MESSAGE = '发生未预期错误，请稍后重试。';
+
 const CODE_TO_KIND: Readonly<Record<string, UiErrorKind>> = {
   [ApiErrorCode.Unauthenticated]: 'unauthorized',
   [ApiErrorCode.Forbidden]: 'forbidden',
@@ -114,14 +117,14 @@ export function toUiError(caught: unknown, endpoint?: string): UiError {
     return withEndpoint({
       kind: 'unknown',
       code: 'UNEXPECTED_ERROR',
-      message: caught.message === '' ? '发生未预期错误，请查看浏览器控制台' : caught.message,
+      message: UNEXPECTED_ERROR_MESSAGE,
     });
   }
 
   return withEndpoint({
     kind: 'unknown',
     code: 'UNEXPECTED_ERROR',
-    message: '发生未预期错误，请查看浏览器控制台',
+    message: UNEXPECTED_ERROR_MESSAGE,
   });
 }
 
@@ -175,6 +178,57 @@ export function toExportRevokeUiError(caught: unknown, endpoint?: string): UiErr
       code: EXPORT_UNAVAILABLE_CODE,
       message: EXPORT_REVOKE_UNAVAILABLE_MESSAGE,
     };
+  }
+  return error;
+}
+
+/**
+ * 标记通知已读的**统一安全拒绝**在界面侧的稳定错误码。
+ *
+ * 为什么需要一个前端码：服务端刻意把「不存在 / 非本人所有 / 归属不可读」收敛到**同一个 404 +
+ * 同一文案**（`NOTIFICATION_NOT_VISIBLE_MESSAGE`），目的就是让调用方无法据此构造存在性探测。
+ * 如果界面把裸 404 当成普通「未找到数据」，就丢掉了「这是一次统一拒绝」的语义；如果界面去做更细的
+ * 区分，就等于在自己这边重新泄露原因。因此这里统一成一个码：**界面只表达「当前不可标记已读」，
+ * 不解释为什么**。
+ */
+export const NOTIFICATION_UNAVAILABLE_CODE = 'NOTIFICATION_UNAVAILABLE';
+
+/** 与码配套的用户安全文案：不区分原因、不泄露存在性、不含任何内部字段 */
+export const NOTIFICATION_READ_UNAVAILABLE_MESSAGE =
+  '该通知当前不可标记已读（服务端不区分原因，界面也不推断原因）。列表随后重新加载即可看到最新状态。';
+
+/**
+ * 本地未预期失败（非 `ApiClientError`：序列化异常、路径构造异常等）的统一安全文案。
+ * 绝不把 `caught.message` 之类的**原始异常文本**带进界面——它可能含有内部标识或堆栈信息。
+ */
+export const NOTIFICATION_READ_FAILED_MESSAGE = '标记已读未完成，请稍后重试。';
+
+/**
+ * 标记通知已读调用的错误收敛（**唯一入口**）。规则很少，但每一条都有理由：
+ * 1. **401 / 403 / 503 等一切其它失败沿用既有映射**（`toUiError`）：会话失效、权限不足、
+ *    服务暂不可用各有各的处置，不在这里被压成一句笼统文案；
+ * 2. `not-found`（服务端的统一安全拒绝）→ 换成 `NOTIFICATION_UNAVAILABLE_CODE` + 统一文案，
+ *    保留 `status` / `requestId` / `endpoint` 以便排障；
+ * 3. 演示模式的本地拒绝（`DEMO_READ_ONLY`）归类为 `forbidden`（「本模式不允许写操作」），
+ *    而不是「发生未预期错误」——它是明确的产品策略，不是故障；
+ * 4. 归类不明（`unknown`，含非 `ApiClientError` 的原始异常）→ 换成固定安全文案，
+ *    原始异常文本既不展示也不外传。
+ */
+export function toNotificationReadUiError(caught: unknown, endpoint?: string): UiError {
+  const error = toUiError(caught, endpoint);
+
+  if (error.code === DEMO_READ_ONLY_CODE) {
+    return { ...error, kind: 'forbidden' };
+  }
+  if (error.kind === 'not-found') {
+    return {
+      ...error,
+      code: NOTIFICATION_UNAVAILABLE_CODE,
+      message: NOTIFICATION_READ_UNAVAILABLE_MESSAGE,
+    };
+  }
+  if (error.kind === 'unknown') {
+    return { ...error, message: NOTIFICATION_READ_FAILED_MESSAGE };
   }
   return error;
 }

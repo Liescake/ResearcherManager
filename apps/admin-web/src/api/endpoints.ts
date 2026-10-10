@@ -33,6 +33,8 @@ export type EndpointId =
   | 'adminStatisticsEducation'
   | 'myExports'
   | 'exportRevoke'
+  | 'myNotifications'
+  | 'notificationRead'
   | 'sessionLogin';
 
 export interface EndpointDescriptor {
@@ -148,6 +150,28 @@ export const ENDPOINTS = {
     note:
       '请求体与查询串都是**空集**：归属取服务端会话主体，客户端提交的 userId/ownerId/artifactId/path/status ' +
       '一律 400。不存在 / 跨主体 / failed / 已过期 统一收敛为同一个 404，界面不区分原因。',
+  },
+  myNotifications: {
+    id: 'myNotifications',
+    method: 'GET',
+    path: '/me/notifications',
+    status: 'stable',
+    permissions: [PermissionPoint.ProfileSelfRead],
+    summary: '本人通知列表（站内通知箱）',
+    note:
+      '查询参数闭集是**空集**：?userId=/?roles=/?scope=/?groupId= 一律 400，归属只取服务端会话主体。' +
+      '响应是通知视图数组（无分页、无未读数），字段闭集为 id / type / title / body / status / createdAt / readAt / updatedAt。',
+  },
+  notificationRead: {
+    id: 'notificationRead',
+    method: 'PATCH',
+    path: '/me/notifications/{notificationId}/read',
+    status: 'stable',
+    permissions: [PermissionPoint.ProfileSelfUpdate],
+    summary: '标记本人通知已读（幂等：read 是终态）',
+    note:
+      '不接受任何请求体字段与查询参数：唯一输入是路径里的通知 ID（须为 UUID 形态）。' +
+      '「不存在 / 非本人所有 / 归属不可读」服务端统一收敛为同一个 404，界面不区分原因、也不推断存在性。',
   },
   sessionLogin: {
     id: 'sessionLogin',

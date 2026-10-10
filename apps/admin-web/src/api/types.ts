@@ -192,6 +192,91 @@ export interface MyExportPage {
 }
 
 /**
+ * 通知类型闭集（镜像服务端 `NOTIFICATION_TYPE_VALUES`）。
+ *
+ * 取值只描述「通知因何产生」，**不参与任何授权判定**，也不影响可见范围。前端拿它做展示文案；
+ * 遇到未登记取值时按「未知类型（原值）」呈现，而不是猜成某个已知结论、也不是报错。
+ */
+export const NOTIFICATION_TYPE_VALUES = [
+  'membership_review',
+  'achievement_review',
+  'education_review',
+  'matching_result',
+  'announcement',
+] as const;
+
+export type NotificationType = (typeof NOTIFICATION_TYPE_VALUES)[number];
+
+/** 已知类型的展示文案（仅展示，不构成任何判定） */
+export const NOTIFICATION_TYPE_LABELS: Readonly<Record<NotificationType, string>> = {
+  membership_review: '入组审核',
+  achievement_review: '成果审核',
+  education_review: '升学审核',
+  matching_result: '匹配结果',
+  announcement: '站内公告',
+};
+
+/** 未知类型按原值呈现（原值本身是服务端白名单字段，不含归属或内部标识） */
+export function notificationTypeLabel(type: string): string {
+  const label = NOTIFICATION_TYPE_LABELS[type as NotificationType];
+  return label ?? `未知类型（${type}）`;
+}
+
+/**
+ * 阅读状态闭集（镜像服务端 `NOTIFICATION_STATUS_VALUES`）：只有未读与已读，`read` 是终态。
+ *
+ * 状态**只以服务端返回为准**：界面不做任何本地推断，也不缓存「点过就当作已读」的结论。
+ */
+export const NOTIFICATION_STATUS_VALUES = ['unread', 'read'] as const;
+
+export type NotificationStatus = (typeof NOTIFICATION_STATUS_VALUES)[number];
+
+export const NOTIFICATION_STATUS_LABELS: Readonly<Record<NotificationStatus, string>> = {
+  unread: '未读',
+  read: '已读',
+};
+
+/** 已知状态有确定文案；未知取值按「未知状态（原值）」呈现，绝不猜成某个已知结论 */
+export function notificationStatusLabel(status: string): string {
+  const label = NOTIFICATION_STATUS_LABELS[status as NotificationStatus];
+  return label ?? `未知状态（${status}）`;
+}
+
+/**
+ * **可标记已读闭集**：只有服务端原文为 `unread` 才提供入口。
+ *
+ * 这是白名单而不是黑名单：`read`（终态）以及任何**未知**取值都自动落在闭集之外，
+ * 界面因此不会出现一个「点了必然被服务端拒绝」或「重复提交」的按钮。
+ * 真正的状态推进始终在服务端（唯一前向边 `unread -> read`，且幂等）。
+ */
+export function isNotificationUnread(status: unknown): boolean {
+  return status === 'unread';
+}
+
+/**
+ * 通知对外视图（**逐字段镜像**服务端 `NOTIFICATION_VIEW_FIELDS` 白名单）。
+ *
+ * 刻意不含：归属（`userId` / `ownerUserId`）、投递渠道 / provider、深链路径、存储句柄，
+ * 也不含任何原始异常信息。服务端本就不下发这些字段，前端也不去读它们；即使响应里多带了
+ * 这些键，`api/notification-view.ts` 的读取器也不会把它们带进界面。
+ *
+ * `type` / `status` 声明为 `string` 而不是枚举：读取器无法保证服务端不会新增取值，
+ * 界面按「未知取值原样呈现」处理，绝不 Fallback 成某个已知结论。
+ */
+export interface NotificationView {
+  id: string;
+  type: string;
+  title: string;
+  /** 正文允许为空串（服务端契约 `body` 下限为 0），但必须是字符串 */
+  body: string;
+  status: string;
+  createdAt: string;
+  /** 服务端已读时间：只有已读记录才允许携带（读取器按契约定向校验） */
+  readAt?: string;
+  updatedAt: string;
+}
+
+/**
  * 管理端统计来源（契约基线 `GET /admin/statistics/{flow|achievements|education}`）。
  * 后端切片未实现，因此**不对响应形状做任何假设**：只把「能否取到数据」与「取到几个可展示指标」
  * 作为事实，指标以 `label/value` 白名单形式携带，避免把未确认的字段名写进界面逻辑。

@@ -56,6 +56,17 @@ export const INVALID_RESPONSE_CODE = 'INVALID_RESPONSE';
 export const INVALID_RESPONSE_MESSAGE =
   '服务端响应不符合统一信封契约（data / meta / error），已按失败处理';
 
+/**
+ * 契约违规错误的**统一构造器**（HTTP 层可能仍是 200）。
+ *
+ * 为什么单独抽出来：多个切片的白名单读取器都要在「响应形状不符合已确认契约」时给出**同一个**
+ * 稳定错误码与同一段用户安全文案，各写一遍只会让文案与状态码慢慢漂移。它只构造错误，
+ * 不决定任何业务分支。
+ */
+export function contractError(message: string = INVALID_RESPONSE_MESSAGE): ApiClientError {
+  return new ApiClientError(INVALID_RESPONSE_CODE, message, { status: 200 });
+}
+
 const HAS_SCHEME = /^[a-z][a-z0-9+.-]*:/iu;
 
 /** 控制字符（C0 与 DEL）检测：可用于 URL/头部注入，一律拒绝（按码点判断，避免正则控制字符） */

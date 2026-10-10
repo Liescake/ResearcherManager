@@ -549,6 +549,64 @@ table caption {
   text-align: left;
 }
 
+/* ---------- 通知列表（我的通知） ---------- */
+
+/* 列表用语义化 ul/li：可执行动作是原生 button，键盘可达且不依赖任何自定义焦点管理。
+   窄视口下列表垂直堆叠，不产生横向滚动（与表格区不同，通知是「一条一块」的内容）。 */
+.notifications {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.notification {
+  background: #fbfbfd;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+/* 未读条目只做轻微视觉区分：状态本身以服务端返回的文案为准，不靠颜色下结论 */
+.notification--unread {
+  background: #f7fafe;
+  border-color: #c7d8f2;
+}
+
+.notification__head {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.notification__title {
+  font-size: 14px;
+  margin: 0;
+}
+
+.notification__body {
+  margin: 6px 0;
+  /* 服务端正文可能自带换行：原样展示，不重排、不折叠 */
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.notification__meta {
+  color: var(--color-muted);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 13px;
+  gap: 4px 14px;
+  margin: 0;
+}
+
+.notification__actions {
+  margin-top: 8px;
+}
+
 /* ---------- 登录页 ---------- */
 
 .login {

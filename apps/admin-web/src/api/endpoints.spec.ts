@@ -37,6 +37,9 @@ describe('API 边界登记表', () => {
         // HEAD 已实现本人导出列表与撤销（后端契约稳定），因此这两条是 stable
         'myExports',
         'exportRevoke',
+        // HEAD 已实现本人通知列表与标记已读（后端契约稳定），因此这两条也是 stable
+        'myNotifications',
+        'notificationRead',
       ].sort(),
     );
     expect(pending.sort()).toEqual(
@@ -80,6 +83,23 @@ describe('API 边界登记表', () => {
     expect(ENDPOINTS.exportRevoke.permissions).toEqual(['profile:self:read']);
     expect(endpointPath(ENDPOINTS.exportRevoke, { exportId: 'a-1' })).toBe(
       '/me/exports/a-1/revoke',
+    );
+  });
+
+  /**
+   * 通知切片的边界登记：列表是 GET 且**没有查询参数**，标记已读是 PATCH 且只带 notificationId
+   * 路径参数（没有请求体入口），权限点复用闭集目录里的 self 点。
+   */
+  it('本人通知边界：列表是 GET、标记已读是 PATCH 且只带 notificationId 路径参数', () => {
+    expect(ENDPOINTS.myNotifications.method).toBe('GET');
+    expect(ENDPOINTS.myNotifications.path).toBe('/me/notifications');
+    expect(ENDPOINTS.myNotifications.permissions).toEqual(['profile:self:read']);
+
+    expect(ENDPOINTS.notificationRead.method).toBe('PATCH');
+    expect(ENDPOINTS.notificationRead.path).toBe('/me/notifications/{notificationId}/read');
+    expect(ENDPOINTS.notificationRead.permissions).toEqual(['profile:self:update']);
+    expect(endpointPath(ENDPOINTS.notificationRead, { notificationId: 'a-1' })).toBe(
+      '/me/notifications/a-1/read',
     );
   });
 });

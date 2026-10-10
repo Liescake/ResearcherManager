@@ -45,6 +45,16 @@ describe('界面错误模型', () => {
     expect(toUiError(new Error('')).message).toContain('未预期');
   });
 
+  it('非 ApiClientError 的恶意原始 message 不会泄露到界面', () => {
+    const rawMessage = 'provider=/srv/secrets/token path=/internal/db password=hunter2';
+    const error = toUiError(new Error(rawMessage), 'GET /api/v1/profile');
+
+    expect(error).toMatchObject({ kind: 'unknown', code: 'UNEXPECTED_ERROR' });
+    expect(error.message).toBe('发生未预期错误，请稍后重试。');
+    expect(error.message).not.toContain(rawMessage);
+    expect(error.endpoint).toBe('GET /api/v1/profile');
+  });
+
   /**
    * 503 与 500 的处置不同：503 是「暂时不可用、可稍后重试」，500 是服务端缺陷、需要排查。
    * 两者都揉进「服务端异常」会让使用者无法判断该不该直接重试。

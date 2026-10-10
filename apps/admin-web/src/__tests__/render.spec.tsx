@@ -182,6 +182,17 @@ describe('应用外壳的登录守卫与模式标注', () => {
     expect(html).not.toContain('统计概览');
   });
 
+  it('菜单按钮的 aria-controls 指向实际主导航节点', () => {
+    const storage = memoryStorage({
+      status: 'authenticated',
+      session: createSession('ticket-abcd1234', '会话票据登录'),
+    });
+    const html = render(<App storage={storage} />);
+
+    expect(html).toContain('aria-controls="main-navigation"');
+    expect(html).toContain('<nav id="main-navigation"');
+  });
+
   it('联调模式 → 标注联调模式，不出现演示数据标注', () => {
     const storage = memoryStorage({
       status: 'authenticated',

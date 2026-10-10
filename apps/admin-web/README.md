@@ -1,7 +1,7 @@
 # @rm/admin-web
 
 管理端 Web（React 19 + Vite 8）。当前为**可替换的管理端 MVP**：登录、基础布局、统计概览
-（含本人导出记录与撤销）、申请列表、个人资料，以及**预留的申请审核路由**。
+（含本人通知与本人导出记录与撤销）、申请列表、个人资料，以及**预留的申请审核路由**。
 
 ## 本轮范围
 
@@ -14,6 +14,7 @@
 | 申请列表：服务端分页/过滤契约、演示夹具走查、状态机参考                       | 图表、权限配置、审计页面                                              |
 | 个人资料：读取 + 未锁定字段 PATCH 更新（以服务端返回为准重新加载）            | 首次提交（`PUT /me/profile`）、更正申请流程                           |
 | 概览页「我的导出记录」：状态展示 + 本人撤销（确认弹窗、幂等、防重复提交）     | 导出**下载**入口（`GET /me/exports/{exportId}/download`）、管理端导出 |
+| 概览页「我的通知」：白名单展示 + 标记已读（幂等、防重复提交、失败不伪造成功） | 通知生产侧、未读数、批量已读、删除与订阅消息下发                      |
 | loading / empty / error / 401 / 403 / pending 六种状态语义                    | jsdom 组件交互测试（用 `react-dom/server` 静态渲染替代）              |
 
 **不伪造的原则**（贯穿实现）：
@@ -67,19 +68,40 @@ inert、`Escape` 关闭请求、`aria-modal` 的属实性由浏览器保证，�
 真相，DOM 不能先关上而状态还开着。**刻意不做**：不手写 Tab 循环（原生模态已经保证），也不在提交中
 允许取消——那会让界面与服务端事实脱节。
 
+## 我的通知（统计概览页内的一块）
+
+后端已实现 `/me/notifications` 的两条路由，前端本轮接入**白名单展示 + 标记本人已读**：
+
+| 行为       | 规则                                                                                                |
+| ---------- | --------------------------------------------------------------------------------------------------- |
+| 列表       | `GET /api/v1/me/notifications`，**不带任何查询串**（`?userId=` / `?roles=` / `?scope=` 一律 400）   |
+| 字段白名单 | 只渲染 `id` / `type` / `title` / `body` / `status` / `createdAt` / `readAt` / `updatedAt`           |
+| 不进入界面 | 归属（`userId` / `ownerUserId`）、会话票据、深链路径、投递渠道 / provider、原始异常                 |
+| 标记入口   | 只有服务端原文 `unread` 显示；`read`（终态）与未知取值都没有入口                                    |
+| 提交       | `PATCH /api/v1/me/notifications/{notificationId}/read`，**无请求体、无查询串**，只有路径参数        |
+| 已读状态   | 一律以**服务端返回的视图**为准（含服务端 `readAt`），界面不做本地推断、不缓存「点过即已读」         |
+| 成功       | 以服务端返回的视图更新本地视图并提示；不重拉整表                                                    |
+| 失败       | 401 / 403 / 503 沿用既有错误分类；服务端统一安全拒绝收敛为 `NOTIFICATION_UNAVAILABLE`，本地视图不变 |
+| 防重复提交 | 提交中该条显示「正在标记…」并禁用，其余未读入口一并禁用，另有同步 ref 兜底；服务端幂等              |
+| 契约漂移   | `api/notification-view.ts` 逐字段读取，任一条形态非法即整页按契约违规失败（不静默丢行）             |
+
+**刻意不做**：不显示未读数（服务端当前没有这个口径，客户端不自行造统计值），不提供「全部已读」与删除
+（端点不在本轮范围），不新增路由（这一块属于「统计概览」页）；演示模式下标记入口禁用且不发任何请求
+（`DEMO_READ_ONLY`），夹具 `DEMO_NOTIFICATIONS` 覆盖未读 / 已读两种状态且不含归属、票据、路径、provider。
+
 ## 目录结构
 
 ```
 src/
   api/         API 边界登记表（endpoints）、客户端（client）、错误模型（errors）、
                会话（session）、演示夹具（demo-data）、取数网关（gateway）、视图类型（types）、
-               导出视图白名单读取（export-view，纯函数）
+               导出视图白名单读取（export-view，纯函数）、通知视图白名单读取（notification-view，纯函数）
   auth/        会话与网关的 React 上下文（AuthContext）
   router/      路由表（routes）与哈希路由/登录守卫（hash-router，纯函数）
-  state/       取数状态机（async，纯函数）、撤销交互状态机（revoke-flow，纯函数）与 useLoader Hook
+  state/       取数状态机（async，纯函数）、撤销交互状态机（revoke-flow，纯函数）、通知交互状态机（notification-flow，纯函数）与 useLoader Hook
   components/  基础布局（AppLayout）、状态面板（StatePanel）、状态分派（AsyncStateView）、
-               本人导出记录区（MyExportsPanel，受控纯展示）
-  pages/       登录 / 统计概览（含导出记录与撤销）/ 申请列表 / 审核（预留）/ 个人资料 / 404
+               本人导出记录区（MyExportsPanel，受控纯展示）、本人通知区（MyNotificationsPanel，受控纯展示）
+  pages/       登录 / 统计概览（含通知与导出记录与撤销）/ 申请列表 / 审核（预留）/ 个人资料 / 404
   lib/         展示格式化（纯函数）
   __tests__/   组件静态渲染测试（react-dom/server，无 jsdom）
 ```
