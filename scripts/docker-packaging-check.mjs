@@ -36,7 +36,7 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -366,12 +366,9 @@ export function findSecretReferences(text) {
 // 断言收集
 // ---------------------------------------------------------------------------
 
-const failures = [];
-const warnings = [];
-
-function check(condition, message) {
+function check(state, condition, message) {
   if (!condition) {
-    failures.push(message);
+    state.failures.push(message);
   }
   return condition;
 }
@@ -397,24 +394,24 @@ function readJsonOrNull(relativePath) {
 }
 
 /** 逐条检查一个编排文件；`mode` 为 `dev` 或 `prod` */
-function checkCompose(fileName, mode) {
+function checkCompose(state, fileName, mode) {
   const text = readTextOrNull(fileName);
   if (text === null) {
-    failures.push(`缺少编排文件 ${fileName}`);
+    state.failures.push(`缺少编排文件 ${fileName}`);
     return;
   }
 
   const services = serviceBlocks(text);
   const names = [...services.keys()].sort();
-  check(
+  check(state,
     names.join(',') === 'api,postgres',
     `${fileName} 必须只定义 api 与 postgres 两个服务（当前: ${names.join(',') || '无'}）`,
   );
 
   const networksSection = collectTopLevelSection(text, 'networks').join('\n');
-  check(networksSection.trim() !== '', `${fileName} 必须显式声明 networks（api 与 postgres 共用）`);
+  check(state, networksSection.trim() !== '', `${fileName} 必须显式声明 networks（api 与 postgres 共用）`);
   const volumesSection = collectTopLevelSection(text, 'volumes').join('\n');
-  check(volumesSection.includes('rm-postgres-data'), `${fileName} 必须声明具名卷 rm-postgres-data`);
+  check(state, volumesSection.includes('rm-postgres-data'), `${fileName} 必须声明具名卷 rm-postgres-data`);
 
   const postgres = services.get('postgres') ?? '';
   const api = services.get('api') ?? '';
@@ -426,49 +423,49 @@ function checkCompose(fileName, mode) {
     ['postgres', postgres],
     ['api', api],
   ]) {
-    check(/healthcheck:/u.test(block), `${fileName} 的 ${name} 服务必须定义 healthcheck`);
-    check(
+    check(state, /healthcheck:/u.test(block), `${fileName} 的 ${name} 服务必须定义 healthcheck`);
+    check(state,
       /networks:\s*\n\s*-\s*rm-internal/u.test(block),
       `${fileName} 的 ${name} 服务必须接入显式网络 rm-internal`,
     );
   }
 
   // ---- postgres ----
-  check(
+  check(state,
     /rm-postgres-data:\/var\/lib\/postgresql\/data/u.test(postgres),
     `${fileName}: postgres 数据必须落在具名卷上`,
   );
-  check(/pg_isready/u.test(postgres), `${fileName}: postgres healthcheck 必须用 pg_isready`);
+  check(state, /pg_isready/u.test(postgres), `${fileName}: postgres healthcheck 必须用 pg_isready`);
 
   const postgresInterpolations = parseInterpolations(postgresCode);
   for (const key of ['POSTGRES_USER', 'POSTGRES_PASSWORD']) {
     const found = postgresInterpolations.find((item) => item.name === key);
-    check(found !== undefined, `${fileName}: postgres 必须通过环境变量提供 ${key}（无默认值）`);
-    check(
+    check(state, found !== undefined, `${fileName}: postgres 必须通过环境变量提供 ${key}（无默认值）`);
+    check(state,
       found === undefined || found.operator === 'required',
       `${fileName}: ${key} 必须声明为必填（\${${key}:?...}），不得有内置默认值`,
     );
   }
 
   // ---- api ----
-  check(/context:\s*\./u.test(api), `${fileName}: api 构建上下文必须是仓库根（context: .）`);
-  check(/dockerfile:\s*Dockerfile/u.test(api), `${fileName}: api 必须使用仓库根 Dockerfile`);
-  check(
+  check(state, /context:\s*\./u.test(api), `${fileName}: api 构建上下文必须是仓库根（context: .）`);
+  check(state, /dockerfile:\s*Dockerfile/u.test(api), `${fileName}: api 必须使用仓库根 Dockerfile`);
+  check(state,
     /depends_on:[\s\S]{0,240}?postgres:[\s\S]{0,240}?condition:\s*service_healthy/u.test(apiCode),
     `${fileName}: api 必须 depends_on postgres 且 condition: service_healthy`,
   );
-  check(
+  check(state,
     /scripts\/docker-healthcheck\.mjs/u.test(api),
     `${fileName}: api healthcheck 必须复用 scripts/docker-healthcheck.mjs（不硬编码路径）`,
   );
-  check(
+  check(state,
     /API_HOST:\s*"?0\.0\.0\.0"?/u.test(api),
     `${fileName}: api 必须显式监听 0.0.0.0（容器内回环不可达）`,
   );
 
   const apiInterpolations = parseInterpolations(apiCode);
   const sessionSecret = apiInterpolations.find((item) => item.name === 'SESSION_SECRET');
-  check(
+  check(state,
     sessionSecret !== undefined && sessionSecret.operator === 'required',
     `${fileName}: SESSION_SECRET 必须声明为必填（\${SESSION_SECRET:?...}），不得有内置默认值`,
   );
@@ -487,7 +484,7 @@ function checkCompose(fileName, mode) {
       item.operator === 'defaulted' &&
       item.defaultValue.trim() !== ''
     ) {
-      failures.push(
+      state.failures.push(
         `${fileName}: 机密类变量 ${item.name} 不得带非空默认值（\${${item.name}:-${item.defaultValue}}）`,
       );
     }
@@ -495,50 +492,50 @@ function checkCompose(fileName, mode) {
   if (mode === 'prod') {
     for (const item of apiInterpolations) {
       if (requiredSecretKeys.has(item.name) && item.operator !== 'required') {
-        failures.push(`${fileName}: ${item.name} 在生产档必须声明为必填（\${${item.name}:?...}）`);
+        state.failures.push(`${fileName}: ${item.name} 在生产档必须声明为必填（\${${item.name}:?...}）`);
       }
     }
   }
 
   if (mode === 'dev') {
-    check(
+    check(state,
       /仅本机|仅本地|本地开发/u.test(text),
       `${fileName}: 必须在文件头明确标注「仅本机/本地开发」适用范围`,
     );
-    check(
+    check(state,
       /DATABASE_SSL_MODE:\s*disable/u.test(api),
       `${fileName}: 本地开发档必须显式 DATABASE_SSL_MODE: disable（安全默认是 require）`,
     );
-    check(
+    check(state,
       /\/docker-entrypoint-initdb\.d:ro/u.test(postgres),
       `${fileName}: 初始化脚本（额外建集成测试库）必须以只读方式挂载`,
     );
-    check(
+    check(state,
       /ports:\s*\n/u.test(postgres) || /\n\s+ports:/u.test(postgres),
       `${fileName}: 本地开发档需要把 postgres 端口发布到宿主机（集成测试从宿主机连接）`,
     );
-    check(
+    check(state,
       /\$\{POSTGRES_PORT/u.test(postgres),
       `${fileName}: 本地开发档 postgres 端口必须用 \${POSTGRES_PORT:-...} 声明（默认 55432 避开宿主机 5432）`,
     );
   }
 
   if (mode === 'prod') {
-    check(
+    check(state,
       !/docker-entrypoint-initdb\.d/u.test(postgres),
       `${fileName}: 生产档不得挂载初始化脚本（它会在生产库里创建 *_test 数据库）`,
     );
-    check(/NODE_ENV:\s*production/u.test(api), `${fileName}: api 必须 NODE_ENV=production`);
-    check(
+    check(state, /NODE_ENV:\s*production/u.test(api), `${fileName}: api 必须 NODE_ENV=production`);
+    check(state,
       /DATABASE_SSL_MODE:\s*verify-full\s*$/mu.test(api),
       `${fileName}: api 必须写死 DATABASE_SSL_MODE: verify-full（不可用环境变量降级）`,
     );
-    check(
+    check(state,
       !/DATABASE_SSL_MODE:.*\$\{/u.test(api),
       `${fileName}: DATABASE_SSL_MODE 不得由环境变量插值（生产不允许降级 TLS）`,
     );
     const databaseUrl = apiInterpolations.find((item) => item.name === 'DATABASE_URL');
-    check(
+    check(state,
       databaseUrl !== undefined && databaseUrl.operator === 'required',
       `${fileName}: DATABASE_URL 必须声明为必填`,
     );
@@ -556,36 +553,36 @@ function checkCompose(fileName, mode) {
       'DATABASE_MIGRATION_APPLIED_VERSIONS',
     ]) {
       const item = apiInterpolations.find((entry) => entry.name === key);
-      check(
+      check(state,
         item !== undefined && item.operator === 'required',
         `${fileName}: 取证事实 ${key} 必须声明为必填（缺失就要 fail-closed）`,
       );
     }
-    check(
+    check(state,
       postgres.includes('RM_TLS_DIR') && postgres.includes('/etc/rm-tls:ro'),
       `${fileName}: postgres 必须把证书目录只读挂载到 /etc/rm-tls`,
     );
-    check(
+    check(state,
       api.includes('RM_TLS_DIR') && api.includes('/etc/rm-tls:ro'),
       `${fileName}: api 必须把证书目录只读挂载到 /etc/rm-tls`,
     );
-    check(
+    check(state,
       /DATABASE_SSL_CA_PATH:\s*"\/etc\/rm-tls\//u.test(api),
       `${fileName}: api 必须登记 CA 的容器内绝对路径`,
     );
     // 生产不把数据库端口发布到宿主机
-    check(
+    check(state,
       !/^\s{4}ports:/mu.test(postgres),
       `${fileName}: 生产档不得把 postgres 端口发布到宿主机（应使用编排网络内的 expose）`,
     );
-    check(/ssl=on/u.test(postgres), `${fileName}: postgres 必须启用 ssl=on`);
-    check(/hba_file=/u.test(postgres), `${fileName}: postgres 必须用 hba_file 强制只接受 TLS 连接`);
-    check(
+    check(state, /ssl=on/u.test(postgres), `${fileName}: postgres 必须启用 ssl=on`);
+    check(state, /hba_file=/u.test(postgres), `${fileName}: postgres 必须用 hba_file 强制只接受 TLS 连接`);
+    check(state,
       /ssl_cert_file=|\/etc\/rm-tls\/server\.crt/u.test(postgres),
       `${fileName}: postgres 必须登记服务端证书路径`,
     );
 
-    checkProductionHardening(fileName, api, postgres);
+    checkProductionHardening(state, fileName, api, postgres);
   }
 }
 
@@ -913,37 +910,37 @@ function describeApiPortIssue(fileName, issue) {
  * postgres 的 cap_add：非 root 启动时官方 entrypoint 不走 chown/gosu 分支，因此不需要任何能力；
  * 若将来确需添加，必须同时改这里与 docker-compose.prod.yml 文件头的能力说明（失败文案里写了）。
  */
-function checkProductionHardening(fileName, api, postgres) {
+function checkProductionHardening(state, fileName, api, postgres) {
   for (const [name, block] of [
     ['api', api],
     ['postgres', postgres],
   ]) {
-    check(
+    check(state,
       readScalarField(block, 'read_only') === 'true',
       `${fileName}: ${name} 必须显式 read_only: true（只读根文件系统）`,
     );
     const capDrop = readListField(block, 'cap_drop');
-    check(
+    check(state,
       capDrop !== null && capDrop.includes('ALL'),
       `${fileName}: ${name} 必须 cap_drop: [ALL]（去掉全部 Linux capability）`,
     );
     const securityOpt = readListField(block, 'security_opt') ?? [];
-    check(
+    check(state,
       securityOpt.includes('no-new-privileges:true'),
       `${fileName}: ${name} 必须声明 security_opt: no-new-privileges:true（禁止 setuid/文件能力提权）`,
     );
     const user = readScalarField(block, 'user');
-    check(user !== null, `${fileName}: ${name} 必须显式声明 user（不许回落到镜像默认 root）`);
-    check(
+    check(state, user !== null, `${fileName}: ${name} 必须显式声明 user（不许回落到镜像默认 root）`);
+    check(state,
       !isRootUser(user),
       `${fileName}: ${name} 的 user 必须是非 root 且可解析的身份（当前: ${user ?? '未声明'}）`,
     );
-    check(
+    check(state,
       user === null || /^[A-Za-z_][A-Za-z0-9_-]*(?::[A-Za-z0-9_-]+)?$/u.test(user),
       `${fileName}: ${name} 的 user 必须是镜像内可解析的用户名（或 uid[:gid]），当前: ${user ?? '未声明'}`,
     );
     const restart = readScalarField(block, 'restart');
-    check(
+    check(state,
       restart !== null && restart !== 'no',
       `${fileName}: ${name} 必须保留重启策略（restart 缺失或为 no 会在故障后留下停摆容器）`,
     );
@@ -951,7 +948,7 @@ function checkProductionHardening(fileName, api, postgres) {
     // 单一控制点 = findStopGracePeriodIssues，失败文案由 describeStopGracePeriodIssue 统一渲染。
     const graceIssue = findStopGracePeriodIssues(readScalarField(block, 'stop_grace_period'));
     if (graceIssue !== null) {
-      failures.push(describeStopGracePeriodIssue(fileName, name, graceIssue));
+      state.failures.push(describeStopGracePeriodIssue(fileName, name, graceIssue));
     }
   }
 
@@ -959,12 +956,12 @@ function checkProductionHardening(fileName, api, postgres) {
   // （详见 findApiPortExposureIssues）。这是「端口暴露面」断言的单一控制点：条目数量、短语法、
   // 通配、空 host、缺 host、非 3000/tcp 都在这里拦下——包括「第二条也回环合规」的额外映射。
   for (const issue of findApiPortExposureIssues(readPortMappings(api))) {
-    failures.push(describeApiPortIssue(fileName, issue));
+    state.failures.push(describeApiPortIssue(fileName, issue));
   }
 
   // api：没有可写路径，多声明一个 tmpfs 就多一个可写面
   const apiTmpfs = readListField(api, 'tmpfs');
-  check(
+  check(state,
     apiTmpfs === null || apiTmpfs.length === 0,
     `${fileName}: api 运行期不需要可写目录（只读文件 + 只写 stdout），不得声明 tmpfs（当前: ${(apiTmpfs ?? []).join(', ') || '无'}）`,
   );
@@ -973,14 +970,14 @@ function checkProductionHardening(fileName, api, postgres) {
   // 一个不能少、一个不能多，也不接受重复项或带 mount 覆盖的等价写法（如 `/tmp:ro`）。
   const postgresTmpfs = readListField(postgres, 'tmpfs') ?? [];
   for (const issue of findPostgresTmpfsIssues(postgresTmpfs)) {
-    failures.push(describePostgresTmpfsIssue(fileName, issue));
+    state.failures.push(describePostgresTmpfsIssue(fileName, issue));
   }
   for (const entry of postgresTmpfs) {
     const { target } = splitTmpfsEntry(entry);
     for (const protectedPath of ['/var/lib/postgresql/data', '/etc/rm-tls']) {
       const shadows =
         target === '/' || target === protectedPath || protectedPath.startsWith(`${target}/`);
-      check(
+      check(state,
         !shadows,
         `${fileName}: tmpfs ${entry} 不得覆盖 ${protectedPath}（持久数据/证书必须是卷或只读挂载，不能是 tmpfs）`,
       );
@@ -989,15 +986,15 @@ function checkProductionHardening(fileName, api, postgres) {
 
   // 数据卷必须仍然可写：postgres 的数据不允许只读
   const dataMount = /rm-postgres-data:\S*/u.exec(postgres);
-  check(dataMount !== null, `${fileName}: postgres 数据卷 rm-postgres-data 必须仍然挂载`);
-  check(
+  check(state, dataMount !== null, `${fileName}: postgres 数据卷 rm-postgres-data 必须仍然挂载`);
+  check(state,
     dataMount === null || !/:ro\b/u.test(dataMount[0]),
     `${fileName}: postgres 数据卷必须可写（不得挂成 :ro）`,
   );
 
   // 非 root 启动时官方 entrypoint 不需要任何能力：不给 cap_add 留模糊空间
   const capAdd = readListField(postgres, 'cap_add');
-  check(
+  check(state,
     capAdd === null || capAdd.length === 0,
     `${fileName}: postgres 以非 root 启动时不需要 cap_add（当前: ${(capAdd ?? []).join(', ')}）；如确需添加，必须同时更新本门禁与 docker-compose.prod.yml 文件头的能力说明`,
   );
@@ -1014,7 +1011,7 @@ function checkProductionHardening(fileName, api, postgres) {
         continue;
       }
       const leaked = findSecretReferences(section);
-      check(
+      check(state,
         leaked.length === 0,
         `${fileName}: ${name} 的 ${field} 不得引用机密类变量 ${leaked.join(', ')}（会出现在 docker inspect / docker ps / 容器日志里；机密只允许经 environment 注入）`,
       );
@@ -1024,7 +1021,7 @@ function checkProductionHardening(fileName, api, postgres) {
   // 调试类环境变量会把内部细节（含库连接串等）写进日志；LOG_LEVEL 的默认档位不得是调试档
   for (const key of ['DEBUG', 'NODE_DEBUG', 'NODE_OPTIONS', 'DEBUG_FD', 'DEBUG_COLORS']) {
     const declared = readScalarField(api, key) ?? readScalarField(postgres, key);
-    check(
+    check(state,
       declared === null,
       `${fileName}: 生产档不得声明 ${key}（会开启内部/调试输出，可能把机密写进日志）`,
     );
@@ -1034,47 +1031,47 @@ function checkProductionHardening(fileName, api, postgres) {
   );
   const logLevelDefault =
     logLevel?.operator === 'defaulted' ? logLevel.defaultValue.trim().toLowerCase() : '';
-  check(
+  check(state,
     !/^(?:debug|trace|verbose|silly)$/u.test(logLevelDefault),
     `${fileName}: LOG_LEVEL 的默认值不得是 debug/trace/verbose（调试档会把内部细节写进日志），当前: ${logLevelDefault === '' ? '(非默认档)' : logLevelDefault}`,
   );
 }
 
 /** 检查 Dockerfile（构建顺序、入口、健康检查、非 root、无内置机密） */
-function checkDockerfile() {
+function checkDockerfile(state) {
   const text = readTextOrNull('Dockerfile');
   if (text === null) {
-    failures.push('缺少 Dockerfile');
+    state.failures.push('缺少 Dockerfile');
     return;
   }
   const apiManifest = readJsonOrNull('services/api/package.json');
   const rootManifest = readJsonOrNull('package.json');
 
   for (const stage of ['AS deps', 'AS build', 'AS runtime']) {
-    check(text.includes(stage), `Dockerfile 必须包含多阶段构建：${stage}`);
+    check(state, text.includes(stage), `Dockerfile 必须包含多阶段构建：${stage}`);
   }
-  check(/COPY\s+\.\s+\./u.test(text), 'Dockerfile 必须整体拷入仓库根上下文（monorepo 构建前提）');
-  check(
+  check(state, /COPY\s+\.\s+\./u.test(text), 'Dockerfile 必须整体拷入仓库根上下文（monorepo 构建前提）');
+  check(state,
     /pnpm install --frozen-lockfile/u.test(text),
     'Dockerfile 必须用 --frozen-lockfile 安装（锁文件可复现）',
   );
-  check(/USER\s+node\b/u.test(text), 'Dockerfile 运行阶段必须以非 root 用户启动（USER node）');
+  check(state, /USER\s+node\b/u.test(text), 'Dockerfile 运行阶段必须以非 root 用户启动（USER node）');
   // 运行阶段不得再切回 root（后出现的 USER root/0 会覆盖前面的非 root 声明）
-  check(
+  check(state,
     !/^USER\s+(?:root|0)\s*$/mu.test(text),
     'Dockerfile 不得把运行用户设回 root（USER root/0）',
   );
   // 「禁止机密进日志」：本地 .env 不得进镜像，也不得被打印到构建日志里
   // `(?<![\w.-])` 保证命中的是 `.env` 这个文件名本身，而不是 `foo.env` 这类同名后缀
-  check(
+  check(state,
     !/^\s*(?:COPY|ADD)\s+[^\n]*(?<![\w.-])\.env\b/mu.test(text),
     'Dockerfile 不得把 .env 拷进镜像（机密只允许运行时注入）',
   );
-  check(
+  check(state,
     !/^RUN[^\n]*(?<![\w.-])\.env\b/mu.test(text),
     'Dockerfile 的 RUN 不得触碰 .env（内容会留在构建日志/镜像层里）',
   );
-  check(
+  check(state,
     /HEALTHCHECK[\s\S]*scripts\/docker-healthcheck\.mjs/u.test(text),
     'Dockerfile 的 HEALTHCHECK 必须复用 scripts/docker-healthcheck.mjs',
   );
@@ -1085,21 +1082,21 @@ function checkDockerfile() {
     .map(([name]) => name);
   const buildPackages = rootManifest?.scripts?.['build:packages'] ?? '';
   for (const dep of apiWorkspaceDeps) {
-    check(
+    check(state,
       buildPackages.includes(dep),
       `root package.json 的 build:packages 必须包含 @rm/api 的工作区依赖 ${dep}`,
     );
   }
   const packagesIndex = text.indexOf('pnpm build:packages');
   const apiBuildIndex = text.indexOf('pnpm --filter @rm/api build');
-  check(
+  check(state,
     packagesIndex !== -1 && apiBuildIndex !== -1 && packagesIndex < apiBuildIndex,
     'Dockerfile 必须先构建工作区包（pnpm build:packages），再构建 @rm/api',
   );
 
   // 容器启动入口：CMD 必须指向 @rm/api 的 main 所对应的构建产物
   const apiEntry = apiManifest?.main;
-  check(
+  check(state,
     typeof apiEntry === 'string' && apiEntry !== '',
     'services/api/package.json 必须声明 main 入口',
   );
@@ -1107,18 +1104,18 @@ function checkDockerfile() {
     const expectedCmd = `services/api/${apiEntry}`;
     // 只取**行首**的 CMD：`HEALTHCHECK ... CMD [...]` 里的 CMD 不是启动入口
     const cmdMatch = /^CMD\s+\[([^\]]*)\]/mu.exec(text);
-    check(cmdMatch !== null, 'Dockerfile 必须用 exec 形式的 CMD 声明启动入口');
+    check(state, cmdMatch !== null, 'Dockerfile 必须用 exec 形式的 CMD 声明启动入口');
     const cmdTokens = (cmdMatch?.[1] ?? '')
       .split(',')
       .map((token) => token.trim().replace(/^"|"$/gu, ''));
-    check(
+    check(state,
       cmdTokens.includes(expectedCmd),
       `Dockerfile 的 CMD 必须包含 ${expectedCmd}（= services/api 的 main 产物），当前: ${cmdTokens.join(' ') || '无'}`,
     );
     // 构建产物是否存在只作提示：`pnpm verify` 在 CI 里先于 `pnpm build` 运行，
     // 干净检出时 dist 本来就不存在，把它当作失败会让门禁误报。
     if (!existsSync(join(repoRoot, 'services/api', apiEntry.replace(/^\.\//u, '')))) {
-      warnings.push(
+      state.warnings.push(
         `容器启动入口产物尚未构建：services/api/${apiEntry}（先执行 pnpm build；CI 中 verify 早于 build，属正常）`,
       );
     }
@@ -1127,34 +1124,34 @@ function checkDockerfile() {
   // 不得把机密固化进镜像
   for (const line of text.split(/\r?\n/u)) {
     if (/^\s*(ARG|ENV)\s+.*(PASSWORD|SECRET|API_KEY|TOKEN)/iu.test(line)) {
-      failures.push(`Dockerfile 不得通过 ARG/ENV 固化机密：${line.trim()}`);
+      state.failures.push(`Dockerfile 不得通过 ARG/ENV 固化机密：${line.trim()}`);
     }
   }
-  check(
+  check(state,
     !/COPY\s+.*\.(pem|key)\b/u.test(text),
     'Dockerfile 不得把证书/私钥拷进镜像（应运行时挂载）',
   );
 }
 
 /** 检查健康探针脚本本身 */
-function checkHealthcheckScript() {
+function checkHealthcheckScript(state) {
   const text = readTextOrNull('scripts/docker-healthcheck.mjs');
   if (text === null) {
-    failures.push('缺少 scripts/docker-healthcheck.mjs');
+    state.failures.push('缺少 scripts/docker-healthcheck.mjs');
     return;
   }
   const imports = [...text.matchAll(/from\s+'([^']+)'/gu)].map((match) => match[1]);
   for (const specifier of imports) {
-    check(
+    check(state,
       specifier.startsWith('node:'),
       `scripts/docker-healthcheck.mjs 只允许 node: 内置模块（发现 ${specifier}）`,
     );
   }
-  check(
+  check(state,
     /API_PREFIX/u.test(text),
     'scripts/docker-healthcheck.mjs 必须跟随 API_PREFIX，不得硬编码路径',
   );
-  check(
+  check(state,
     /process\.exit\(0\)/u.test(text) && /process\.exit\(1\)/u.test(text),
     'scripts/docker-healthcheck.mjs 必须用退出码 0/1 表达健康与否',
   );
@@ -1162,13 +1159,13 @@ function checkHealthcheckScript() {
     .split(/\r?\n/u)
     .filter((line) => !/^\s*(?:\*|\/\/|#)/u.test(line))
     .join('\n');
-  check(
+  check(state,
     !/\/api\/v1\/health/u.test(code),
     'scripts/docker-healthcheck.mjs 不得在代码里硬编码 /api/v1/health 路径（注释里的缺陷说明不算）',
   );
   // 「禁止机密进日志」：探针的输出会直接进入容器日志，因此不得整体输出环境、
   // 也不得读取任何机密类环境变量（探针只需要路径与端口）。
-  check(
+  check(state,
     !/JSON\.stringify\(\s*process\.env|Object\.(?:entries|keys|values)\(\s*process\.env|console\.\w+\(\s*process\.env/u.test(
       code,
     ),
@@ -1181,26 +1178,26 @@ function checkHealthcheckScript() {
         .filter((name) => isSecretKey(name)),
     ),
   ];
-  check(
+  check(state,
     secretEnvReads.length === 0,
     `scripts/docker-healthcheck.mjs 不得读取机密类环境变量 ${secretEnvReads.join(', ')}（探针无需任何凭据）`,
   );
 }
 
 /** 检查公开环境变量模板：无真实密钥，且覆盖生产档所有必填变量 */
-function checkEnvTemplate() {
+function checkEnvTemplate(state) {
   const text = readTextOrNull('.env.docker.example');
   if (text === null) {
-    failures.push('缺少 .env.docker.example');
+    state.failures.push('缺少 .env.docker.example');
     return;
   }
   const secretClue = looksLikeRealSecret(text);
-  check(secretClue === null, `.env.docker.example 疑似含真实密钥：${secretClue ?? ''}`);
+  check(state, secretClue === null, `.env.docker.example 疑似含真实密钥：${secretClue ?? ''}`);
 
   const entries = parseEnvFile(text);
   for (const [key, value] of entries) {
     if (isSecretKey(key)) {
-      check(
+      check(state,
         isPlaceholderValue(value),
         `.env.docker.example 的机密类字段 ${key} 必须是明确占位符（change-me / REPLACE-ME），当前: ${value === '' ? '(空)' : '(非占位符)'}`,
       );
@@ -1212,53 +1209,53 @@ function checkEnvTemplate() {
   const prod = stripYamlComments(readTextOrNull('docker-compose.prod.yml') ?? '');
   for (const item of parseInterpolations(prod)) {
     if (item.operator === 'required') {
-      check(entries.has(item.name), `.env.docker.example 必须提供生产档必填变量 ${item.name}`);
+      check(state, entries.has(item.name), `.env.docker.example 必须提供生产档必填变量 ${item.name}`);
     }
   }
 }
 
 /** 检查只读 TLS 认证规则文件 */
-function checkPgHba() {
+function checkPgHba(state) {
   const text = readTextOrNull('db/docker/prod/pg_hba.conf');
   if (text === null) {
-    failures.push('缺少 db/docker/prod/pg_hba.conf');
+    state.failures.push('缺少 db/docker/prod/pg_hba.conf');
     return;
   }
-  check(/^hostssl\s/mu.test(text), 'pg_hba.conf 必须允许 hostssl（只有 TLS 连接可用）');
-  check(
+  check(state, /^hostssl\s/mu.test(text), 'pg_hba.conf 必须允许 hostssl（只有 TLS 连接可用）');
+  check(state,
     /^hostnossl\s.*reject\s*$/mu.test(text),
     'pg_hba.conf 必须显式 reject 明文（hostnossl）连接',
   );
 }
 
 /** 检查忽略规则：模板可提交、证书与真实 .env 必须排除 */
-function checkIgnoreFiles() {
+function checkIgnoreFiles(state) {
   const gitignore = readTextOrNull('.gitignore');
   const dockerignore = readTextOrNull('.dockerignore');
-  check(gitignore !== null, '缺少 .gitignore');
-  check(dockerignore !== null, '缺少 .dockerignore');
+  check(state, gitignore !== null, '缺少 .gitignore');
+  check(state, dockerignore !== null, '缺少 .dockerignore');
   if (gitignore !== null) {
-    check(
+    check(state,
       gitignore.includes('!.env.docker.example'),
       '.gitignore 必须显式放行公开模板 .env.docker.example',
     );
-    check(
+    check(state,
       /^\*\.pem$/mu.test(gitignore) && /^\*\.key$/mu.test(gitignore),
       '.gitignore 必须排除 *.pem / *.key',
     );
-    check(/^\/certs\/$/mu.test(gitignore), '.gitignore 必须排除本地证书目录 /certs/');
+    check(state, /^\/certs\/$/mu.test(gitignore), '.gitignore 必须排除本地证书目录 /certs/');
   }
   if (dockerignore !== null) {
-    check(
+    check(state,
       dockerignore.includes('!.env.docker.example'),
       '.dockerignore 必须放行 .env.docker.example',
     );
-    check(
+    check(state,
       /\*\.pem/u.test(dockerignore) && /\*\.key/u.test(dockerignore),
       '.dockerignore 必须排除 *.pem / *.key',
     );
-    check(/\*\*\/dist/u.test(dockerignore), '.dockerignore 必须排除构建产物 **/dist');
-    check(
+    check(state, /\*\*\/dist/u.test(dockerignore), '.dockerignore 必须排除构建产物 **/dist');
+    check(state,
       /^\.env$/mu.test(dockerignore) && /^\.env\.\*$/mu.test(dockerignore),
       '.dockerignore 必须排除真实 .env / .env.*',
     );
@@ -1266,7 +1263,7 @@ function checkIgnoreFiles() {
 }
 
 /** 两份编排的交叉一致性：服务集合与具名卷必须一致，且不得残留旧文件名 */
-function checkComposeCrossConsistency() {
+function checkComposeCrossConsistency(state) {
   const dev = readTextOrNull('docker-compose.yml');
   const prod = readTextOrNull('docker-compose.prod.yml');
   if (dev === null || prod === null) {
@@ -1274,13 +1271,13 @@ function checkComposeCrossConsistency() {
   }
   const devServices = [...serviceBlocks(dev).keys()].sort().join(',');
   const prodServices = [...serviceBlocks(prod).keys()].sort().join(',');
-  check(
+  check(state,
     devServices === prodServices,
     `两份编排的服务集合必须一致（dev=${devServices} prod=${prodServices}）`,
   );
 
   for (const volume of ['rm-postgres-data']) {
-    check(
+    check(state,
       collectTopLevelSection(dev, 'volumes').join('\n').includes(volume) &&
         collectTopLevelSection(prod, 'volumes').join('\n').includes(volume),
       `两份编排必须声明同一个具名卷 ${volume}`,
@@ -1288,22 +1285,22 @@ function checkComposeCrossConsistency() {
   }
 
   if (existsSync(join(repoRoot, 'compose.yaml'))) {
-    failures.push(
+    state.failures.push(
       '检测到遗留的 compose.yaml：与 docker-compose.yml 并存会产生两份互相漂移的编排，请只保留一份',
     );
   }
 }
 
-function report() {
-  if (warnings.length > 0) {
-    console.log(`\n提示 (${warnings.length})`);
-    for (const warning of warnings) {
+function report(state) {
+  if (state.warnings.length > 0) {
+    console.log(`\n提示 (${state.warnings.length})`);
+    for (const warning of state.warnings) {
       console.log(`  ~ ${warning}`);
     }
   }
-  if (failures.length > 0) {
-    console.error(`\n失败 (${failures.length})`);
-    for (const failure of failures) {
+  if (state.failures.length > 0) {
+    console.error(`\n失败 (${state.failures.length})`);
+    for (const failure of state.failures) {
       console.error(`  x ${failure}`);
     }
     process.exitCode = 1;
@@ -1316,7 +1313,7 @@ function report() {
 // --self-test：只验证解析器与判定规则本身（不读磁盘、不依赖仓库内容）
 // ---------------------------------------------------------------------------
 
-function selfTest() {
+function selfTest(state) {
   const cases = [];
   const expect = (name, actual, expected) => {
     const ok = JSON.stringify(actual) === JSON.stringify(expected);
@@ -1746,16 +1743,16 @@ function selfTest() {
       '    restart: always',
       '',
     ].join('\n');
-    const savedFailures = failures.splice(0, failures.length);
-    const savedWarnings = warnings.splice(0, warnings.length);
+    const savedFailures = state.failures.splice(0, state.failures.length);
+    const savedWarnings = state.warnings.splice(0, state.warnings.length);
     try {
-      checkProductionHardening('合成样本', apiBlock, postgresBlock);
-      return { count: failures.length, messages: [...failures] };
+      checkProductionHardening(state, '合成样本', apiBlock, postgresBlock);
+      return { count: state.failures.length, messages: [...state.failures] };
     } finally {
-      failures.length = 0;
-      warnings.length = 0;
-      failures.push(...savedFailures);
-      warnings.push(...savedWarnings);
+      state.failures.length = 0;
+      state.warnings.length = 0;
+      state.failures.push(...savedFailures);
+      state.warnings.push(...savedWarnings);
     }
   };
   expect(
@@ -1927,18 +1924,25 @@ function selfTest() {
 // 主流程
 // ---------------------------------------------------------------------------
 
-if (process.argv.includes('--self-test')) {
-  selfTest();
-} else {
-  console.log('Docker 打包静态门禁');
-  console.log(`- 仓库根目录: ${repoRoot}`);
-  checkDockerfile();
-  checkHealthcheckScript();
-  checkCompose('docker-compose.yml', 'dev');
-  checkCompose('docker-compose.prod.yml', 'prod');
-  checkComposeCrossConsistency();
-  checkEnvTemplate();
-  checkPgHba();
-  checkIgnoreFiles();
-  report();
+function main() {
+  const state = { failures: [], warnings: [] };
+  if (process.argv.includes('--self-test')) {
+    selfTest(state);
+  } else {
+    console.log('Docker 打包静态门禁');
+    console.log(`- 仓库根目录: ${repoRoot}`);
+    checkDockerfile(state);
+    checkHealthcheckScript(state);
+    checkCompose(state, 'docker-compose.yml', 'dev');
+    checkCompose(state, 'docker-compose.prod.yml', 'prod');
+    checkComposeCrossConsistency(state);
+    checkEnvTemplate(state);
+    checkPgHba(state);
+    checkIgnoreFiles(state);
+    report(state);
+  }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main();
 }
