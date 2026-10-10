@@ -31,6 +31,8 @@ export type EndpointId =
   | 'adminStatisticsFlow'
   | 'adminStatisticsAchievements'
   | 'adminStatisticsEducation'
+  | 'myExports'
+  | 'exportRevoke'
   | 'sessionLogin';
 
 export interface EndpointDescriptor {
@@ -124,6 +126,28 @@ export const ENDPOINTS = {
     permissions: [PermissionPoint.StatisticsEducationRead],
     summary: '升学统计',
     note: '响应形状未确认：升学率口径必须由服务端按共享 computeAdmissionRate 计算，前端不自行推导。',
+  },
+  myExports: {
+    id: 'myExports',
+    method: 'GET',
+    path: '/me/exports',
+    status: 'stable',
+    permissions: [PermissionPoint.ProfileSelfRead],
+    summary: '本人导出请求列表与状态（键集分页）',
+    note:
+      '查询串闭集只有 cursor：位移分页（page/pageSize）与 status/userId/ownerId 一律 400。' +
+      'meta 只有 limit / hasNext / nextCursor 三项，nextCursor 是不透明签名串。',
+  },
+  exportRevoke: {
+    id: 'exportRevoke',
+    method: 'POST',
+    path: '/me/exports/{exportId}/revoke',
+    status: 'stable',
+    permissions: [PermissionPoint.ProfileSelfRead],
+    summary: '撤销本人的导出请求（幂等；撤销后下载立即失效）',
+    note:
+      '请求体与查询串都是**空集**：归属取服务端会话主体，客户端提交的 userId/ownerId/artifactId/path/status ' +
+      '一律 400。不存在 / 跨主体 / failed / 已过期 统一收敛为同一个 404，界面不区分原因。',
   },
   sessionLogin: {
     id: 'sessionLogin',

@@ -29,7 +29,15 @@ describe('API 边界登记表', () => {
     const pending = all.filter((item) => item.status === 'pending').map((item) => item.id);
 
     expect(stable.sort()).toEqual(
-      ['health', 'profileRead', 'profileUpdate', 'selfStatistics'].sort(),
+      [
+        'health',
+        'profileRead',
+        'profileUpdate',
+        'selfStatistics',
+        // HEAD 已实现本人导出列表与撤销（后端契约稳定），因此这两条是 stable
+        'myExports',
+        'exportRevoke',
+      ].sort(),
     );
     expect(pending.sort()).toEqual(
       [
@@ -57,6 +65,23 @@ describe('API 边界登记表', () => {
     expect(ENDPOINTS.adminApplications.permissions).toContain('membership:review:global');
     expect(ENDPOINTS.adminStatisticsEducation.permissions).toContain('statistics:education:read');
   });
+
+  /**
+   * 导出切片的边界登记：撤销的入参**只有路径参数**（没有请求体、没有查询串），
+   * 归属取服务端会话主体，因此登记表里也不存在任何「可提交归属/产物」的入口。
+   */
+  it('本人导出边界：列表是 GET、撤销是 POST 且只带 exportId 路径参数', () => {
+    expect(ENDPOINTS.myExports.method).toBe('GET');
+    expect(ENDPOINTS.myExports.path).toBe('/me/exports');
+    expect(ENDPOINTS.myExports.permissions).toEqual(['profile:self:read']);
+
+    expect(ENDPOINTS.exportRevoke.method).toBe('POST');
+    expect(ENDPOINTS.exportRevoke.path).toBe('/me/exports/{exportId}/revoke');
+    expect(ENDPOINTS.exportRevoke.permissions).toEqual(['profile:self:read']);
+    expect(endpointPath(ENDPOINTS.exportRevoke, { exportId: 'a-1' })).toBe(
+      '/me/exports/a-1/revoke',
+    );
+  });
 });
 
 describe('路径构造', () => {
@@ -77,6 +102,12 @@ describe('路径构造', () => {
     expect(() => endpointPath(ENDPOINTS.profileRead, { unexpected: 'x' })).toThrowError(
       /路径参数未被使用/,
     );
+    // 导出 ID 是**单段**参数：路径穿越尝试被百分号编码，永远落在一个路径段里
+    // （服务端再以 UUID 形态门禁统一拒绝，前端不据此判断存在性）
+    expect(endpointPath(ENDPOINTS.exportRevoke, { exportId: '../../etc/passwd' })).toBe(
+      '/me/exports/..%2F..%2Fetc%2Fpasswd/revoke',
+    );
+    expect(() => endpointPath(ENDPOINTS.exportRevoke, {})).toThrowError(/缺少路径参数/);
   });
 
   it('展示用标签包含统一前缀，便于与后端日志对齐', () => {

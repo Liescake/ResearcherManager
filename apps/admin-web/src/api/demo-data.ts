@@ -10,6 +10,7 @@ import {
 import type {
   AdminApplicationListItem,
   DashboardMetric,
+  ExportRequestView,
   StudentProfileView,
   SelfStatisticsView,
 } from './types';
@@ -131,6 +132,44 @@ export const DEMO_ADMIN_STATISTICS: Readonly<Record<string, readonly DashboardMe
     { key: 'preparing', label: '备考中', value: 1 },
   ],
 };
+
+/**
+ * 本人导出记录夹具：**五种视图状态各一条**，用来走查「哪些能撤销、哪些必须没有入口」。
+ *
+ * 与其它夹具同一条纪律：全部是合成数据（假 UUID、演示字段名），不含任何真实用户信息，
+ * 也不冒充任何持久化结果。`expired` 一条是刻意的：服务端当前只在下载/撤销判定里使用过期语义
+ * 而不会把 `expired` 当作列表状态下发，夹具保留它，是为了让界面在遇到该取值（以及将来任何新取值）
+ * 时的行为被固定下来——**不提供撤销入口**，而不是靠猜。
+ */
+function demoExportView(
+  index: number,
+  status: string,
+  resource: string,
+  fields: readonly string[],
+): ExportRequestView {
+  const day = String((index % 27) + 1).padStart(2, '0');
+  return {
+    id: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+    resource,
+    fields: [...fields],
+    status,
+    createdAt: `2026-10-${day}T01:00:00.000Z`,
+    updatedAt: `2026-10-${day}T02:30:00.000Z`,
+  };
+}
+
+export const DEMO_EXPORTS: readonly ExportRequestView[] = [
+  demoExportView(1, 'pending', 'profile', ['name', 'grade', 'college']),
+  demoExportView(2, 'completed', 'education', ['school', 'status']),
+  demoExportView(3, 'failed', 'achievement', ['title', 'level']),
+  demoExportView(4, 'expired', 'profile', ['name', 'skills']),
+  demoExportView(5, 'revoked', 'education', ['school', 'status']),
+];
+
+/** 返回**副本**：演示页面就地修改返回值不得污染夹具（与申请列表夹具同口径） */
+export function demoExportItems(): ExportRequestView[] {
+  return DEMO_EXPORTS.map((item) => ({ ...item, fields: [...item.fields] }));
+}
 
 export interface DemoApplicationQuery {
   page: number;

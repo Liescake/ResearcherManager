@@ -8,15 +8,24 @@ import {
   DEMO_PROFILE,
   DEMO_SELF_STATISTICS,
   buildDemoApplicationPage,
+  demoExportItems,
 } from './demo-data';
-import { ENDPOINTS, endpointRef } from './endpoints';
+import { ENDPOINTS, endpointPath, endpointRef } from './endpoints';
+import {
+  buildExportCursorQuery,
+  contractError,
+  readExportPage,
+  readExportView,
+} from './export-view';
 import { looksLikePendingEndpoint, toUiError } from './errors';
 import { ADMIN_STATISTICS_SOURCES } from './types';
 import type {
   AdminApplicationPage,
   AdminApplicationQuery,
   AdminApplicationListItem,
+  ExportRequestView,
   HealthView,
+  MyExportPage,
   SelfStatisticsView,
   StatisticsSourceResult,
   StudentProfileView,
@@ -61,6 +70,25 @@ export interface AdminGateway {
   loadSelfStatistics(): Promise<SelfStatisticsView>;
   loadAdminStatistics(): Promise<StatisticsSourceResult[]>;
   loadApplications(query: AdminApplicationQuery): Promise<AdminApplicationPage>;
+  /**
+   * 本人导出记录的一页（键集分页）。`cursor` 是服务端签发的不透明游标：
+   * 前端只负责原样带回，**不解析、不构造、不缓存**。
+   */
+  loadMyExports(options?: MyExportsQuery): Promise<MyExportPage>;
+  /**
+   * **撤销本人的导出请求**（`POST /me/exports/:exportId/revoke`）。
+   *
+   * 入参只有路径参数 `exportId`：不发请求体、不带查询串，因此不存在「客户端提交归属 / 产物 /
+   * 路径」的入口——归属由服务端的会话主体决定（Authorization 由 api client 统一注入）。
+   * 幂等：重复撤销同样返回已撤销的视图。演示模式**拒绝**该写操作（`DEMO_READ_ONLY`），
+   * 且演示网关不持有任何 `ApiClient`，因此结构上不可能发出请求。
+   */
+  revokeExport(exportId: string): Promise<ExportRequestView>;
+}
+
+export interface MyExportsQuery {
+  /** 服务端上一页返回的 `nextCursor`；省略即取第一页 */
+  readonly cursor?: string;
 }
 
 export const DEMO_READ_ONLY_MESSAGE =
@@ -144,6 +172,41 @@ export function createLiveGateway(client: ApiClient): AdminGateway {
       );
       return toApplicationPage(query, envelope.data, envelope.meta as Record<string, unknown>);
     },
+
+    /**
+     * 本人导出列表：只带服务端声明的 `cursor`（服务端默认页大小），并**按白名单读取**响应。
+     * 形状不符即抛契约违规错误：宁可让这一页显示为「响应不符合接口契约」，也不静默丢行。
+     */
+    async loadMyExports(options: MyExportsQuery = {}): Promise<MyExportPage> {
+      const envelope = await client.getEnvelope<unknown>(
+        `${ENDPOINTS.myExports.path}${buildExportCursorQuery(options)}`,
+      );
+      const page = readExportPage(envelope.data, envelope.meta as Record<string, unknown>);
+      if (page === null) {
+        throw contractError();
+      }
+      return page;
+    },
+
+    /**
+     * 撤销本人导出：**没有请求体、没有查询串**。
+     *
+     * `client.postJson(path, undefined)` 刻意传 `undefined` 而不是 `{}`：客户端只在 body
+     * 不是 `undefined` 时才发送请求体与 `content-type`，因此这条请求在线上就是一个裸 POST +
+     * `Authorization`（票据由 `tokenProvider` 注入，前端代码从不读取或暂存它）。
+     * 路径参数经 `endpointPath` 单点校验与转义（含 `/`、空串一律 fail fast）。
+     */
+    async revokeExport(exportId: string): Promise<ExportRequestView> {
+      const data = await client.postJson<unknown>(
+        endpointPath(ENDPOINTS.exportRevoke, { exportId }),
+        undefined,
+      );
+      const view = readExportView(data);
+      if (view === null) {
+        throw contractError();
+      }
+      return view;
+    },
   };
 }
 
@@ -168,6 +231,8 @@ export function createMisconfiguredGateway(error: ApiClientError): AdminGateway 
     loadSelfStatistics: () => reject(),
     loadAdminStatistics: () => reject(),
     loadApplications: () => reject(),
+    loadMyExports: () => reject(),
+    revokeExport: () => reject(),
   };
 }
 
@@ -246,6 +311,26 @@ export function createDemoGateway(options: DemoGatewayOptions = {}): AdminGatewa
         total: page.total,
         totalPages: page.totalPages,
       };
+    },
+
+    /**
+     * 演示导出记录：一次性返回夹具（`hasNext: false`、`nextCursor: null`），
+     * **不模拟游标分页**——伪造一个可续页的游标会让界面显示「还有下一页」却拿不到数据。
+     * `cursor` 参数被忽略：演示网关不接受任何分页输入，因为它根本没有服务端。
+     */
+    async loadMyExports(): Promise<MyExportPage> {
+      await wait();
+      const items = demoExportItems();
+      return { items, limit: items.length, hasNext: false, nextCursor: null };
+    },
+
+    /**
+     * 演示模式**拒绝**撤销：这是写操作，演示网关既不持有 `ApiClient`（结构上发不出请求），
+     * 也返回本地「假装撤销成功」的结果——那正是本项目禁止的（见 `DEMO_READ_ONLY_MESSAGE`）。
+     */
+    async revokeExport(): Promise<ExportRequestView> {
+      await wait();
+      throw new ApiClientError('DEMO_READ_ONLY', DEMO_READ_ONLY_MESSAGE);
     },
   };
 }

@@ -128,13 +128,55 @@ export function toUiError(caught: unknown, endpoint?: string): UiError {
 export function isUnauthorized(error: UiError): boolean {
   return error.kind === 'unauthorized';
 }
-
 export function isForbidden(error: UiError): boolean {
   return error.kind === 'forbidden';
 }
 
 export function isNotFound(error: UiError): boolean {
   return error.kind === 'not-found';
+}
+
+/**
+ * 撤销导出的**统一安全拒绝**在界面侧的稳定错误码。
+ *
+ * 为什么需要一个前端码：服务端刻意把「不存在 / 跨主体 / `failed` 结论 / 已过期 / 非法路径参数」
+ * 收敛到**同一个 404 + 同一条文案**（`EXPORT_REVOCATION_UNAVAILABLE_MESSAGE`），目的就是让调用方
+ * 无法据此区分「有没有这条导出、它是什么结论」。如果界面把服务端的裸 404 当成普通「未找到数据」，
+ * 就等于丢掉了「这是一次统一拒绝」的语义；如果界面去做更细的区分，就等于在自己这边重新泄露原因。
+ * 因此这里统一成一个码：**界面只表达「当前不可撤销」，不解释为什么**。
+ */
+export const EXPORT_UNAVAILABLE_CODE = 'EXPORT_UNAVAILABLE';
+
+/** 与码配套的用户安全文案：不区分原因、不泄露存在性、不含任何内部字段 */
+export const EXPORT_REVOKE_UNAVAILABLE_MESSAGE =
+  '该导出请求当前不可撤销（服务端不区分原因，界面也不推断原因）。列表随后重新加载即可看到最新状态。';
+
+/** 演示模式下写操作被本地拒绝的稳定码（与 `gateway.ts` 的 `DEMO_READ_ONLY` 一致） */
+export const DEMO_READ_ONLY_CODE = 'DEMO_READ_ONLY';
+
+/**
+ * 撤销调用的错误收敛（**唯一入口**）。规则刻意很少，但每一条都有理由：
+ * 1. **401 / 403 / 503 等一切其它失败沿用既有映射**（`toUiError`）：会话失效、权限不足、
+ *    服务暂不可用各有各的处置，不在这里被压成一句笼统文案；
+ * 2. `not-found`（服务端的统一安全拒绝）→ 换成 `EXPORT_UNAVAILABLE` + 统一文案，
+ *    保留 `status` / `requestId` / `endpoint` 以便排障；
+ * 3. 演示模式的本地拒绝（`DEMO_READ_ONLY`）归类为 `forbidden`（「本模式不允许写操作」），
+ *    而不是「发生未预期错误」——它是明确的产品策略，不是故障。
+ */
+export function toExportRevokeUiError(caught: unknown, endpoint?: string): UiError {
+  const error = toUiError(caught, endpoint);
+
+  if (error.code === DEMO_READ_ONLY_CODE) {
+    return { ...error, kind: 'forbidden' };
+  }
+  if (error.kind === 'not-found') {
+    return {
+      ...error,
+      code: EXPORT_UNAVAILABLE_CODE,
+      message: EXPORT_REVOKE_UNAVAILABLE_MESSAGE,
+    };
+  }
+  return error;
 }
 
 /**

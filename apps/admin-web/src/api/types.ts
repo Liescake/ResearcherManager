@@ -111,6 +111,87 @@ export interface AdminApplicationPage {
 }
 
 /**
+ * 本人导出请求的**对外视图状态**（镜像服务端 `EXPORT_VIEW_STATUS_VALUES`）。
+ *
+ * 为什么这五个取值必须显式列全，而不是「只处理我见过的两个」：
+ * - `pending` / `completed` / `failed` 是服务端**存储三态**；
+ * - `revoked` 是服务端按 `revokedAt` **派生**的第四态（撤销是服务端事实，客户端不参与判定）；
+ * - `expired` 对应服务端「下载 / 撤销判定」里的过期语义。服务端当前不会把它当作列表状态下发，
+ *   这里显式声明是为了让它在界面上有确定呈现（不可撤销、无下载），而不是落到「未知状态」分支上。
+ *
+ * 注意：**可撤销闭集**是独立的（见 `isExportRevocableStatus`）。界面永远不按枚举名猜动作，
+ * 只按闭集放行——因此服务端将来新增任何状态，界面的默认行为都是「不提供撤销入口」。
+ */
+export const EXPORT_VIEW_STATUS_VALUES = [
+  'pending',
+  'completed',
+  'failed',
+  'expired',
+  'revoked',
+] as const;
+
+export type ExportViewStatus = (typeof EXPORT_VIEW_STATUS_VALUES)[number];
+
+/** 展示文案（仅展示，不构成任何授权或状态判定） */
+export const EXPORT_STATUS_LABELS: Readonly<Record<ExportViewStatus, string>> = {
+  pending: '处理中',
+  completed: '已完成',
+  failed: '生成失败',
+  expired: '已过期',
+  revoked: '已撤销',
+};
+
+/**
+ * **可撤销状态闭集**（镜像服务端 `isExportRevocableStatus`）：只有 `pending` / `completed`。
+ *
+ * 这是白名单而不是黑名单：`failed`（结论不可撤销）、`expired`（已过期）以及任何**未知**取值
+ * 都自动落在闭集之外。界面据此决定是否渲染撤销入口；真正的判定始终在服务端。
+ */
+export const EXPORT_REVOCABLE_STATUS_VALUES = ['pending', 'completed'] as const;
+
+export function isExportRevocableStatus(value: unknown): boolean {
+  return (
+    typeof value === 'string' &&
+    (EXPORT_REVOCABLE_STATUS_VALUES as readonly string[]).includes(value)
+  );
+}
+
+/** 已知状态的展示文案；未知取值按「未知状态（原值）」呈现，绝不猜成某个已知结论 */
+export function exportStatusLabel(status: string): string {
+  const label = EXPORT_STATUS_LABELS[status as ExportViewStatus];
+  return label ?? `未知状态（${status}）`;
+}
+
+/**
+ * 导出请求对外视图（**逐字段镜像**服务端 `ExportRequestView` 白名单）。
+ *
+ * 刻意不含：归属（ownerUserId / requesterId）、产物句柄（artifactId）、有效期（expiresAt）、
+ * 撤销时刻（revokedAt）、文件名/路径/下载地址——服务端本就不下发这些字段，前端也不去读它们。
+ */
+export interface ExportRequestView {
+  id: string;
+  resource: string;
+  fields: string[];
+  /** 服务端状态原文：前端不做本地推断，未知取值按「未知状态」展示且不可撤销 */
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * 本人导出列表的一页（**键集分页**，镜像服务端 `meta` = `{ limit, hasNext, nextCursor }`）。
+ *
+ * `limit` 在服务端未给出时为 `null`（绝不推算）；`hasNext` 与 `nextCursor` 的充要关系
+ * 由服务端保证，前端只是如实携带——**不自洽就按契约违规处理**，不猜「还有没有下一页」。
+ */
+export interface MyExportPage {
+  items: ExportRequestView[];
+  limit: number | null;
+  hasNext: boolean;
+  nextCursor: string | null;
+}
+
+/**
  * 管理端统计来源（契约基线 `GET /admin/statistics/{flow|achievements|education}`）。
  * 后端切片未实现，因此**不对响应形状做任何假设**：只把「能否取到数据」与「取到几个可展示指标」
  * 作为事实，指标以 `label/value` 白名单形式携带，避免把未确认的字段名写进界面逻辑。

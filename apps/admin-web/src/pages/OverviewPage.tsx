@@ -4,12 +4,13 @@ import {
   MAX_PAGE_SIZE,
   computeAdmissionRate,
 } from '@rm/shared';
-import type { ReactNode } from 'react';
+import { useRef, useState, type ReactNode } from 'react';
 import { ENDPOINTS, endpointRef } from '../api/endpoints';
 import { DEMO_EDUCATION_RECORDS } from '../api/demo-data';
 import { ADMIN_STATISTICS_SOURCES, type StatisticsSourceResult } from '../api/types';
 import { useAuth } from '../auth/AuthContext';
 import { AsyncStateView } from '../components/AsyncStateView';
+import { MyExportsPanel } from '../components/MyExportsPanel';
 import {
   EmptyPanel,
   ErrorPanel,
@@ -17,6 +18,16 @@ import {
   PendingEndpointPanel,
 } from '../components/StatePanel';
 import { useLoader } from '../state/useLoader';
+import {
+  INITIAL_REVOKE_FLOW,
+  cancelRevoke,
+  confirmRevoke,
+  dismissRevokeNotice,
+  requestRevoke,
+  revokeFailed,
+  revokeSucceeded,
+  type RevokeFlowState,
+} from '../state/revoke-flow';
 import { formatDateTime, formatPercent, formatUptimeSeconds } from '../lib/format';
 
 const SELF_STATISTIC_FIELDS = [
@@ -113,6 +124,43 @@ export function OverviewPage(): ReactNode {
   const health = useLoader(() => gateway.loadHealth(), [gateway], {
     endpoint: endpointRef(ENDPOINTS.health),
   });
+  const myExports = useLoader(() => gateway.loadMyExports(), [gateway], {
+    endpoint: endpointRef(ENDPOINTS.myExports),
+  });
+
+  /**
+   * 撤销流程状态。持有它的原因：撤销是写操作，它的时序（确认、提交中、成功、失败）
+   * 必须与渲染分离——状态机在 `state/revoke-flow.ts`（纯函数）里，并已被单测固定。
+   */
+  const [revokeFlow, setRevokeFlow] = useState<RevokeFlowState>(INITIAL_REVOKE_FLOW);
+  /**
+   * 防重复提交的**同步保险**：`revokeFlow.pendingId` 要等下一次渲染才生效，
+   * 因此一次极快的双击仍可能在上一次 setState 生效之前进入提交路径。ref 在同一 tick 内即可挡住。
+   * 它只是纵深防御：真正的幂等判定在服务端（重复撤销同样返回已撤销，不会改写撤销时刻）。
+   */
+  const revokeInFlight = useRef(false);
+
+  const submitRevoke = async (exportId: string): Promise<void> => {
+    if (revokeInFlight.current) return;
+    revokeInFlight.current = true;
+    try {
+      // 只提交路径参数：不发请求体、不带查询串，票据由 api client 注入（前端不读也不存）
+      const view = await gateway.revokeExport(exportId);
+      setRevokeFlow((current) => revokeSucceeded(current, view));
+    } catch (caught) {
+      setRevokeFlow((current) => revokeFailed(current, caught));
+    } finally {
+      revokeInFlight.current = false;
+    }
+  };
+
+  const handleConfirmRevoke = (): void => {
+    const outcome = confirmRevoke(revokeFlow);
+    // 未确认或已在提交中时 outcome.exportId 为 null：**不发出任何请求**
+    if (outcome.exportId === null) return;
+    setRevokeFlow(outcome.state);
+    void submitRevoke(outcome.exportId);
+  };
 
   const isDemo = gateway.mode === 'demo';
   const admission = computeAdmissionRate(isDemo ? DEMO_EDUCATION_RECORDS : []);
@@ -152,6 +200,17 @@ export function OverviewPage(): ReactNode {
           )}
         </AsyncStateView>
       </section>
+
+      <MyExportsPanel
+        state={myExports.state}
+        mode={isDemo ? 'demo' : 'live'}
+        flow={revokeFlow}
+        onRequestRevoke={(target) => setRevokeFlow((current) => requestRevoke(current, target))}
+        onCancelRevoke={() => setRevokeFlow((current) => cancelRevoke(current))}
+        onConfirmRevoke={handleConfirmRevoke}
+        onDismissNotice={() => setRevokeFlow((current) => dismissRevokeNotice(current))}
+        onRetry={myExports.reload}
+      />
 
       <section className="card" aria-labelledby="admin-stats-title">
         <h2 id="admin-stats-title">管理端统计（后端切片未实现）</h2>
