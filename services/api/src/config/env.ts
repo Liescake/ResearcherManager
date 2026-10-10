@@ -132,9 +132,38 @@ const envShape = z.object({
 });
 
 /**
+ * 生产环境出站是否**必须**走 TLS。
+ *
+ * 触发条件与 provider 装配的条件**逐字对齐**（见
+ * `src/modules/matching/matching.ai-provider.ts` 的 `createMatchingAiProvider` /
+ * `isMatchingEnabled`）：只有「NODE_ENV=production」且「匹配开关已打开」且
+ * 「AI_PROVIDER=http-json」三者同时成立时才会真的向外部模型服务发出请求，
+ * 此时明文 http 会把模型提示词与 `Authorization: Bearer <key>` 一起暴露在同链路上。
+ *
+ * 刻意**不**依赖 NODE_ENV 以外的任何未定义配置（如代理、附加开关）：
+ * 关闭 / mock provider 与开发、测试环境语义完全不变（`AI_TRUSTED_HOSTS` 允许的
+ * 本机 / 内网 http 网关在非生产环境仍然放行）。
+ */
+function requiresHttpsAiEndpoint(value: {
+  readonly NODE_ENV: 'development' | 'test' | 'production';
+  readonly AI_PROVIDER: 'mock' | 'http-json' | 'disabled';
+  readonly AI_MATCHING_ENABLED: boolean;
+}): boolean {
+  return (
+    value.NODE_ENV === 'production' &&
+    value.AI_MATCHING_ENABLED &&
+    value.AI_PROVIDER === 'http-json'
+  );
+}
+
+/**
  * 完整环境变量 schema：在字段级校验之上追加 AI 出站端点的启动期安全校验，
  * 与 provider 侧复用**同一份**判定逻辑，避免「启动放行、运行拒绝」或反向的偏差。
- * 只增补 `AI_BASE_URL` 的 issue，消息不包含原始取值。
+ *
+ * 两条规则（都只增补 `AI_BASE_URL` 的 issue，消息**只描述规则**，不回显 URL / key）：
+ * 1. 端点字面量安全校验（协议白名单、userinfo / query / hash、主机与端口）；
+ * 2. 生产环境的 `http-json` + 匹配开启（即真的会出站）时，**只接受 `https:`**，
+ *    明文 `http` fail-closed 拒绝启动。
  */
 export const envSchema = envShape.superRefine((value, ctx) => {
   if (value.AI_BASE_URL === undefined) {
@@ -148,6 +177,17 @@ export const envSchema = envShape.superRefine((value, ctx) => {
       code: z.ZodIssueCode.custom,
       path: ['AI_BASE_URL'],
       message: resolution.message,
+    });
+    // 字面量本身已不合规：不再追加 TLS 判定，避免同一处配置出现互相矛盾的提示
+    return;
+  }
+  if (requiresHttpsAiEndpoint(value) && resolution.endpoint.protocol !== 'https:') {
+    // 只写变量名与规则，绝不回显取值（取值可能含主机名、端口乃至凭据）
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['AI_BASE_URL'],
+      message:
+        '生产环境（NODE_ENV=production）在匹配开启且 AI_PROVIDER=http-json 时必须使用 https 端点；明文 http 会把模型请求与 API key 暴露在同链路上，已按 fail-closed 拒绝',
     });
   }
 });

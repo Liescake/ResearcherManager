@@ -176,4 +176,90 @@ describe('环境变量校验', () => {
     expect(loadEnv({ AI_MAX_RESPONSE_BYTES: '' }).AI_MAX_RESPONSE_BYTES).toBe(1_048_576);
     expect(() => loadEnv({ AI_MAX_RESPONSE_BYTES: '10' })).toThrowError(/环境变量校验失败/u);
   });
+
+  it('生产 + 匹配开启 + http-json：明文 http 端点启动即失败（fail-closed）', () => {
+    // 逐个样本都指向**公网**主机名，因此失败原因只能是「生产必须 https」，
+    // 而不是端点字面量安全校验（后者由上面的用例单独覆盖）。
+    for (const plaintext of [
+      'http://api.ai.example.net/v1',
+      'http://api.ai.example.net:80/v1',
+      // 受信主机放行「主机与端口」两项，但**不放宽**生产 TLS 要求
+      'http://gw.private.example.net:9000/v1',
+    ]) {
+      try {
+        loadEnv({
+          NODE_ENV: 'production',
+          AI_PROVIDER: 'http-json',
+          AI_MATCHING_ENABLED: 'true',
+          AI_BASE_URL: plaintext,
+          AI_TRUSTED_HOSTS: 'gw.private.example.net',
+        });
+        expect.unreachable(`生产环境应当拒绝明文端点: ${plaintext}`);
+      } catch (error) {
+        const message = (error as Error).message;
+        expect(message).toContain('AI_BASE_URL');
+        // 只描述规则：不回显 URL、主机名、端口或任何凭据片段
+        expect(message).not.toContain(plaintext);
+        expect(message).not.toContain('api.ai.example.net');
+        expect(message).not.toContain('gw.private.example.net');
+        expect(message).not.toContain('9000');
+      }
+    }
+
+    // 同一组条件换成 https 即放行
+    const httpsEnv = loadEnv({
+      NODE_ENV: 'production',
+      AI_PROVIDER: 'http-json',
+      AI_MATCHING_ENABLED: 'true',
+      AI_BASE_URL: 'https://api.ai.example.net/v1',
+    });
+    expect(httpsEnv.AI_BASE_URL).toBe('https://api.ai.example.net/v1');
+    expect(httpsEnv.NODE_ENV).toBe('production');
+  });
+
+  it('生产 https 要求只在该组合下生效：不波及 disabled / mock / 开关关闭 / 开发 / 测试', () => {
+    // 生产 + http-json 但匹配关闭：适配层不会调用 provider，明文端点不构成出站面
+    expect(
+      loadEnv({
+        NODE_ENV: 'production',
+        AI_PROVIDER: 'http-json',
+        AI_MATCHING_ENABLED: 'false',
+        AI_BASE_URL: 'http://api.ai.example.net/v1',
+      }).AI_BASE_URL,
+    ).toBe('http://api.ai.example.net/v1');
+
+    // 生产 + 匹配开启 + 非 http-json provider：仍走桩 / 明确降级路径
+    for (const provider of ['mock', 'disabled'] as const) {
+      expect(
+        loadEnv({
+          NODE_ENV: 'production',
+          AI_PROVIDER: provider,
+          AI_MATCHING_ENABLED: 'true',
+          AI_BASE_URL: 'http://api.ai.example.net/v1',
+        }).AI_BASE_URL,
+      ).toBe('http://api.ai.example.net/v1');
+    }
+
+    // 开发 / 测试：保留本机 / 内网 http 网关语义（含受信主机与自定义端口）
+    for (const nodeEnv of ['development', 'test'] as const) {
+      expect(
+        loadEnv({
+          NODE_ENV: nodeEnv,
+          AI_PROVIDER: 'http-json',
+          AI_MATCHING_ENABLED: 'true',
+          AI_BASE_URL: 'http://127.0.0.1:11434/v1',
+          AI_TRUSTED_HOSTS: '127.0.0.1',
+        }).AI_BASE_URL,
+      ).toBe('http://127.0.0.1:11434/v1');
+    }
+
+    // 未配置 AI_BASE_URL 时本规则不产生 issue：
+    // 生产 + http-json + 匹配开启的「缺少 AI_BASE_URL」由 provider 装配层负责拒绝。
+    const missingBaseUrl = loadEnv({
+      NODE_ENV: 'production',
+      AI_PROVIDER: 'http-json',
+      AI_MATCHING_ENABLED: 'true',
+    });
+    expect(missingBaseUrl.AI_BASE_URL).toBeUndefined();
+  });
 });
