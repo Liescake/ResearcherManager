@@ -102,7 +102,7 @@ function MetricsList({
  * - 系统与契约自检：健康检查与共享常量，用于联调排障。
  */
 export function OverviewPage(): ReactNode {
-  const { gateway } = useAuth();
+  const { gateway, apiBaseUrl } = useAuth();
 
   const selfStatistics = useLoader(() => gateway.loadSelfStatistics(), [gateway], {
     endpoint: endpointRef(ENDPOINTS.selfStatistics),
@@ -209,14 +209,19 @@ export function OverviewPage(): ReactNode {
         <dl className="kv">
           <dt>请求地址</dt>
           <dd>
+            {/* 显示实际生效的基地址（与票据去向一致），而不是只显示约定的常量前缀 */}
             <code>
-              {gateway.mode === 'demo' ? '（演示模式不发起请求）' : `${API_PREFIX}/health`}
+              {gateway.mode === 'demo'
+                ? '（演示模式不发起请求）'
+                : `${apiBaseUrl}${ENDPOINTS.health.path}`}
             </code>
           </dd>
           <dt>约定前缀</dt>
           <dd>
             <code>{API_PREFIX}</code>
           </dd>
+          <dt>当前模式</dt>
+          <dd>{gateway.mode === 'demo' ? '演示模式（不发请求）' : '联调模式（真实请求）'}</dd>
         </dl>
         <AsyncStateView
           state={health.state}

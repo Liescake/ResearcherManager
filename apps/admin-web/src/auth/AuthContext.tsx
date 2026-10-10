@@ -7,10 +7,15 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { createApiClient, resolveApiBaseUrl } from '../api/client';
+import { createApiClient, resolveApiBaseUrlResult } from '../api/client';
 import { ENDPOINTS } from '../api/endpoints';
 import { toUiError, type UiError } from '../api/errors';
-import { createDemoGateway, createLiveGateway, type AdminGateway } from '../api/gateway';
+import {
+  createDemoGateway,
+  createLiveGateway,
+  createMisconfiguredGateway,
+  type AdminGateway,
+} from '../api/gateway';
 import {
   ANONYMOUS,
   createBrowserSessionStorage,
@@ -28,7 +33,9 @@ import {
   LOGGED_OUT_NOTICE,
   SESSION_EXPIRED_NOTICE,
   expireSession,
+  probeApiHealth,
   verifyTicket,
+  type ApiProbeResult,
 } from './session-flow';
 
 /**
@@ -58,12 +65,18 @@ export type LoginResult = { ok: true; warning?: string } | { ok: false; error: U
 export interface AuthContextValue {
   readonly session: SessionState;
   readonly gateway: AdminGateway;
+  /** 实际生效的 API 基地址（与请求头里票据的去向完全一致）；配置非法时为空串 */
+  readonly apiBaseUrl: string;
+  /** 基地址配置错误：非 null 时界面只渲染配置错误，且不得发起任何请求 */
+  readonly apiConfigError: UiError | null;
   /** 会话层提示（会话过期、已退出等），展示后由页面调用 `clearNotice` */
   readonly notice: string | null;
   clearNotice(): void;
   loginWithTicket(input: LoginInput): Promise<LoginResult>;
   enterDemoMode(): void;
   logout(): void;
+  /** 联调连通性探测：匿名 GET /health，不携带票据、不改变会话 */
+  checkApiConnection(): Promise<ApiProbeResult>;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -94,33 +107,51 @@ export function AuthProvider({ children, storage, baseUrl }: AuthProviderProps):
     setSession(next);
   }, []);
 
-  const resolvedBaseUrl = useMemo(() => baseUrl ?? resolveApiBaseUrl(), [baseUrl]);
-
-  const client = useMemo(
-    () =>
-      createApiClient({
-        baseUrl: resolvedBaseUrl,
-        tokenProvider: () =>
-          session.status === 'authenticated' && session.session.mode === 'real'
-            ? session.session.ticket
-            : null,
-        onUnauthorized: () => {
-          // 会话语义上的失效：清空 + 提示；跳转由路由守卫完成（401 不在这里做命令式跳转）
-          const expiry = expireSession(storageRef.current);
-          setSession(expiry.state);
-          setNotice(expiry.notice);
-        },
-      }),
-    [resolvedBaseUrl, session],
+  const resolvedBaseUrl = useMemo(() => resolveApiBaseUrlResult(baseUrl), [baseUrl]);
+  const apiBaseUrl = resolvedBaseUrl.ok ? resolvedBaseUrl.baseUrl : '';
+  const demoSession = session.status === 'authenticated' && session.session.mode === 'demo';
+  /**
+   * 配置错误只在**真实模式**下成为阻断状态。
+   *
+   * 演示模式不构造客户端、不发任何请求，因此一个写错的 API 地址不该妨碍界面走查——
+   * 把两种模式放进同一个阻断条件，等于让「后端配置有问题」连带禁掉了「不依赖后端的演示」。
+   */
+  const apiConfigError = useMemo(
+    () => (demoSession || resolvedBaseUrl.ok ? null : toUiError(resolvedBaseUrl.error)),
+    [demoSession, resolvedBaseUrl],
   );
 
-  const gateway = useMemo<AdminGateway>(
-    () =>
-      session.status === 'authenticated' && session.session.mode === 'demo'
-        ? createDemoGateway()
-        : createLiveGateway(client),
-    [session, client],
-  );
+  /**
+   * 客户端与网关在**同一个 memo** 里构造，是为了让「基地址非法」「演示模式」这两条
+   * 不变量在结构上成立：前者拿不到客户端（连构造都不会发生），后者只会拿到演示网关。
+   */
+  const { client, gateway } = useMemo((): {
+    client: ReturnType<typeof createApiClient> | null;
+    gateway: AdminGateway;
+  } => {
+    if (session.status === 'authenticated' && session.session.mode === 'demo') {
+      // 演示模式：不构造任何 API 客户端，代码层面就无法发出请求、更无法写入
+      return { client: null, gateway: createDemoGateway() };
+    }
+    if (!resolvedBaseUrl.ok) {
+      // 基地址非法：fail-closed，既不构造客户端，也不给界面任何「空数据」的错觉
+      return { client: null, gateway: createMisconfiguredGateway(resolvedBaseUrl.error) };
+    }
+    const liveClient = createApiClient({
+      baseUrl: resolvedBaseUrl.baseUrl,
+      tokenProvider: () =>
+        session.status === 'authenticated' && session.session.mode === 'real'
+          ? session.session.ticket
+          : null,
+      onUnauthorized: () => {
+        // 会话语义上的失效：清空 + 提示；跳转由路由守卫完成（401 不在这里做命令式跳转）
+        const expiry = expireSession(storageRef.current);
+        setSession(expiry.state);
+        setNotice(expiry.notice);
+      },
+    });
+    return { client: liveClient, gateway: createLiveGateway(liveClient) };
+  }, [resolvedBaseUrl, session]);
 
   const loginWithTicket = useCallback(
     async ({ ticket, redirect }: LoginInput): Promise<LoginResult> => {
@@ -134,6 +165,13 @@ export function AuthProvider({ children, storage, baseUrl }: AuthProviderProps):
             message: INVALID_TICKET_NOTICE,
             endpoint: `${ENDPOINTS.sessionLogin.method} ${ENDPOINTS.sessionLogin.path}`,
           },
+        };
+      }
+      if (client === null) {
+        // 基地址非法时本地拒绝：票据不会离开浏览器，请求一个都不会发出
+        return {
+          ok: false,
+          error: apiConfigError ?? toUiError(new Error('API 基地址配置不合法，已拒绝登录请求')),
         };
       }
       const outcome = await verifyTicket({ baseUrl: client.baseUrl, ticket: trimmed });
@@ -152,8 +190,15 @@ export function AuthProvider({ children, storage, baseUrl }: AuthProviderProps):
       navigate(redirect !== undefined && redirect !== '' ? redirect : buildHash(HOME_PATH));
       return outcome.warning === undefined ? { ok: true } : { ok: true, warning: outcome.warning };
     },
-    [applySession, client],
+    [applySession, client, apiConfigError],
   );
+
+  const checkApiConnection = useCallback(async (): Promise<ApiProbeResult> => {
+    if (!resolvedBaseUrl.ok) {
+      return { ok: false, error: toUiError(resolvedBaseUrl.error) };
+    }
+    return probeApiHealth({ baseUrl: resolvedBaseUrl.baseUrl });
+  }, [resolvedBaseUrl]);
 
   const enterDemoMode = useCallback(() => {
     applySession({ status: 'authenticated', session: createDemoSession() });
@@ -172,8 +217,30 @@ export function AuthProvider({ children, storage, baseUrl }: AuthProviderProps):
   }, []);
 
   const value = useMemo<AuthContextValue>(
-    () => ({ session, gateway, notice, clearNotice, loginWithTicket, enterDemoMode, logout }),
-    [session, gateway, notice, clearNotice, loginWithTicket, enterDemoMode, logout],
+    () => ({
+      session,
+      gateway,
+      apiBaseUrl,
+      apiConfigError,
+      notice,
+      clearNotice,
+      loginWithTicket,
+      enterDemoMode,
+      logout,
+      checkApiConnection,
+    }),
+    [
+      session,
+      gateway,
+      apiBaseUrl,
+      apiConfigError,
+      notice,
+      clearNotice,
+      loginWithTicket,
+      enterDemoMode,
+      logout,
+      checkApiConnection,
+    ],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

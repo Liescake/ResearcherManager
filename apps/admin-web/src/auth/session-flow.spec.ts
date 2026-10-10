@@ -9,7 +9,12 @@ import {
   serializeSession,
   type SessionStorageLike,
 } from '../api/session';
-import { SESSION_EXPIRED_NOTICE, expireSession, verifyTicket } from './session-flow';
+import {
+  SESSION_EXPIRED_NOTICE,
+  expireSession,
+  probeApiHealth,
+  verifyTicket,
+} from './session-flow';
 
 /**
  * 会话流程的回归测试（node 环境、无 React、无 jsdom）。
@@ -169,6 +174,87 @@ describe('票据登录探测（verifyTicket）', () => {
     const timeout = await probe({ fetchImpl: hanging, timeoutMs: 10 });
     expect(timeout.ok).toBe(false);
     expect(timeout.error?.kind).toBe('timeout');
+  });
+});
+
+/**
+ * 联调连通性探测（登录页的「联调入口」用它回答「地址通不通」）。
+ *
+ * 关键不变量：探测是**匿名**的——它发生在登录之前，绝不能把任何票据发往尚未确认的目标。
+ */
+describe('联调连通性探测（probeApiHealth）', () => {
+  it('200 → 可达，并原样带出健康信息', async () => {
+    const result = await probeApiHealth({
+      baseUrl: '/api/v1',
+      fetchImpl: fetchReturning(
+        ok({ status: 'ok', service: 'api', version: '0.1.0', uptimeSeconds: 1, timestamp: 'x' }),
+      ),
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.health?.service).toBe('api');
+    expect(result.error).toBeUndefined();
+  });
+
+  it('匿名：探测请求不带 Authorization 头（票据不会在登录前被发往任何目标）', async () => {
+    const calls: FetchArgs[] = [];
+    await probeApiHealth({
+      baseUrl: 'http://127.0.0.1:3000/api/v1',
+      fetchImpl: fetchReturning(ok({ status: 'ok' }), { calls }),
+    });
+
+    expect(String(calls[0]?.[0])).toBe('http://127.0.0.1:3000/api/v1/health');
+    expect((calls[0]?.[1]?.headers as Record<string, string>)['authorization']).toBeUndefined();
+  });
+
+  it('API 不可达 → 明确的网络错误，而不是「连通」', async () => {
+    const failing = (async () => {
+      throw new TypeError('fetch failed');
+    }) as unknown as typeof fetch;
+    const result = await probeApiHealth({ baseUrl: '/api/v1', fetchImpl: failing });
+
+    expect(result.ok).toBe(false);
+    expect(result.error?.kind).toBe('network');
+    expect(result.health).toBeUndefined();
+  });
+
+  it('503 → 归为「服务暂不可用」，与 500 区分', async () => {
+    const result = await probeApiHealth({
+      baseUrl: '/api/v1',
+      fetchImpl: fetchReturning(
+        {
+          data: null,
+          meta: {},
+          error: { code: ApiErrorCode.AiUnavailable, message: '依赖不可用' },
+        },
+        { status: 503 },
+      ),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatchObject({ kind: 'service-unavailable', status: 503 });
+  });
+
+  it('响应不符合信封契约 → 归为契约违规，绝不当成连通', async () => {
+    const result = await probeApiHealth({
+      baseUrl: '/api/v1',
+      fetchImpl: fetchReturning('<html>proxy error</html>'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.error?.kind).toBe('contract');
+  });
+
+  it('基地址非法 → fail-closed：不发起任何请求', async () => {
+    const calls: FetchArgs[] = [];
+    const result = await probeApiHealth({
+      baseUrl: '//evil.example.com/api/v1',
+      fetchImpl: fetchReturning(ok({}), { calls }),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.error?.kind).toBe('configuration');
+    expect(calls).toHaveLength(0);
   });
 });
 

@@ -14,6 +14,7 @@
 import { ApiClientError, createApiClient } from '../api/client';
 import { ENDPOINTS } from '../api/endpoints';
 import { toUiError, type UiError } from '../api/errors';
+import type { HealthView } from '../api/types';
 import {
   ANONYMOUS,
   writeSession,
@@ -101,6 +102,48 @@ export async function verifyTicket(options: TicketProbeOptions): Promise<Verific
         };
       }
     }
+    return { ok: false, error: toUiError(caught, endpoint) };
+  }
+}
+
+/** 联调连通性探测结果：只表达「能不能连上、后端是否健康」，不构成任何授权判断 */
+export interface ApiProbeResult {
+  ok: boolean;
+  health?: HealthView;
+  error?: UiError;
+}
+
+export interface ApiProbeOptions {
+  /** 与主客户端同源的基地址（必须已被 `resolveApiBaseUrlResult` 判定为合法） */
+  baseUrl: string;
+  /** 仅用于测试注入；生产环境走 `globalThis.fetch` */
+  fetchImpl?: typeof fetch;
+  /** 仅用于测试缩短超时；生产环境走客户端默认值 */
+  timeoutMs?: number;
+}
+
+/**
+ * 联调连通性探测：**匿名**请求 `GET /health`。
+ *
+ * 三个刻意之处：
+ * 1. **不带票据**：探测发生在登录之前，是「我先看看 API 通不通」的动作；如果它携带票据，
+ *    「先探测再粘贴票据」就变成了把凭证发往尚未确认的目标。这里不传 `tokenProvider`，
+ *    结构上不会有 Authorization 头。
+ * 2. **不改会话**：不接 `onUnauthorized`，也不写存储。探测失败只是展示一条错误状态。
+ * 3. **fail-closed**：基地址非法时 `createApiClient` 会抛错，本函数把它转成 `ok: false`，
+ *    绝不放行到「看起来连通」的结论。
+ */
+export async function probeApiHealth(options: ApiProbeOptions): Promise<ApiProbeResult> {
+  const endpoint = `${ENDPOINTS.health.method} ${ENDPOINTS.health.path}`;
+  try {
+    const probe = createApiClient({
+      baseUrl: options.baseUrl,
+      ...(options.fetchImpl === undefined ? {} : { fetchImpl: options.fetchImpl }),
+      ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+    });
+    const health = await probe.getJson<HealthView>(ENDPOINTS.health.path);
+    return { ok: true, health };
+  } catch (caught) {
     return { ok: false, error: toUiError(caught, endpoint) };
   }
 }

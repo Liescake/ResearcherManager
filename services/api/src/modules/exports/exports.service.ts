@@ -1,12 +1,26 @@
 import { randomUUID } from 'node:crypto';
-import { Inject, Injectable, InternalServerErrorException, Logger } from '@nestjs/common';
+import {
+  Inject,
+  Injectable,
+  InternalServerErrorException,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import { DataScope, PermissionPoint, StateTransitionError } from '@rm/shared';
 import type { AuthorizationSubject } from '@rm/shared';
 import { AuthorizationGuard } from '../access-control/authorization-guard';
 import {
+  EXPORT_DOWNLOAD_CONTENT_TYPE,
+  EXPORT_DOWNLOAD_MAX_BYTES,
+  EXPORT_DOWNLOAD_UNAVAILABLE_MESSAGE,
   EXPORT_REQUEST_INTEGRITY_MESSAGE,
   assertDeclaredExportQueryFields,
   assertDeclaredExportRequestFields,
+  assertSafeExportDownloadHeaderValue,
+  buildExportDownloadDisposition,
+  buildExportDownloadFilename,
+  digestExportId,
+  exportDownloadIdSchema,
   exportRequestInputSchema,
   parseExportRequestView,
   parseStoredExportRequest,
@@ -18,20 +32,29 @@ import {
 import type { ExportRequestView } from './exports.contract';
 import {
   EXPORT_ARTIFACT_STORE,
+  EXPORT_DOWNLOAD_AUDIT,
   EXPORT_REPOSITORY,
+  ExportDownloadAuditResult,
   ExportResource,
   ExportStatus,
   isExportTransitionRejection,
 } from './exports.port';
-import type { ExportArtifactStore, ExportRepository, ExportRequest } from './exports.port';
+import type {
+  ExportArtifactContent,
+  ExportArtifactStore,
+  ExportDownloadAuditSink,
+  ExportRepository,
+  ExportRequest,
+} from './exports.port';
 import { EXPORT_ENTRY_STATUS, assertExportTransition } from './exports.state-machine';
 
 /**
- * 导出切片（P8 最小垂直切片，本人侧）：
+ * 导出切片（本人侧）：
  * - `POST /me/exports` 创建**本人**的导出请求（服务端白名单资源 + 字段）；
- * - `GET  /me/exports` 本人导出请求列表与状态。
+ * - `GET  /me/exports` 本人导出请求列表与状态；
+ * - `GET  /me/exports/:exportId/download` 下载本人**已完成**导出的产物内容。
  *
- * 六条硬约束：
+ * 七条硬约束（前六条对三条路由都成立，第七条只对下载成立）：
  * 1. **主体与结论都来自服务端**：`ownerUserId` 取 `AuthorizationSubject.userId`（由
  *    `SESSION_SUBJECT_RESOLVER` 从服务端会话存储解析），`id` / `artifactId` 是服务端 UUID，
  *    `status` 只由状态机写入（入口恒为 `pending`），`createdAt` / `updatedAt` 取服务端时钟；
@@ -60,6 +83,19 @@ import { EXPORT_ENTRY_STATUS, assertExportTransition } from './exports.state-mac
  *    状态与产物句柄自洽、ISO 时间、字段闭集），违规或归属与会话主体不一致一律 500，
  *    且日志只写字段路径、不写取值；对外视图再过一遍 `.strict()` 白名单，多出字段即 500。
  *    视图**不含**归属、产物句柄、文件名、路径、下载地址与存储 key（那些字段在记录里就不存在）。
+ * 7. **下载只交付内容，不交付位置**（`GET /me/exports/:exportId/download`）：
+ *    - 归属同时来自**会话主体**与**服务端记录**（取数语句把归属下推进存储：`findByIdForOwner`），
+ *      客户端提交的 `userId` / `ownerUserId` / `artifactId` / `fileUrl` / 自定义路径与自定义头
+ *      一律不参与判定（查询串闭集直接 400，控制器也不读任何自定义头）；
+ *    - 「不存在 / 跨主体 / 未完成 / 产物缺失 / 空产物」收敛到**同一个稳定拒绝**（404 + 同一条文案），
+ *      因此拒绝本身不泄露存在性或状态；仓储故障、产物读取故障、内容超限、
+ *      存储记录违约则是 fail-closed 500（不把基础设施故障伪装成业务结论）；
+ *    - 产物内容由 `ExportArtifactStore.read` 给出：**只有字节**，没有 storage key / 路径 /
+ *      下载地址 / 签名地址；响应头取值（Content-Type / Content-Disposition 文件名）由服务端
+ *      常量派生并再过一次「控制字符 / 路径 / 引号」门禁，命中即 500 且一个字节都不写出；
+ *    - 内容有**硬上限**（`EXPORT_DOWNLOAD_MAX_BYTES`），超限不截断、不分片、不流式降级；
+ *    - 下载留痕只写**脱敏三元组**（服务端生成的 requestId、导出 ID 的单向摘要、结果码），
+ *      不写内容、产物位置、归属、请求侧输入或 PII；留痕失败即 500（不做「没有留痕的成功下载」）。
  *
  * 授权口径（已知偏差，与审计/通知/统计切片的处理同构，属后续版本项）：权限目录是**闭集**
  * （docs/P2-权限目录与状态机.md §1「未列出即拒绝」），其中 `export:{resource}:create` 的默认范围
@@ -74,9 +110,11 @@ import { EXPORT_ENTRY_STATUS, assertExportTransition } from './exports.state-mac
  * 属后续版本项；本切片**不新增权限点**。`resource=profile` 时入口与资源两段门控点相同：
  * 两段语义独立（入口 = 本人导出入口；资源 = 该资源的本人读取），重复判定不改变结果。
  *
- * 尚不包含（明确留给后续切片）：真实文件生成与字段级脱敏、文件有效期与清理、下载路由与
- * 下载审计、管理端 `POST /admin/exports` 与按资源/范围的导出、列表分页与筛选、
- * 幂等键与元数据落库（`export_requests` 表）、以及把本切片的产物句柄接入下载通道。
+ * 尚不包含（明确留给后续切片）：真实文件生成与字段级脱敏、文件有效期与清理、
+ * 管理端 `POST /admin/exports` 与按资源/范围的导出、列表分页与筛选、
+ * 幂等键与元数据落库、下载限流与审计的持久化查询面。
+ * 下载切片已落地的是**交付边界**本身（归属、状态、授权、硬上限、响应头、留痕脱敏），
+ * 它复用内存基线产物存储的**最小读能力**，不伪造生产文件下载。
  */
 @Injectable()
 export class ExportsService {
@@ -86,6 +124,7 @@ export class ExportsService {
     @Inject(AuthorizationGuard) private readonly guard: AuthorizationGuard,
     @Inject(EXPORT_REPOSITORY) private readonly repository: ExportRepository,
     @Inject(EXPORT_ARTIFACT_STORE) private readonly artifacts: ExportArtifactStore,
+    @Inject(EXPORT_DOWNLOAD_AUDIT) private readonly downloadAudit: ExportDownloadAuditSink,
   ) {}
 
   /**
@@ -200,6 +239,168 @@ export class ExportsService {
     this.assertRecordedOutcome(saved, outcome);
 
     return this.toOwnedView(saved, subject.userId);
+  }
+
+  /**
+   * 下载本人已完成导出的产物内容（`GET /me/exports/:exportId/download`）。
+   *
+   * 判定顺序（被测试固定）：
+   * 1. 入口授权（服务端常量，`profile:self:read` + `SELF`）→ 拒绝即 403，此时**仓储、产物存储、
+   *    审计出口一次都不会被调用**；
+   * 2. 查询串闭集：任何查询参数（`?userId=`/`?ownerUserId=`/`?artifactId=`/`?fileUrl=`/`?path=`…）
+   *    一律 400，且**不回显取值**；自定义头从不进入判定（控制器只读 `authorization`）；
+   * 3. 路径参数形态：非 UUID 与「不存在」走**同一个拒绝出口**（不进任何存储）；
+   * 4. 取数：`findByIdForOwner(exportId, subject.userId)` —— 归属来自**会话主体**并下推进存储，
+   *    因此「他人的导出」与「不存在的导出」不可区分（都是 `undefined`）；
+   * 5. 读取契约 + 归属复核（纵深防御）→ 违规即 fail-closed 500；
+   * 6. 状态必须为 `completed` 且有服务端产物句柄，否则收敛到统一拒绝；
+   * 7. 资源级授权（权限点由**记录里的服务端资源**映射）；
+   * 8. 产物读取：故障 fail-closed，缺失（或空内容）收敛到统一拒绝，超过硬上限 fail-closed；
+   * 9. 响应头取值由服务端常量派生并通过「控制字符 / 路径 / 引号」门禁；
+   * 10. 留痕（脱敏三元组）成功后返回内容 —— **留痕失败即 500**。
+   *
+   * 返回的载荷只含**内容字节**与两个服务端常量派生值（文件名、内容类型），不含存储位置。
+   */
+  async downloadMyExport(
+    subject: AuthorizationSubject,
+    exportId: unknown,
+    query: unknown,
+  ): Promise<ExportDownloadPayload> {
+    // 1. 入口授权先于查询串校验与任何取数/留痕
+    this.authorizeEntry(subject);
+
+    // 2. 查询串闭集：下载端点同样不接受任何查询参数
+    assertDeclaredExportQueryFields(query);
+
+    // 3. 留痕用关联 ID 由**服务端**生成：客户端可提交的 `x-request-id` 不进入审计
+    const requestId = randomUUID();
+    // 4. 审计只落导出 ID 的**单向摘要**：非法形态同样只摘要，绝不落原值
+    const exportIdDigest = digestExportId(typeof exportId === 'string' ? exportId : '');
+
+    // 5. 路径参数形态：非 UUID 与「不存在」共用同一拒绝出口（不泄露存在性）
+    const parsedId = exportDownloadIdSchema.safeParse(exportId);
+    if (!parsedId.success) {
+      return this.rejectDownload(requestId, exportIdDigest);
+    }
+
+    // 6. 取数：归属下推进仓储；他人记录与不存在返回同一个 undefined
+    let record: ExportRequest | undefined;
+    try {
+      record = await this.repository.findByIdForOwner(parsedId.data, subject.userId);
+    } catch (error) {
+      // 仓储故障 ⇒ fail-closed：绝不把基础设施故障伪装成「导出不存在」
+      return this.failDownload(requestId, exportIdDigest, `取数故障(${errorName(error)})`);
+    }
+    if (record === undefined) {
+      return this.rejectDownload(requestId, exportIdDigest);
+    }
+
+    // 7. 读取契约与归属复核（纵深防御：仓储未按主体过滤 / 数据被外部改写 → 500，不返回任何内容）
+    const parsed = parseStoredExportRequest(record);
+    if (!parsed.ok) {
+      return this.failDownload(requestId, exportIdDigest, '存储记录违反读取契约');
+    }
+    if (readExportOwnerId(parsed.value) !== subject.userId) {
+      return this.failDownload(requestId, exportIdDigest, '存储记录归属与会话主体不一致');
+    }
+
+    // 8. 只有 `completed` 且带服务端产物句柄才可下载；pending / failed 收敛到同一拒绝
+    if (parsed.value.status !== ExportStatus.Completed) {
+      return this.rejectDownload(requestId, exportIdDigest);
+    }
+    const artifactId = parsed.value.artifactId;
+    if (artifactId === undefined) {
+      return this.rejectDownload(requestId, exportIdDigest);
+    }
+
+    // 9. 资源级授权：权限点由记录里的服务端资源映射，客户端无法影响
+    this.authorizeResource(subject, parsed.value.resource);
+
+    // 10. 产物读取：故障 fail-closed；缺失收敛到统一拒绝
+    let content: ExportArtifactContent | undefined;
+    try {
+      content = await this.artifacts.read(artifactId);
+    } catch (error) {
+      return this.failDownload(requestId, exportIdDigest, `产物读取故障(${errorName(error)})`);
+    }
+    if (content === undefined) {
+      return this.rejectDownload(requestId, exportIdDigest);
+    }
+    const bytes = content.bytes;
+    if (!(bytes instanceof Uint8Array)) {
+      // 产物存储返回形态非法：这是实现缺陷，不是「没有内容」
+      return this.failDownload(requestId, exportIdDigest, '产物内容形态非法');
+    }
+    // 空产物视为「没有可交付内容」：与缺失同一出口，绝不发出 0 字节下载
+    if (bytes.byteLength === 0) {
+      return this.rejectDownload(requestId, exportIdDigest);
+    }
+    // 硬上限：在写出任何字节之前判定；超限不截断、不分片、不降级
+    if (bytes.byteLength > EXPORT_DOWNLOAD_MAX_BYTES) {
+      return this.failDownload(requestId, exportIdDigest, '产物超过下载硬上限');
+    }
+
+    // 11. 响应头取值由服务端常量派生，再过一次头注入门禁（CRLF / 路径 / 引号 ⇒ fail-closed）
+    let fileName: string;
+    try {
+      fileName = buildExportDownloadFilename(parsedId.data);
+      assertSafeExportDownloadHeaderValue('content-type', EXPORT_DOWNLOAD_CONTENT_TYPE);
+      buildExportDownloadDisposition(fileName);
+    } catch (error) {
+      return this.failDownload(requestId, exportIdDigest, `响应头不合法(${errorName(error)})`);
+    }
+
+    // 12. 留痕成功后才交付内容：审计不可用时绝不返回「看起来成功但没有留痕」的下载
+    await this.recordDownloadAudit(requestId, exportIdDigest, ExportDownloadAuditResult.Success);
+
+    return { bytes, fileName, contentType: EXPORT_DOWNLOAD_CONTENT_TYPE };
+  }
+
+  /**
+   * **统一安全拒绝**出口：不存在 / 跨主体 / 未完成 / 产物缺失 / 空产物全部收敛到这里，
+   * 状态码、错误码与文案完全一致，因此调用方无法据此区分「有没有这条导出、它是什么状态」。
+   */
+  private async rejectDownload(requestId: string, exportIdDigest: string): Promise<never> {
+    await this.recordDownloadAudit(
+      requestId,
+      exportIdDigest,
+      ExportDownloadAuditResult.Unavailable,
+    );
+    throw new NotFoundException(EXPORT_DOWNLOAD_UNAVAILABLE_MESSAGE);
+  }
+
+  /**
+   * fail-closed 出口：基础设施故障（取数 / 产物读取）、内容超过硬上限、存储记录违约、
+   * 响应头取值不合法。对外只给统一内部错误（不泄露原因），日志只写**原因标签与错误名**，
+   * 绝不写取值（产物位置、内容、归属、原始错误文本都可能出现在取值里）。
+   */
+  private async failDownload(
+    requestId: string,
+    exportIdDigest: string,
+    reason: string,
+  ): Promise<never> {
+    this.logger.error(`[exports] 下载 fail-closed：${reason}`);
+    await this.recordDownloadAudit(requestId, exportIdDigest, ExportDownloadAuditResult.Failed);
+    throw new InternalServerErrorException(EXPORT_REQUEST_INTEGRITY_MESSAGE);
+  }
+
+  /**
+   * 下载留痕：只写**脱敏三元组**（服务端 requestId、导出 ID 单向摘要、结果码）。
+   *
+   * 审计失败（存储故障或条目违约）一律 fail-closed 为 500：审计不可用时不得让下载「静默成功」。
+   * 日志只写错误名，不写审计错误原文（原文可能含内部路径与连接信息）。
+   */
+  private async recordDownloadAudit(
+    requestId: string,
+    exportIdDigest: string,
+    result: ExportDownloadAuditResult,
+  ): Promise<void> {
+    try {
+      await this.downloadAudit.record({ requestId, exportIdDigest, result });
+    } catch (error) {
+      this.logger.error(`[exports] 下载审计写入失败: ${errorName(error)}`);
+      throw new InternalServerErrorException(EXPORT_REQUEST_INTEGRITY_MESSAGE);
+    }
   }
 
   /**
@@ -337,6 +538,21 @@ export class ExportsService {
 
     return view.value;
   }
+}
+
+/**
+ * 下载载荷：只有**内容字节**与两个由服务端常量派生的响应头取值（文件名、内容类型）。
+ * 刻意没有 storage key / 路径 / 下载地址 / 签名地址 / 产物句柄：调用方拿不到可反推存储位置的信息。
+ */
+export interface ExportDownloadPayload {
+  readonly bytes: Uint8Array;
+  readonly fileName: string;
+  readonly contentType: string;
+}
+
+/** 只取错误名：错误消息可能含内部路径 / 连接串 / 字段取值，绝不进入日志或响应 */
+function errorName(error: unknown): string {
+  return error instanceof Error ? error.name : typeof error;
 }
 
 /** 物化结论：终态与（仅在 `completed` 时存在的）服务端产物句柄 */

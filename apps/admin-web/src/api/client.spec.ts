@@ -3,9 +3,12 @@ import { describe, expect, it } from 'vitest';
 import {
   ApiClientError,
   INVALID_BASE_URL_CODE,
+  INVALID_RESPONSE_CODE,
+  INVALID_RESPONSE_MESSAGE,
   buildPageQuery,
   createApiClient,
   resolveApiBaseUrl,
+  resolveApiBaseUrlResult,
 } from './client';
 
 type FetchArgs = [input: string | URL | Request, init?: RequestInit];
@@ -140,6 +143,24 @@ describe('API 基地址解析与校验', () => {
     expect(tokenReads).toBe(0);
   });
 
+  /**
+   * 渲染期不允许抛异常：一个错误的环境变量不能让整个应用白屏。
+   * `resolveApiBaseUrlResult` 把同一条 fail-closed 判定变成可渲染结果，且失败时**不返回基地址**，
+   * 调用方因此无法构造客户端——票据同样不会被送出去。
+   */
+  it('基地址解析结果版不抛异常：非法值返回错误对象且不给出可用地址', () => {
+    const legal = resolveApiBaseUrlResult('http://127.0.0.1:3000/api/v1/');
+    expect(legal).toEqual({ ok: true, baseUrl: 'http://127.0.0.1:3000/api/v1' });
+
+    const illegal = resolveApiBaseUrlResult('//evil.example.com/api/v1');
+    expect(illegal.ok).toBe(false);
+    if (!illegal.ok) {
+      expect(illegal.error.code).toBe(INVALID_BASE_URL_CODE);
+      expect(illegal.error).toBeInstanceOf(ApiClientError);
+      expect('baseUrl' in illegal).toBe(false);
+    }
+  });
+
   it('合法基地址照常发请求并带着票据（回归：校验不误伤正常部署）', async () => {
     const calls: FetchArgs[] = [];
     const client = createApiClient({
@@ -201,13 +222,33 @@ describe('API 客户端', () => {
     }
   });
 
-  it('非信封响应一律视为错误，不误判为成功', async () => {
+  it('非信封响应一律视为错误，并给出可定位的契约错误码（回归：不再只是 HTTP_200）', async () => {
     const client = createApiClient({
       baseUrl: '/api/v1',
       fetchImpl: fetchReturning({ status: 'ok' }),
     });
 
-    await expect(client.getJson('/health')).rejects.toMatchObject({ code: 'HTTP_200' });
+    await expect(client.getJson('/health')).rejects.toMatchObject({
+      code: INVALID_RESPONSE_CODE,
+      message: INVALID_RESPONSE_MESSAGE,
+      status: 200,
+    });
+  });
+
+  /**
+   * 契约错误必须**保留 HTTP 状态**：界面据此把 401/403/404/503 归类为会话失效、无权限、
+   * 未实现或依赖不可用；把状态丢掉会把这些真实语义揉成一句「响应不符合契约」。
+   */
+  it('响应不是信封但 HTTP 层失败时保留状态码（503 仍可归为「服务暂不可用」）', async () => {
+    const client = createApiClient({
+      baseUrl: '/api/v1',
+      fetchImpl: fetchReturning('Service Unavailable', { status: 503 }),
+    });
+
+    await expect(client.getJson('/health')).rejects.toMatchObject({
+      code: INVALID_RESPONSE_CODE,
+      status: 503,
+    });
   });
 
   it('网络异常与超时分别映射为 NETWORK_ERROR 与 TIMEOUT', async () => {

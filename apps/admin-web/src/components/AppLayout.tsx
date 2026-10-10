@@ -5,12 +5,14 @@ import { buildHash } from '../router/hash-router';
 import { DemoNotice, NoticeBar } from './StatePanel';
 
 /**
- * 基础布局：顶栏（应用名 + 导航 + 当前会话 + 退出）+ 内容区 + 页脚。
+ * 基础布局：顶栏（应用名 + 导航 + 当前会话 + 退出）+ 联调状态条 + 内容区 + 页脚。
  *
  * 视觉是临时的（无组件库、无主题系统），但结构承担的语义是定型的：
  * 1. 演示模式提示条**常驻**在内容之上，任何页面都不可能「忘记标注演示数据」；
- * 2. 会话提示（过期/退出）在布局层统一呈现，页面不重复实现；
- * 3. 导航只列出已登记的路由，未实现的页面也在导航里显式标注「预留」，
+ * 2. 联调状态条常驻：真实模式显示**实际生效的 API 基地址**（与票据去向一致），
+ *    演示模式明示「不发起任何请求」——两种模式在界面上不可能被看混；
+ * 3. 会话提示（过期/退出）在布局层统一呈现，页面不重复实现；
+ * 4. 导航只列出已登记的路由，未实现的页面也在导航里显式标注「预留」，
  *    避免出现「点进去才发现没有」的错觉。
  */
 export interface AppLayoutProps {
@@ -19,7 +21,7 @@ export interface AppLayoutProps {
 }
 
 export function AppLayout({ currentRouteId, children }: AppLayoutProps): ReactNode {
-  const { session, gateway, notice, clearNotice, logout } = useAuth();
+  const { session, gateway, notice, clearNotice, logout, apiBaseUrl } = useAuth();
   const authenticated = session.status === 'authenticated';
   const mode = authenticated ? session.session.mode : null;
   const sessionLabel = authenticated ? session.session.label : '未登录';
@@ -56,6 +58,27 @@ export function AppLayout({ currentRouteId, children }: AppLayoutProps): ReactNo
           )}
         </div>
       </header>
+
+      <div className="app__connection" role="status">
+        {mode === 'real' ? (
+          <>
+            <span className="tag tag--live">真实请求</span>
+            <span className="muted">
+              联调模式：所有数据均来自 <code>{apiBaseUrl}</code>{' '}
+              的真实响应，本页不使用任何演示夹具。
+            </span>
+          </>
+        ) : mode === 'demo' ? (
+          <>
+            <span className="tag tag--demo">不发起请求</span>
+            <span className="muted">
+              演示模式：不连接后端、不发起任何请求，数据全部来自前端受控夹具。
+            </span>
+          </>
+        ) : (
+          <span className="muted">未登录：未携带会话票据，也未发起任何业务请求。</span>
+        )}
+      </div>
 
       <div className="app__notices">
         {gateway.notice !== null && (

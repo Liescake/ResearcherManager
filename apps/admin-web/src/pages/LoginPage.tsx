@@ -1,12 +1,14 @@
 import { useState, type FormEvent, type ReactNode } from 'react';
 import type { UiError } from '../api/errors';
 import { ENDPOINTS } from '../api/endpoints';
+import { SESSION_STORAGE_KEY } from '../api/session';
 import { useAuth } from '../auth/AuthContext';
+import type { ApiProbeResult } from '../auth/session-flow';
 import { useHashLocation } from '../router/hash-router';
 import { ErrorPanel, NoticeBar, PendingEndpointPanel } from '../components/StatePanel';
 
 /**
- * 登录页。
+ * 登录页 = **本地联调入口**。
  *
  * 先要说清**当前后端的真实状态**：契约基线只定义了 `POST /auth/wechat/login`（小程序凭证换取）
  * 与 `POST /auth/refresh`，管理端网页登录端点尚未定义。因此本页提供两条**都不撒谎**的路径：
@@ -17,16 +19,28 @@ import { ErrorPanel, NoticeBar, PendingEndpointPanel } from '../components/State
  * 2. 受控演示模式（显式）：无票据、不发请求，用前端夹具走查界面；所有演示数据全程标注，
  *    写操作一律被拒绝。
  *
- * 刻意不做的事：本地伪造登录成功、把账号密码当占位符提交却假装成功。
+ * 本页刻意不做的事：
+ * - **不内置任何票据**：没有默认票据、没有「用示例票据登录」按钮；
+ * - **不提供认证旁路**：票据必须经服务端确认，确认失败就如实报错；
+ * - **不接受外部传入的基地址**：请求地址只来自构建期配置（页面顶部的联调入口只做展示）。
  */
 export function LoginPage(): ReactNode {
-  const { notice, clearNotice, loginWithTicket, enterDemoMode } = useAuth();
+  const { notice, clearNotice, loginWithTicket, enterDemoMode, apiBaseUrl, checkApiConnection } =
+    useAuth();
   const location = useHashLocation();
   const redirect = location.query['redirect'];
   const [ticket, setTicket] = useState('');
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<UiError | null>(null);
   const [warning, setWarning] = useState<string | null>(null);
+  const [probe, setProbe] = useState<ApiProbeResult | null>(null);
+  const [probing, setProbing] = useState(false);
+
+  const runProbe = async (): Promise<void> => {
+    setProbing(true);
+    setProbe(await checkApiConnection());
+    setProbing(false);
+  };
 
   const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
@@ -58,12 +72,78 @@ export function LoginPage(): ReactNode {
 
       {notice !== null && <NoticeBar text={notice} onDismiss={clearNotice} />}
 
+      <section className="card" aria-labelledby="connect-title">
+        <h2 id="connect-title">联调入口（真实模式）</h2>
+        <p className="muted">
+          真实模式下，请求携带的会话票据**只会**发往下面的地址。本页不内置、不生成、不缓存任何
+          票据，也不提供任何认证旁路：票据必须由服务端确认，确认失败就如实报错。
+        </p>
+        <dl className="kv">
+          <dt>API 基地址</dt>
+          <dd>
+            <code>{apiBaseUrl}</code>
+          </dd>
+          <dt>地址来源</dt>
+          <dd>
+            构建期配置 <code>VITE_API_BASE_URL</code>（未配置时同源 <code>/api/v1</code>
+            ）；页面无法修改它，也不接受经 URL 或存储传入的地址。
+          </dd>
+        </dl>
+        <div className="pager">
+          <button
+            type="button"
+            className="button--secondary"
+            onClick={() => void runProbe()}
+            disabled={probing}
+          >
+            {probing ? '正在探测…' : '检测 API 连通性（匿名 GET /health）'}
+          </button>
+        </div>
+        <p className="muted">
+          探测请求<strong>不带票据</strong>、不改变登录状态，只回答「地址通不通、后端是否健康」。
+        </p>
+        {probe !== null && probe.ok && probe.health !== undefined && (
+          <dl className="kv">
+            <dt>连通性</dt>
+            <dd className="ok">可达</dd>
+            <dt>服务</dt>
+            <dd>
+              {probe.health.service} v{probe.health.version}
+            </dd>
+            <dt>状态</dt>
+            <dd>{probe.health.status}</dd>
+          </dl>
+        )}
+        {probe !== null && !probe.ok && probe.error !== undefined && (
+          <ErrorPanel error={probe.error} onRetry={() => void runProbe()} />
+        )}
+
+        <details>
+          <summary>用受控会话状态进入真实模式（不经过本表单）</summary>
+          <p className="muted">
+            也可在浏览器控制台为当前标签页写入会话（键 <code>{SESSION_STORAGE_KEY}</code>
+            ），刷新后即进入真实模式。它走**同一套**票据形状校验与
+            <code>GET /me/profile</code> 探测路径，不会绕过认证：
+          </p>
+          <pre>
+            <code>
+              {
+                '{"mode":"real","ticket":"<一次性会话票据>","label":"联调","signedInAt":"<ISO 时间>"}'
+              }
+            </code>
+          </pre>
+          <p className="muted">
+            票据由服务端种子写入后交给你；本页没有任何默认值，也不读取 URL 中的票据。
+          </p>
+        </details>
+      </section>
+
       <section className="card" aria-labelledby="ticket-title">
         <h2 id="ticket-title">会话票据登录（真实校验）</h2>
         <p className="muted">
           当前后端尚未提供管理端登录端点：票据由服务端种子写入后交给你。提交后前端会向
           <code>GET /me/profile</code>
-          发起一次真实请求来确认票据；服务端不认可就不会进入系统。
+          发起一次真实请求，确认服务端是否认可这张票据；服务端不认可就不会进入系统。
         </p>
         <form className="form" onSubmit={(event) => void submit(event)}>
           <label htmlFor="ticket">会话票据（Bearer）</label>

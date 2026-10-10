@@ -103,6 +103,23 @@ body {
   width: 100%;
 }
 
+/* 联调状态条：常驻显示「请求去了哪里」或「根本没发请求」，两种模式不可能被看混 */
+.app__connection {
+  align-items: center;
+  background: #f7f9fc;
+  border-bottom: 1px solid var(--color-border);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 13px;
+  gap: 8px;
+  justify-content: center;
+  padding: 6px 20px;
+}
+
+.app__connection code {
+  background: #e8eef7;
+}
+
 .app__notices:empty {
   padding: 0;
 }
@@ -173,6 +190,12 @@ body {
   color: var(--color-muted);
 }
 
+.badge--real {
+  background: #e7f5ee;
+  border-color: #bfe3d0;
+  color: var(--color-ok);
+}
+
 .notice {
   background: #eef4ff;
   border: 1px solid #c7d8f2;
@@ -200,6 +223,13 @@ body {
   background: #fff8e8;
   border-color: #f0d59a;
   color: var(--color-warning);
+}
+
+/* 联调模式的状态标签：与演示标签同形不同色，避免「演示 / 真实」被看混 */
+.tag--live {
+  background: #e7f5ee;
+  border-color: #bfe3d0;
+  color: var(--color-ok);
 }
 
 /* ---------- 卡片与表格 ---------- */

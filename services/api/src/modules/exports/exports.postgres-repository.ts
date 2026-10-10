@@ -48,6 +48,7 @@ import { EXPORT_ENTRY_STATUS, EXPORT_STATUS_TRANSITIONS } from './exports.state-
  * | `save` 未知 id 抛错（不退化成插入） | 条件写入 0 行 → 归属范围内诊断查询 → `NOT_FOUND` |
  * | `save` 归属被改写抛错 | `WHERE id = $1 AND requester_id = $2` 钉住归属 + 返回行逐列复核 → `OWNER_VIOLATION` |
  * | `listByOwnerId` 只返回该主体名下记录 | `WHERE requester_id = $1::uuid`（归属下推）+ 逐条复核 |
+ * | `findByIdForOwner` 不存在 / 属于他人都是 `undefined` | `WHERE id = $1::uuid AND requester_id = $2::uuid` → 0 行即 `undefined`（两者不可区分） |
  * | 端口没有删除 / 归档方法 | adapter 同样没有：`delete` / `archive` / `purge` / `truncate` / `upsert` 一个都不存在 |
  *
  * 与内存基线的**唯一刻意差异**：内存基线不做读取契约校验（存储层损坏必须能被出口门禁看见），
@@ -341,6 +342,7 @@ export type PostgresExportRepositoryErrorCode =
   | 'EXECUTOR_NOT_PERSISTENT'
   | 'EXECUTOR_FAILURE'
   | 'INVALID_SUBJECT'
+  | 'INVALID_ID'
   | 'INVALID_RECORD'
   | 'INVALID_ROW'
   | 'RESULT_SET_VIOLATION'
@@ -567,6 +569,20 @@ const SELECT_BY_OWNER_SQL = `SELECT ${COLUMN_LIST}
   FROM ${TABLE_IDENTIFIER}
   WHERE requester_id = $1::uuid
   ${ORDER_BY}`;
+
+/**
+ * 按「主键 + 归属」取**单条**记录（下载切片的取数语句）。
+ *
+ * `WHERE id = $1::uuid AND requester_id = $2::uuid`：两个条件都是**参数占位符**，
+ * 归属**不参与 SQL 文本**；因此「拿他人的作业 ID」查不到任何行，与「不存在」是同一个空结果集
+ * （`mapScopedRows` 之后的单行判定把两者收敛为同一个 `undefined`，不可区分）。
+ * 显式列清单，不使用 `SELECT *`；`LIMIT 2` 只为让「主键唯一性被破坏」可判定为结果集违约
+ * （正常最多 1 行），不是分页窗口。
+ */
+const SELECT_BY_ID_FOR_OWNER_SQL = `SELECT ${COLUMN_LIST}
+  FROM ${TABLE_IDENTIFIER}
+  WHERE id = $1::uuid AND requester_id = $2::uuid
+  LIMIT 2`;
 
 /** `save` 的 SET 片段：由可变列清单派生，占位符从 `$3` 起（`$1`/`$2` 留给 WHERE 的 id/归属） */
 const UPDATE_SET_LIST = POSTGRES_EXPORT_MUTABLE_COLUMNS.map(
@@ -809,6 +825,23 @@ export function assertPostgresExportSubject(ownerUserId: unknown): string {
     'INVALID_SUBJECT',
     '取数主体必须落在存储 ID 域内（合法且非空的规范小写 UUID）：非 UUID 的 ownerUserId 属于服务端缺陷，不得进入 SQL',
     'ownerUserId',
+  );
+}
+
+/**
+ * 记录 ID：单条取数（下载切片）的**记录标识**复核，与主体使用同一份存储 ID 域判定。
+ *
+ * 路由参数在进入本 adapter 之前就已由 service 做过形态校验；这里再判一次是纵深防御：
+ * 非 UUID / 空 UUID / 非规范小写一律 fail-closed（`INVALID_ID`）且**绝不绑定进 SQL**，
+ * 错误信息也不回显该值（错误只带字段名 `id`）。它同样在**解析执行器之前**被调用，
+ * 因此非法 ID 既不进 SQL、也不触发任何数据库连接。
+ */
+export function assertPostgresExportRecordId(id: unknown): string {
+  return requireStorageUuid(
+    id,
+    'INVALID_ID',
+    '记录 ID 必须落在存储 ID 域内（合法且非空的规范小写 UUID）：非法 ID 属于服务端缺陷，不得进入 SQL',
+    'id',
   );
 }
 
@@ -1236,6 +1269,43 @@ export class PostgresExportRepository implements AsyncExportRepository {
     const rows = await runQuery(executor, SELECT_BY_OWNER_SQL, [ownerId]);
     return this.mapScopedRows(rows, ownerId);
   }
+
+  /**
+   * 按「主键 + 归属」取单条记录（下载切片的取数入口）。
+   *
+   * 判定顺序：
+   * 1. 记录 ID 与主体都必须落在**存储 ID 域**内，否则 `INVALID_ID` / `INVALID_SUBJECT`，
+   *    且**一个 SQL 都不执行**（非法标识既不进 SQL、也不建连）；
+   * 2. `WHERE id = $1::uuid AND requester_id = $2::uuid`：两个值都是参数占位符，
+   *    归属**下推进 SQL**；「记录不存在」与「记录属于他人」返回的都是**空结果集**，
+   *    因此本方法对两者返回同一个 `undefined`，调用方无法据此区分（不泄露存在性）；
+   * 3. 每条返回行都要过严格行契约 + 读取契约，并**逐条复核归属**（`mapScopedRows`：
+   *    返回了主体之外的记录即 `OWNER_VIOLATION`，整批 fail-closed）；
+   * 4. 多行（本应由 `LIMIT 2` 暴露的主键唯一性破坏）判 `RESULT_SET_VIOLATION`。
+   *
+   * 执行器异常同样收敛为不含原始文本的 `EXECUTOR_FAILURE`（`runQuery`）。
+   */
+  async findByIdForOwner(id: string, ownerUserId: string): Promise<ExportRequest | undefined> {
+    const executor = this.usableExecutor();
+    const recordId = assertPostgresExportRecordId(id);
+    const ownerId = assertPostgresExportSubject(ownerUserId);
+
+    const rows = await runQuery(executor, SELECT_BY_ID_FOR_OWNER_SQL, [recordId, ownerId]);
+    const records = this.mapScopedRows(rows, ownerId);
+
+    if (records.length === 0) {
+      // 「不存在」与「属于他人」在这里**不可区分**：这是端口契约要求的安全属性
+      return undefined;
+    }
+    if (records.length > 1) {
+      throw new PostgresExportRepositoryError(
+        'RESULT_SET_VIOLATION',
+        '按主键取数返回了多行：主键唯一性被破坏',
+        ['id'],
+      );
+    }
+    return records[0];
+  }
 }
 
 /**
@@ -1286,6 +1356,12 @@ export function createLazyPostgresExportRepository(
     async listByOwnerId(ownerUserId: string): Promise<readonly ExportRequest[]> {
       const ownerId = assertPostgresExportSubject(ownerUserId);
       return new PostgresExportRepository(await executor()).listByOwnerId(ownerId);
+    },
+    async findByIdForOwner(id: string, ownerUserId: string): Promise<ExportRequest | undefined> {
+      // 记录 ID 与归属都先判、再建连：非法标识不会触发任何数据库连接
+      const recordId = assertPostgresExportRecordId(id);
+      assertPostgresExportSubject(ownerUserId);
+      return new PostgresExportRepository(await executor()).findByIdForOwner(recordId, ownerUserId);
     },
   };
 }

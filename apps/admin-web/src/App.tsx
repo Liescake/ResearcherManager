@@ -2,6 +2,7 @@ import { useEffect, type ReactNode } from 'react';
 import { AuthProvider, useAuth } from './auth/AuthContext';
 import type { SessionStorageLike } from './api/session';
 import { AppLayout } from './components/AppLayout';
+import { ConfigErrorPage } from './pages/ConfigErrorPage';
 import { NotFoundPage } from './pages/NotFoundPage';
 import { ApplicationsPage } from './pages/ApplicationsPage';
 import { LoginPage } from './pages/LoginPage';
@@ -16,6 +17,9 @@ import { matchRoute, navigate, resolveNavigation, useHashLocation } from './rout
  * 安全要点：守卫在**渲染前**判定。需要认证而当前匿名时，本组件只渲染「正在跳转登录」占位，
  * 绝不先把受保护页面渲染出来再跳转（那会让页面内的取数在无会话状态下先跑一轮）。
  * 401 由 client → 会话层统一处理，本组件不需要额外分支。
+ *
+ * 基地址配置非法时**先于一切路由**渲染配置错误页：此时不存在可用的 API 客户端，
+ * 任何业务页面都没有可渲染的真实数据来源。
  *
  * `storage` / `baseUrl` 可选注入：单测用它构造确定的会话与地址，不必依赖浏览器存储。
  */
@@ -36,17 +40,22 @@ export function App({ storage, baseUrl }: AppProps = {}): ReactNode {
 }
 
 function RouteView(): ReactNode {
-  const { session } = useAuth();
+  const { session, apiConfigError } = useAuth();
   const location = useHashLocation();
   const match = matchRoute(location);
   const decision = resolveNavigation(match, session);
-  const redirectTo = decision.kind === 'redirect' ? decision.to : null;
+  // 配置错误时不跳转：跳到一个同样无法取数的页面只会掩盖真正的问题
+  const redirectTo = apiConfigError === null && decision.kind === 'redirect' ? decision.to : null;
 
   useEffect(() => {
     if (redirectTo !== null) {
       navigate(redirectTo);
     }
   }, [redirectTo]);
+
+  if (apiConfigError !== null) {
+    return <ConfigErrorPage error={apiConfigError} />;
+  }
 
   if (decision.kind === 'redirect') {
     return (

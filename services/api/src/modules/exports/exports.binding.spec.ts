@@ -474,14 +474,15 @@ describe('导出端口语义：归属隔离与受控落库（内存基线）', (
     expect(JSON.stringify(mine)).not.toContain(OTHER_OWNER);
   });
 
-  it('端口没有「按客户端声明取数」与删除入口：只有 create / save / listByOwnerId', () => {
+  it('端口没有「按客户端声明取数」与删除入口：只有 create / save / listByOwnerId / findByIdForOwner', () => {
     const repository = new InMemoryExportRepository(
       loadEnv({ NODE_ENV: 'test' }),
     ) as unknown as Record<string, unknown>;
-    for (const present of ['create', 'save', 'listByOwnerId']) {
+    for (const present of ['create', 'save', 'listByOwnerId', 'findByIdForOwner']) {
       expect(typeof repository[present]).toBe('function');
     }
     // 删除 / 归档 / 未过滤读取入口一个都不存在（入口越少，越不存在越权面）
+    // `findByIdForOwner` 的归属是**取数条件本身**，因此不属于「未过滤读取」
     for (const forbidden of [
       'delete',
       'remove',

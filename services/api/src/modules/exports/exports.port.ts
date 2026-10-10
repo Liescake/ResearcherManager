@@ -2,12 +2,16 @@
  * 导出切片（exports）的**显式端口**与存储侧词汇表
  * （docs/P2-架构与数据设计.md §2「exports | 异步导出、脱敏、有效期、下载审计」）。
  *
- * 本切片只承载**本人导出请求的最小垂直切片**：
+ * 本切片承载**本人导出请求的最小垂直切片**：
  * - `POST /me/exports` 创建本人的导出请求（服务端白名单资源 + 字段）；
- * - `GET  /me/exports` 本人导出请求列表与状态。
+ * - `GET  /me/exports` 本人导出请求列表与状态；
+ * - `GET  /me/exports/:exportId/download` 下载本人**已完成**导出的产物内容。
  *
- * 真实文件下载、有效期与清理、脱敏规则明细、下载审计、管理端 `POST /admin/exports`
- * （`export:{resource}:create`，见 docs/P2-API契约基线.md §「统计、导出、配置」）属于后续切片。
+ * **真实文件生成、字段级脱敏、有效期与清理、管理端 `POST /admin/exports`**
+ * （`export:{resource}:create`，见 docs/P2-API契约基线.md §「统计、导出、配置」）仍属于后续切片：
+ * 下载切片只把「已完成导出的产物能不能被本人取走」这一段收敛到契约内，
+ * 产物内容由 `ExportArtifactStore` 的显式端口给出（真实实现留给后续切片），
+ * 本切片**不伪造生产文件下载**，也不声称任何实现可生产可用。
  *
  * 为什么必须有两个显式端口（而不是把「进程内 Map」当成生产存储）：
  * 1. `ExportRepository` —— 导出请求事实的持久化端口。**按是否解析出 `DATABASE_URL` 分流**：
@@ -24,10 +28,12 @@
  * - 两个端口都**不做授权判定**：资源级判定属于 `AuthorizationGuard`，调用方必须先授权；
  * - 两个端口都**不生成归属与状态**：`ownerUserId` 只由 service 从服务端会话主体写入，
  *   `status` 只由 service 的状态机写入，`createdAt` / `updatedAt` 取服务端时钟；
- * - 仓储**只按服务端主体取数**（`listByOwnerId`）：没有「按客户端提交的 owner 取数」这类方法，
+ * - 仓储**只按服务端主体取数**（`listByOwnerId` / `findByIdForOwner`）：没有「按客户端提交的
+ *   owner 取数」这类方法，也没有**不带归属条件**的单条读取（不存在 `findById`），
  *   因此「拿他人的导出请求」在端口层面就没有可用的查询入口；
  * - 端口实体里**没有**文件名、文件路径、下载 URL、对象存储 key 这类字段：
- *   产物在存储侧的位置只存在于 `ExportArtifactStore` 内部，端口返回值只是一个不透明句柄。
+ *   产物在存储侧的位置只存在于 `ExportArtifactStore` 内部，端口返回值只是一个不透明句柄；
+ *   `ExportArtifactStore.read` 返回的也只有**内容字节**，不含 key / 路径 / 下载地址 / 签名地址。
  */
 
 /** 导出资源**闭集**：与 docs/P2-API契约基线.md 的 `export:{resource}:*` 资源名一一对应 */
@@ -118,7 +124,12 @@ export interface ExportRepositoryCapabilities {
  *   必须报错而不是静默插入/静默换主；
  * - `listByOwnerId`：只返回该服务端主体名下的记录，按创建顺序。
  *   service 仍会逐条复核归属（纵深防御：仓储的过滤行为不作为安全边界）；
- * - 端口**没有**删除/归档方法：本切片不提供「删除导出记录」的能力。
+ * - `findByIdForOwner`：按「记录 ID + 服务端主体归属」取**单条**记录（下载切片唯一的取数入口）。
+ *   归属**同时**出现在方法签名与 SQL 谓词里（`WHERE id = $1::uuid AND requester_id = $2::uuid`），
+ *   因此他人记录既不出库，也无法通过「拿他人的作业 ID」取到；查不到与不属于本人**不可区分**
+ *   （都返回 `undefined`），所以端口层面就不可能泄露「该 ID 是否存在」；
+ * - 端口**没有**删除/归档方法，也**没有**不带归属条件的单条读取（`findById` / `findByOwner` /
+ *   `query` 一类入口一律不存在）：本切片不提供「删除导出记录」与「跨主体取数」的能力。
  *
  * ## 契约形态：**唯一一份异步契约**（本切片完成收敛）
  * 端口此前是**同步**契约（内存基线同步返回），数据库实现只能并存一份 `AsyncExportRepository`。
@@ -157,6 +168,17 @@ export interface ExportRepository {
    * 调用方必须是已授权访问该主体资源的服务端代码；归属必须下推进 SQL（他人记录不出库）。
    */
   listByOwnerId(ownerUserId: string): Promise<readonly ExportRequest[]>;
+  /**
+   * 按「记录 ID + 服务端主体归属」取单条记录（下载切片的唯一取数入口）。
+   *
+   * - `id` 来自服务端已通过形态校验的路由参数，`ownerUserId` 只来自服务端会话主体；
+   * - **归属必须下推进存储**（SQL：`WHERE id = $1 AND requester_id = $2`）；
+   * - 记录不存在**或不属于该主体**都返回 `undefined`（两者不可区分，因此不会泄露存在性）；
+   * - 返回的记录不经过任何公开视图裁剪，调用方必须自行复核读取契约与归属；
+   * - 存储故障（执行器异常、行契约损坏、ID 不在存储域）必须**抛错**（fail-closed），
+   *   绝不能被伪装成「不存在」。
+   */
+  findByIdForOwner(id: string, ownerUserId: string): Promise<ExportRequest | undefined>;
 }
 
 /**
@@ -191,9 +213,9 @@ export const EXPORT_REPOSITORY_STORAGE_ID_DOMAIN = 'uuid';
  * 真库集成验证闭环），因此两份契约已收敛：运行时绑定（内存基线）与数据库 adapter 现在实现
  * **同一份**签名，「切换到数据库」与「回退到内存基线」仍是可整步执行 / 整步回退的操作。
  *
- * 方法集**只有三个**（`create` / `save` / `listByOwnerId`）——这里没有 `findById` 那种
- * 「单条读取」，因此不存在需要额外补主体参数的入口；三者都从入参取**服务端**主体，
- * 数据库实现把归属**下推进 SQL**（`WHERE requester_id = $1`）。
+ * 方法集**只有四个**（`create` / `save` / `listByOwnerId` / `findByIdForOwner`）：唯一的单条读取
+ * 入口也把主体写进签名（`findByIdForOwner`），不存在需要额外补主体参数的「裸 findById」；
+ * 四者都从入参取**服务端**主体，数据库实现把归属**下推进 SQL**（`WHERE requester_id = $1`）。
  *
  * 实现者（`exports.in-memory-repository.ts` 与 `exports.postgres-repository.ts`）必须满足
  * **完全相同**的语义
@@ -210,9 +232,11 @@ export const EXPORT_REPOSITORY_STORAGE_ID_DOMAIN = 'uuid';
  *    不覆盖归属，并逐条复核「返回记录的归属 === 请求主体 / 请求记录的归属」，不一致即判服务端缺陷；
  * 3. **存储 ID 域**：主体与记录内的 `id` / `artifactId` 必须落在
  *    `EXPORT_REPOSITORY_STORAGE_ID_DOMAIN`（规范小写形 UUID）内，否则 fail-closed；
- * 4. **按服务端主体隔离**：`listByOwnerId` 必须把归属下推进 SQL，让「他人导出请求」根本不出库，
- *    并在返回行上**逐条**复核归属（纵深防御：仓储的过滤行为不作为安全边界）；
- *    写回路径同样以 `id + 归属` 双重限定，拿他人的作业 ID 也写不中他人数据；
+ * 4. **按服务端主体隔离**：`listByOwnerId` 与 `findByIdForOwner` 都必须把归属下推进 SQL，
+ *    让「他人导出请求」根本不出库，并在返回行上**逐条**复核归属（纵深防御：仓储的过滤行为
+ *    不作为安全边界）；`findByIdForOwner` 对「不存在」与「属于他人」返回同一个 `undefined`，
+ *    不得用不同返回值 / 不同错误区分两者；写回路径同样以 `id + 归属` 双重限定，
+ *    拿他人的作业 ID 也写不中他人数据；
  * 5. **每条返回记录都必须能被读取契约校验**：未知列、未知资源 / 状态枚举、非法时间戳、
  *    非 UUID 标识、字段白名单之外的字段一律按服务端缺陷抛错；结果集出现多行 / 重复主键同样
  *    fail-closed；
@@ -291,6 +315,18 @@ export interface ExportArtifactRef {
   readonly artifactId: string;
 }
 
+/**
+ * 产物内容：**只有内容本身**。
+ *
+ * 刻意不携带 storage key、文件路径、下载地址、签名地址、文件名、桶名、有效期或 MIME ——
+ * 「位置即能力」：任何可反推存储位置或自带取件能力的字段都不得离开存储实现。
+ * 内容类型与文件名由 API 层用**服务端常量**固定（见 `exports.contract.ts`），
+ * 不由存储实现决定，因此存储侧无法用「返回一个 header」的方式注入响应头。
+ */
+export interface ExportArtifactContent {
+  readonly bytes: Uint8Array;
+}
+
 /** 产物存储后端的能力声明 */
 export interface ExportArtifactStoreCapabilities {
   readonly backend: string;
@@ -301,18 +337,86 @@ export interface ExportArtifactStoreCapabilities {
 }
 
 /**
- * 导出产物存储端口：把「服务端白名单内的资源 + 字段」物化为服务端侧产物。
+ * 导出产物存储端口：把「服务端白名单内的资源 + 字段」物化为服务端侧产物，并按不透明句柄读回内容。
  *
- * - **没有读/下载方法**：本切片不提供下载能力，因此端口在类型层面就无法把产物内容或位置交给调用方；
- * - 返回的句柄只用于写入记录的 `artifactId`（供后续下载切片关联），**绝不外发**；
+ * - **`store` 没有位置语义**：返回的句柄只有一个 UUID（供记录关联），**绝不外发**；
+ * - **`read` 只返回内容字节**：没有 storage key / 路径 / 下载地址 / 签名地址 / 文件名
+ *   （见 `ExportArtifactContent`），因此「把内部存储位置或一次性签名地址交给调用方」在类型层面
+ *   就不可表达；
+ * - `read` 命中返回内容；句柄不存在（含「该句柄不属于请求中的记录」）返回 `undefined`；
+ *   读取故障必须**抛异常**（不能返回 `undefined`），由 service 按 fail-closed 处理；
+ * - `read` **一次返回全部内容**（不做流式读出）：调用方因此能在写出任何字节之前完成硬上限判定，
+ *   不存在「流到一半才发现超大」的窗口；
  * - 失败（生成或写入抛异常、返回形态非法）由 service 收敛为任务的 `failed` 终态：
  *   这是「导出没做出来」的业务事实，不是 500；
- * - 实现**不做授权判定**，也不决定归属：spec 由 service 从服务端主体与已验证输入推导。
+ * - 实现**不做授权判定**，也不决定归属：spec 由 service 从服务端主体与已验证输入推导，
+ *   读取前必须先由 service 完成归属与资源级判定。
  */
 export interface ExportArtifactStore {
   readonly capabilities: ExportArtifactStoreCapabilities;
   store(spec: ExportArtifactSpec): ExportArtifactRef;
+  read(artifactId: string): Promise<ExportArtifactContent | undefined>;
 }
 
 /** DI 令牌：导出产物存储（真实实现应写入对象存储/临时文件区并保留有效期与清理策略） */
 export const EXPORT_ARTIFACT_STORE = Symbol('EXPORT_ARTIFACT_STORE');
+
+/**
+ * 下载审计结果**闭集**：只记「这次下载尝试的结果码」，不记原因、不记任何业务取值。
+ *
+ * - `success`：内容已交付；
+ * - `unavailable`：**统一安全拒绝**（不存在 / 跨主体 / 未完成 / 产物缺失收敛到同一结果），
+ *   因此审计本身也不泄露「该导出是否存在、处于什么状态」；
+ * - `failed`：fail-closed（产物读取故障、内容超过硬上限、存储记录违反读取契约）；
+ * - 未登记取值一律视为存储损坏，绝不作为合法结果外发。
+ */
+export const ExportDownloadAuditResult = {
+  Success: 'success',
+  Unavailable: 'unavailable',
+  Failed: 'failed',
+} as const;
+export type ExportDownloadAuditResult =
+  (typeof ExportDownloadAuditResult)[keyof typeof ExportDownloadAuditResult];
+export const EXPORT_DOWNLOAD_AUDIT_RESULT_VALUES = [
+  ExportDownloadAuditResult.Success,
+  ExportDownloadAuditResult.Unavailable,
+  ExportDownloadAuditResult.Failed,
+] as const;
+
+/**
+ * 下载审计条目：**恰好三个字段**，每一个都是服务端生成的脱敏值。
+ *
+ * - `requestId`：服务端生成的请求关联 ID（**不使用**客户端可提交的 `x-request-id`：
+ *   客户端可控值不得进入审计，否则审计可被伪造成指向任意请求）；
+ * - `exportIdDigest`：导出 ID 的**单向摘要**（`sha256:<32 位十六进制>`）。记摘要而不是原值，
+ *   使审计在可用于关联的同时不落任何原始标识；摘要不可逆，因此审计泄露不等于 ID 泄露；
+ * - `result`：结果码闭集（见上）。
+ *
+ * **刻意没有**的字段：产物内容 / 字节 / 响应体、`artifactId` 或任何产物句柄、storage key /
+ * 路径 / 下载地址 / 签名地址 / 文件名、归属主体、角色 / 权限、查询串、请求头、IP、UA、
+ * 错误原文。审计端口在类型层面就装不下这些取值（严格契约见 `exports.contract.ts` 的
+ * `exportDownloadAuditEntrySchema`），因此「审计顺手把产物位置或 PII 写进去」不可能悄悄发生。
+ */
+export interface ExportDownloadAuditEntry {
+  readonly requestId: string;
+  readonly exportIdDigest: string;
+  readonly result: ExportDownloadAuditResult;
+}
+
+/**
+ * 下载审计端口（**只追加单条脱敏记录**）。
+ *
+ * 为什么独立于 `audit` 模块：本切片只要求「下载尝试留痕」这一件事，而 `AuditRepository`
+ * 的读取契约（actor / ipHash / 事件类型 / 资源类型闭集）面向业务审计事件，扩它需要改动
+ * 公开权限与事件目录（属后续版本项）。本端口因此只承载下载留痕的最小事实集，
+ * **不落任何业务取值**，也不提供读取面（读取属于后续的审计查询切片）。
+ *
+ * 失败语义：`record` 抛异常即表示「留痕失败」，由 service fail-closed 为 500 ——
+ * 审计不可用时绝不返回「看起来成功但没有留痕」的下载响应。
+ */
+export interface ExportDownloadAuditSink {
+  record(entry: ExportDownloadAuditEntry): Promise<void>;
+}
+
+/** DI 令牌：下载审计出口 */
+export const EXPORT_DOWNLOAD_AUDIT = Symbol('EXPORT_DOWNLOAD_AUDIT');

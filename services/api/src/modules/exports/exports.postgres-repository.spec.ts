@@ -670,8 +670,8 @@ describe('PostgreSQL 导出仓储：能力声明与交付边界', () => {
     for (const method of POSTGRES_EXPORT_FORBIDDEN_METHODS) {
       expect(surface[method]).toBeUndefined();
     }
-    // 公开面必须有 create / save / listByOwnerId 三个方法，且都不返回同步值
-    for (const method of ['create', 'save', 'listByOwnerId']) {
+    // 公开面必须有 create / save / listByOwnerId / findByIdForOwner 四个方法，且都不返回同步值
+    for (const method of ['create', 'save', 'listByOwnerId', 'findByIdForOwner']) {
       expect(typeof surface[method]).toBe('function');
     }
   });
@@ -1914,5 +1914,155 @@ describe('PostgreSQL 导出仓储：已装配、无驱动依赖、与 schema 边
     const adapter: AsyncExportRepository = new PostgresExportRepository(new RecordingExecutor());
     expect(adapter.capabilities).toEqual(POSTGRES_EXPORT_REPOSITORY_CAPABILITIES);
     expect(adapter).toBeInstanceOf(PostgresExportRepository);
+  });
+});
+
+/**
+ * 下载切片的取数入口（`findByIdForOwner`）：单条读取必须**同时**钉住主键与归属。
+ *
+ * 这些用例把「归属下推进 SQL」「不存在与属于他人不可区分」「非法标识零 SQL」「他人记录不得回流」
+ * 四条安全属性固定在**真实 adapter 代码路径**上（记录型假执行器，不连数据库）。
+ */
+describe('PostgreSQL 导出仓储：单条取数的归属隔离（下载切片）', () => {
+  it('SQL 是「主键 + 归属」双重参数化谓词：归属不进 SQL 文本，占位符与参数一一对应', async () => {
+    const { repository, executor } = repoWith({
+      rows: [rowFromJob(COMPLETED_JOB)],
+      rowCount: 1,
+    });
+
+    const found = await repository.findByIdForOwner(JOB_ID, OWNER);
+    expect(found).toEqual(COMPLETED_JOB);
+
+    const call = callAt(executor, 0);
+    const sql = call?.sql ?? '';
+    expect(sql).toContain(
+      'SELECT id, requester_id, resource, fields, status, artifact_id, created_at, updated_at',
+    );
+    expect(sql).not.toContain('*');
+    expect(sql).toContain('WHERE id = $1::uuid AND requester_id = $2::uuid');
+    expectParameterizedSql(sql);
+    // 归属与主键都只出现在参数里（SQL 文本里只有列名与占位符）
+    expect(sql).not.toContain(OWNER);
+    expect(sql).not.toContain(JOB_ID);
+    expect(call?.parameters).toEqual([JOB_ID, OWNER]);
+    expect(placeholderIndexes(sql)).toHaveLength(call?.parameters?.length ?? 0);
+    expectWriteAndReadOnlySql(executor);
+  });
+
+  it('0 行 ⇒ undefined（不存在与「属于他人」不可区分），且不追加任何诊断查询', async () => {
+    const { repository, executor } = repoWith({ rows: [], rowCount: 0 });
+
+    await expect(repository.findByIdForOwner(JOB_ID, OWNER)).resolves.toBeUndefined();
+    // 与「不存在」同一返回值：调用方没有任何可区分两者的信息；也不做跨归属探测
+    await expect(repository.findByIdForOwner(OTHER_JOB_ID, OWNER)).resolves.toBeUndefined();
+    expect(executor.calls).toHaveLength(2);
+    for (const call of executor.calls) {
+      expect(call.sql).toContain('requester_id = $2::uuid');
+      expect(call.parameters).toEqual([expect.any(String), OWNER]);
+    }
+  });
+
+  it('执行器越权返回他人记录 ⇒ OWNER_VIOLATION（纵深防御：仓储过滤不作为安全边界）', async () => {
+    const { repository } = repoWith({ rows: [rowFromJob(OTHER_OWNER_JOB)], rowCount: 1 });
+
+    const error = await captureRepoError(() => repository.findByIdForOwner(JOB_ID, OWNER));
+    expect(error.code).toBe('OWNER_VIOLATION');
+    expectIssueOn(error, 'requester_id');
+    expectNoValueLeak(error);
+  });
+
+  it('行契约损坏（未知列 / 非法枚举 / 非 UUID 标识 / 坏时间戳）⇒ INVALID_ROW，不含取值', async () => {
+    const cases: readonly Record<string, unknown>[] = [
+      rowFromJob(COMPLETED_JOB, { storage_key: 'memory-export-artifacts/x.csv' }),
+      rowFromJob(COMPLETED_JOB, { file_path: FORGED_PATH }),
+      rowFromJob(COMPLETED_JOB, { status: 'unknown-status' }),
+      rowFromJob(COMPLETED_JOB, { artifact_id: 'not-a-uuid' }),
+      rowFromJob(COMPLETED_JOB, { created_at: '2026/01/02' }),
+      withoutRowColumn(COMPLETED_JOB, 'requester_id'),
+    ];
+    for (const row of cases) {
+      const { repository } = repoWith({ rows: [row], rowCount: 1 });
+      const error = await captureRepoError(() => repository.findByIdForOwner(JOB_ID, OWNER));
+      expect(error.code).toBe('INVALID_ROW');
+      expectNoValueLeak(error);
+    }
+  });
+
+  it('多行返回 ⇒ RESULT_SET_VIOLATION（主键唯一性被破坏不得被静默取第一条）', async () => {
+    const { repository } = repoWith({
+      rows: [rowFromJob(COMPLETED_JOB), rowFromJob(COMPLETED_JOB)],
+      rowCount: 2,
+    });
+    const error = await captureRepoError(() => repository.findByIdForOwner(JOB_ID, OWNER));
+    expect(error.code).toBe('RESULT_SET_VIOLATION');
+    expectNoValueLeak(error);
+  });
+
+  it('非法记录 ID / 主体 ⇒ INVALID_ID / INVALID_SUBJECT，且一个 SQL 都不执行', async () => {
+    for (const id of ['u-student-1', '', NIL_UUID, HEX_JOB_ID_UPPER, INJECTION]) {
+      const { repository, executor } = repoWith({ rows: [], rowCount: 0 });
+      const error = await captureRepoError(() => repository.findByIdForOwner(id, OWNER));
+      expect(error.code).toBe('INVALID_ID');
+      expectIssueOn(error, 'id');
+      expectNoValueLeak(error);
+      expect(executor.calls).toHaveLength(0);
+    }
+    for (const owner of ['u-student-1', '', NIL_UUID, HEX_OWNER_UPPER, HEX_OWNER_MIXED]) {
+      const { repository, executor } = repoWith({ rows: [], rowCount: 0 });
+      const error = await captureRepoError(() =>
+        repository.findByIdForOwner(HEX_JOB_ID, owner as string),
+      );
+      expect(error.code).toBe('INVALID_SUBJECT');
+      expectIssueOn(error, 'ownerUserId');
+      expectNoValueLeak(error);
+      expect(executor.calls).toHaveLength(0);
+    }
+  });
+
+  it('执行器异常 ⇒ EXECUTOR_FAILURE，不携带原始错误文本', async () => {
+    const repository = new PostgresExportRepository(
+      new ThrowingExecutor(new Error(`connect postgres://user:${SECRET}@${FORGED_PATH}`)),
+    );
+    const error = await captureRepoError(() => repository.findByIdForOwner(JOB_ID, OWNER));
+    expect(error.code).toBe('EXECUTOR_FAILURE');
+    expect((error as { cause?: unknown }).cause).toBeUndefined();
+    expectNoValueLeak(error);
+    expect(error.message).not.toContain('://');
+  });
+
+  it('延迟建连包装同样先判标识、再解析执行器；非法标识不触发任何连接', async () => {
+    let resolves = 0;
+    const lazy: AsyncExportRepository = createLazyPostgresExportRepository(() => {
+      resolves += 1;
+      return Promise.resolve(undefined as unknown as SqlExecutor);
+    });
+
+    await expect(lazy.findByIdForOwner('not-a-uuid', OWNER)).rejects.toMatchObject({
+      code: 'INVALID_ID',
+    });
+    await expect(lazy.findByIdForOwner(JOB_ID, 'u-student-1')).rejects.toMatchObject({
+      code: 'INVALID_SUBJECT',
+    });
+    expect(resolves).toBe(0);
+
+    // 合法标识：解析执行器并走到 adapter（此处执行器为 undefined，构造即 fail-closed）
+    await expect(lazy.findByIdForOwner(JOB_ID, OWNER)).rejects.toMatchObject({
+      code: 'EXECUTOR_UNAVAILABLE',
+    });
+    expect(resolves).toBe(1);
+  });
+
+  it('端口面：存在 findByIdForOwner，且不存在任何不带归属条件的单条读取入口', () => {
+    const { repository } = repoWith();
+    const surface = repository as unknown as Record<string, unknown>;
+    expect(typeof surface.findByIdForOwner).toBe('function');
+    for (const forbidden of ['findById', 'findByOwner', 'findAll', 'query', 'delete', 'upsert']) {
+      expect(surface[forbidden]).toBeUndefined();
+    }
+    // 源码层面：模板里确实存在单条取数语句，且它含归属谓词
+    const source = readFileSync(ADAPTER_PATH, 'utf8');
+    expect(source).toContain('const SELECT_BY_ID_FOR_OWNER_SQL = `SELECT');
+    expect(source).toContain('WHERE id = $1::uuid AND requester_id = $2::uuid');
+    expect(source).not.toMatch(/`(?:DELETE|TRUNCATE|ALTER|DROP|GRANT|COPY)\b/u);
   });
 });

@@ -16,7 +16,9 @@ import type { ExportRepository, ExportRepositoryCapabilities, ExportRequest } fr
  * - **不做读取契约校验**：存储层损坏（未知枚举、字段不在白名单、状态与产物不自洽）必须能被
  *   出口的 fail-closed 门禁看见，因此基线不代替出口做校验，也不静默修正非法记录；
  *   写入只保证「主键唯一」「归属不可改写」这两条存储自身的完整性约束；
- * - **没有**删除/归档方法：本切片不提供「删除导出请求」的能力。
+ * - **没有**删除/归档方法：本切片不提供「删除导出请求」的能力；
+ * - **没有**不带归属条件的单条读取：单条读取只有 `findByIdForOwner(id, ownerUserId)`，
+ *   归属是取数条件本身（不存在 `findById` / `findByOwner` / `query` 这类入口）。
  */
 @Injectable()
 export class InMemoryExportRepository implements ExportRepository {
@@ -67,6 +69,21 @@ export class InMemoryExportRepository implements ExportRepository {
     return [...this.requests.values()]
       .filter((record) => record.ownerUserId === ownerUserId)
       .map((record) => copyRequest(record));
+  }
+
+  /**
+   * 按「记录 ID + 服务端主体归属」取单条记录（下载切片的取数入口）。
+   *
+   * **归属是取数条件的一部分**（等价于数据库实现的 `WHERE id = … AND requester_id = …`），
+   * 因此这里**没有**「先按 id 取出再比较归属」的中间状态：他人的作业 ID 与不存在的 ID
+   * 返回同一个 `undefined`，端口层面就不可能泄露「该 ID 是否存在」。
+   */
+  async findByIdForOwner(id: string, ownerUserId: string): Promise<ExportRequest | undefined> {
+    const record = this.requests.get(id);
+    if (record === undefined || record.ownerUserId !== ownerUserId) {
+      return undefined;
+    }
+    return copyRequest(record);
   }
 }
 

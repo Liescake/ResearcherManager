@@ -42,6 +42,20 @@ export class ApiClientError extends Error {
 /** 基地址非法时的稳定错误码：fail-closed，请求根本不会发出，票据也就不可能被送出 */
 export const INVALID_BASE_URL_CODE = 'INVALID_BASE_URL';
 
+/**
+ * 响应体不是统一信封（`{ data, meta, error }`）时的稳定错误码。
+ *
+ * 为什么单独给一个码：非信封响应在 HTTP 上完全可能是 200（代理返回 HTML、后端换了形状、
+ * 网关插入了错误页）。只按状态码兜底会落到 `unknown`（「发生未预期错误」），排障时无法区分
+ * 「后端契约漂移」与「偶发故障」。状态码仍然保留在 `status` 上，界面据此判断
+ * 401 / 403 / 404 / 503 等语义，不因为多了这个码而丢失。
+ */
+export const INVALID_RESPONSE_CODE = 'INVALID_RESPONSE';
+
+/** 契约漂移时的用户安全文案：说清「不是成功」，但不暴露后端内部结构 */
+export const INVALID_RESPONSE_MESSAGE =
+  '服务端响应不符合统一信封契约（data / meta / error），已按失败处理';
+
 const HAS_SCHEME = /^[a-z][a-z0-9+.-]*:/iu;
 
 /** 控制字符（C0 与 DEL）检测：可用于 URL/头部注入，一律拒绝（按码点判断，避免正则控制字符） */
@@ -153,6 +167,33 @@ export function resolveApiBaseUrl(env?: Record<string, unknown>): string {
   return normalizeBaseUrl(typeof configured === 'string' ? configured : undefined);
 }
 
+/**
+ * 基地址解析结果：非法值不抛异常，而是作为结果返回。
+ *
+ * 为什么需要它：`createApiClient` 在构造时抛错是 fail-closed 的正确行为，但如果界面在**渲染期**
+ * 直接调用抛错版本（`resolveApiBaseUrl`），一个错误的环境变量就会让整个应用白屏——使用者既看不到
+ * 「哪里错了」，也看不到「本该发出的请求一个都没发」。这里把失败变成可渲染的状态，同时保持
+ * 同样的 fail-closed 语义：`ok: false` 时调用方不得构造任何客户端，也就不会发出任何请求。
+ */
+export type BaseUrlResolution =
+  | { readonly ok: true; readonly baseUrl: string }
+  | { readonly ok: false; readonly error: ApiClientError };
+
+/** 与 `createApiClient` 同源的解析，但不抛异常：显式 baseUrl 与 VITE_API_BASE_URL 共用一套校验 */
+export function resolveApiBaseUrlResult(explicit?: string): BaseUrlResolution {
+  try {
+    return { ok: true, baseUrl: resolveClientBaseUrl(explicit) };
+  } catch (caught) {
+    return {
+      ok: false,
+      error:
+        caught instanceof ApiClientError
+          ? caught
+          : new ApiClientError(INVALID_BASE_URL_CODE, 'API 基地址不合法，已拒绝发起请求'),
+    };
+  }
+}
+
 function joinUrl(baseUrl: string, path: string): string {
   if (/^[a-z][a-z0-9+.-]*:\/\//iu.test(path) || path.startsWith('//')) {
     throw new ApiClientError('INVALID_PATH', '不允许请求绝对地址');
@@ -253,9 +294,15 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       if (!response.ok || envelope === undefined || envelope.error !== null) {
         const errorBody: ApiErrorBody | undefined = envelope?.error ?? undefined;
         const requestId = readRequestId(envelope);
+        // 响应体不是信封属于**契约违规**：可能是反向代理返回的 HTML、后端换了形状或网关错误页。
+        // 服务端给出的稳定 code 永远优先；只有「服务端没给 code 且响应不是信封」时才用
+        // INVALID_RESPONSE，让界面能把它与普通 HTTP 失败区分开（HTTP 层可能还是 200）。
+        const contractViolation = envelope === undefined;
         const error = new ApiClientError(
-          errorBody?.code ?? `HTTP_${response.status}`,
-          errorBody?.message ?? '请求失败，请稍后重试',
+          errorBody?.code ??
+            (contractViolation ? INVALID_RESPONSE_CODE : `HTTP_${response.status}`),
+          errorBody?.message ??
+            (contractViolation ? INVALID_RESPONSE_MESSAGE : '请求失败，请稍后重试'),
           {
             status: response.status,
             ...(requestId === undefined ? {} : { requestId }),

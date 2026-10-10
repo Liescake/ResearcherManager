@@ -3,7 +3,11 @@ import { AUDIT_REPOSITORY } from '../modules/audit/audit.port';
 import { SESSION_STORE } from '../modules/auth/session-subject.port';
 import { COMPLIANCE_REPOSITORY } from '../modules/compliance/compliance.port';
 import { EDUCATION_RECORD_REPOSITORY } from '../modules/education/education-records.port';
-import { EXPORT_ARTIFACT_STORE, EXPORT_REPOSITORY } from '../modules/exports/exports.port';
+import {
+  EXPORT_ARTIFACT_STORE,
+  EXPORT_DOWNLOAD_AUDIT,
+  EXPORT_REPOSITORY,
+} from '../modules/exports/exports.port';
 import { GROUP_REPOSITORY } from '../modules/groups/groups.port';
 import { MATCHING_AI_PROVIDER, MATCHING_FEATURE_SOURCE } from '../modules/matching/matching.port';
 import { MATCHING_REPOSITORY } from '../modules/matching/matching.port';
@@ -125,6 +129,13 @@ export const PERSISTENCE_BINDINGS: readonly PersistenceBindingDescriptor[] = [
     token: EXPORT_ARTIFACT_STORE,
     module: 'exports',
     responsibility: '导出产物存储（文件体）',
+    role: 'business',
+  },
+  {
+    token: EXPORT_DOWNLOAD_AUDIT,
+    module: 'exports',
+    responsibility:
+      '下载留痕出口（只追加脱敏三元组：服务端 requestId / 导出 ID 单向摘要 / 结果码）——留痕必须可跨重启保留，否则生产环境不得声称可用',
     role: 'business',
   },
   {

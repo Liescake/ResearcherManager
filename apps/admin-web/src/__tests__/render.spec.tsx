@@ -1,6 +1,7 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import { App } from '../App';
+import { INVALID_BASE_URL_CODE } from '../api/client';
 import { DEMO_DATA_NOTICE } from '../api/demo-data';
 import { ENDPOINTS } from '../api/endpoints';
 import type { UiError } from '../api/errors';
@@ -192,11 +193,59 @@ describe('应用外壳的登录守卫与模式标注', () => {
     expect(html).toContain('统计概览');
   });
 
+  it('联调模式 → 常驻显示实际生效的 API 基地址与「真实请求」标注', () => {
+    const storage = memoryStorage({
+      status: 'authenticated',
+      session: createSession('ticket-abcd1234', '会话票据登录'),
+    });
+    const html = render(<App storage={storage} baseUrl="http://127.0.0.1:3000/api/v1" />);
+
+    // 基地址必须是**实际生效**的那一个（与票据去向一致），而不是只显示约定前缀
+    expect(html).toContain('http://127.0.0.1:3000/api/v1');
+    expect(html).toContain('真实请求');
+    expect(html).toContain('联调模式：所有数据均来自');
+    // 真实模式不得出现任何演示只读提示
+    expect(html).not.toContain('演示模式：不连接后端');
+  });
+
   it('演示模式 → 常驻演示标注，且不宣称已连接后端', () => {
     const storage = memoryStorage({ status: 'authenticated', session: createDemoSession() });
     const html = render(<App storage={storage} />);
     expect(html).toContain('演示模式');
     expect(html).toContain(DEMO_DATA_NOTICE);
     expect(html).toContain('演示模式不发起请求');
+    expect(html).toContain('不发起请求');
+    expect(html).not.toContain('真实请求');
+  });
+
+  /**
+   * 渲染期不允许抛异常：错误的环境变量必须变成可读的配置错误状态，而不是白屏；
+   * 同时不得渲染任何业务页面（否则会出现「没有数据来源的页面」）。
+   */
+  it('基地址非法 → 渲染配置错误页，不渲染任何业务页面', () => {
+    const storage = memoryStorage({
+      status: 'authenticated',
+      session: createSession('ticket-abcd1234', '会话票据登录'),
+    });
+    const html = render(<App storage={storage} baseUrl="//evil.example.com/api/v1" />);
+
+    expect(html).toContain('前端配置错误');
+    expect(html).toContain(INVALID_BASE_URL_CODE);
+    expect(html).toContain('VITE_API_BASE_URL');
+    expect(html).not.toContain('统计概览');
+    expect(html).not.toContain('演示模式');
+  });
+
+  /**
+   * 演示模式不依赖后端：一个写错的 API 地址只能阻断真实模式，
+   * 否则「后端不可达」会连带禁掉「本就不发请求的演示走查」。
+   */
+  it('基地址非法 + 演示模式 → 仍可进入演示界面（演示不依赖 API 配置）', () => {
+    const storage = memoryStorage({ status: 'authenticated', session: createDemoSession() });
+    const html = render(<App storage={storage} baseUrl="//evil.example.com/api/v1" />);
+
+    expect(html).toContain('演示模式');
+    expect(html).toContain('演示模式不发起请求');
+    expect(html).not.toContain('前端配置错误');
   });
 });

@@ -20,7 +20,23 @@ const ERROR_TITLES: Readonly<Record<UiErrorKind, string>> = {
   network: '无法连接服务端',
   timeout: '请求超时',
   server: '服务端异常',
+  'service-unavailable': '服务暂时不可用',
+  contract: '响应不符合接口契约',
+  configuration: '前端配置错误',
   unknown: '发生未预期错误',
+};
+
+/**
+ * 只对分类本身说不清的几种错误补一句「怎么处置」。
+ * 其它分类（401/403/404 等）由对应面板给出更精确的说明，不在这里重复。
+ */
+const ERROR_HINTS: Partial<Readonly<Record<UiErrorKind, string>>> = {
+  contract:
+    '服务端返回的响应体不是约定的 { data, meta, error } 信封，界面不会把它当作成功。请核对后端版本，以及反向代理/网关是否改写了响应体。',
+  'service-unavailable':
+    '服务或其依赖暂时不可用（HTTP 503）：通常可以稍后重试；若持续出现，请检查 API 与依赖服务的运行状态，而不是继续重试。',
+  configuration:
+    '前端构建期的 API 基地址配置不合法，客户端已拒绝发出任何请求（避免把会话票据送往非预期目标）。请修正配置后重新构建。',
 };
 
 export function errorTitle(error: UiError): string {
@@ -96,10 +112,12 @@ export function ErrorPanel({
   onRetry?: () => void;
   extra?: ReactNode;
 }): ReactNode {
+  const hint = ERROR_HINTS[error.kind];
   return (
     <div className="state state--error" role="alert">
       <p className="state__title">{errorTitle(error)}</p>
       <p>{error.message}</p>
+      {hint !== undefined && <p className="muted">{hint}</p>}
       {extra}
       <ErrorDetails error={error} />
       {onRetry !== undefined && (

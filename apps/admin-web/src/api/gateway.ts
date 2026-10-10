@@ -147,6 +147,30 @@ export function createLiveGateway(client: ApiClient): AdminGateway {
   };
 }
 
+/**
+ * 基地址非法时的**不可用网关**：所有取数一律以同一个配置错误失败。
+ *
+ * 为什么不返回空数据、也不返回演示数据：空集会被界面渲染成「没有记录」，演示数据会被渲染成
+ * 业务事实——两者都把一次前端配置故障说成了数据结论。fail-closed 的失败面是唯一诚实的表达，
+ * 而且它让错误沿着既有的「可重试错误」通路显示，不需要任何新的界面分支。
+ */
+export function createMisconfiguredGateway(error: ApiClientError): AdminGateway {
+  const reject = async (): Promise<never> => {
+    throw error;
+  };
+  return {
+    // 仍然是 live：它没有、也不会用任何夹具数据，只是连基地址都不合法而已。
+    mode: 'live',
+    notice: null,
+    loadHealth: () => reject(),
+    loadProfile: () => reject(),
+    updateProfile: () => reject(),
+    loadSelfStatistics: () => reject(),
+    loadAdminStatistics: () => reject(),
+    loadApplications: () => reject(),
+  };
+}
+
 export interface DemoGatewayOptions {
   /** 注入延迟用于走查 loading 态；默认 0，测试保持确定性 */
   latencyMs?: number;

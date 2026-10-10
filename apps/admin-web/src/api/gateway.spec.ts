@@ -1,10 +1,15 @@
 import { ApplicationStatus, ok } from '@rm/shared';
 import type { ApiEnvelope } from '@rm/shared';
 import { describe, expect, it } from 'vitest';
-import { ApiClientError } from './client';
+import { ApiClientError, INVALID_BASE_URL_CODE } from './client';
 import type { ApiClient } from './client';
 import { DEMO_PROFILE } from './demo-data';
-import { DEMO_READ_ONLY_MESSAGE, createDemoGateway, createLiveGateway } from './gateway';
+import {
+  DEMO_READ_ONLY_MESSAGE,
+  createDemoGateway,
+  createLiveGateway,
+  createMisconfiguredGateway,
+} from './gateway';
 import type { AdminApplicationListItem } from './types';
 
 interface RecordedCall {
@@ -153,6 +158,33 @@ describe('联调网关', () => {
 
   it('联调模式不展示演示标注', () => {
     expect(createLiveGateway(stubClient().client).notice).toBeNull();
+  });
+});
+
+describe('基地址非法时的不可用网关', () => {
+  const error = new ApiClientError(INVALID_BASE_URL_CODE, 'API 基地址不合法（含反斜杠）');
+
+  it('一切取数都以配置错误失败：不返回空数据、不返回演示数据', async () => {
+    const gateway = createMisconfiguredGateway(error);
+    expect(gateway.mode).toBe('live');
+    expect(gateway.notice).toBeNull();
+
+    await expect(gateway.loadProfile()).rejects.toBe(error);
+    await expect(gateway.loadHealth()).rejects.toMatchObject({
+      code: INVALID_BASE_URL_CODE,
+    });
+    await expect(gateway.loadSelfStatistics()).rejects.toMatchObject({
+      code: INVALID_BASE_URL_CODE,
+    });
+    await expect(gateway.loadAdminStatistics()).rejects.toMatchObject({
+      code: INVALID_BASE_URL_CODE,
+    });
+    await expect(gateway.loadApplications({ page: 1, pageSize: 20 })).rejects.toMatchObject({
+      code: INVALID_BASE_URL_CODE,
+    });
+    await expect(gateway.updateProfile({ name: 'x' })).rejects.toMatchObject({
+      code: INVALID_BASE_URL_CODE,
+    });
   });
 });
 

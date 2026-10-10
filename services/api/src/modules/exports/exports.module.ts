@@ -8,20 +8,22 @@ import { AccessControlModule } from '../access-control/access-control.module';
 import { AuthModule } from '../auth/auth.module';
 import { InMemoryExportArtifactStore } from './exports.artifact-store.in-memory';
 import { ExportsController } from './exports.controller';
+import { InMemoryExportDownloadAuditSink } from './exports.download-audit.in-memory';
 import { InMemoryExportRepository } from './exports.in-memory-repository';
 import { createLazyPostgresExportRepository } from './exports.postgres-repository';
-import { EXPORT_ARTIFACT_STORE, EXPORT_REPOSITORY } from './exports.port';
+import { EXPORT_ARTIFACT_STORE, EXPORT_DOWNLOAD_AUDIT, EXPORT_REPOSITORY } from './exports.port';
 import type { ExportRepository } from './exports.port';
 import { ExportsService } from './exports.service';
 
 /**
  * 导出模块（docs/P2-架构与数据设计.md §2「exports | 异步导出、脱敏、有效期、下载审计」声明的边界）。
  *
- * 本切片只落地其中**本人导出请求的最小垂直切片**：
+ * 本切片落地其中**本人导出请求的最小垂直切片**：
  * - `POST /me/exports` 创建本人的导出请求（服务端白名单资源 + 字段）；
- * - `GET  /me/exports` 本人导出请求列表与状态。
+ * - `GET  /me/exports` 本人导出请求列表与状态；
+ * - `GET  /me/exports/:exportId/download` 下载本人已完成导出的产物内容。
  *
- * 真实文件生成与字段级脱敏、有效期与清理、下载路由与下载审计、管理端 `POST /admin/exports`
+ * 真实文件生成与字段级脱敏、有效期与清理、管理端 `POST /admin/exports`
  * （`export:{resource}:create`）、列表分页与筛选属于后续切片，必须继续留在本模块内，
  * 不得跨模块直接调用其他领域模块的仓储（导出范围只由本模块的服务端字段白名单决定）。
  *
@@ -61,11 +63,20 @@ import { ExportsService } from './exports.service';
  * 不实现真实文件外发与第三方存储）。它保持内存基线 + 显式 provider 绑定，因此换绑点只有一处，
  * 且它如实声明 `persistent = false` / `productionReady = false`，生产环境由 `PersistenceBoundaryService`
  * 与依赖就绪门禁拦下 —— 不会被误当作可用的生产产物存储。
+ * 基线提供的是**最小读能力**（按不透明句柄读回内容字节，不含 storage key / 路径 / 签名地址），
+ * 因此下载切片交付的是「内容 + 固定的安全响应头」，不是伪造的生产文件下载。
+ *
+ * ## 为什么下载留痕是独立的内存基线出口
+ * `EXPORT_DOWNLOAD_AUDIT` 绑定 `InMemoryExportDownloadAuditSink`（同样如实声明非生产、
+ * 在生产环境拒绝构造）。它只接收**脱敏三元组**（服务端 requestId、导出 ID 单向摘要、结果码）
+ * 并按严格契约校验，因此本切片不会把内容、产物位置、归属或请求侧输入写进留痕。
+ * 真实审计落库（以及读取/查询面）属后续切片：`audit` 模块的事件与资源类型是闭集，
+ * 扩它需要同步公开权限与事件目录，不在本切片范围内。
  *
  * 边界事实：本模块不含 RuoYi/Java 源码、不引入 Maven 依赖、不新增第三方依赖
  * （复用 `@rm/shared`），也不改动 health / runtime-info / profiles / groups / memberships /
  * achievements / education / matching / statistics / notifications / audit 等既有路由；
- * 对外只新增 `/me/exports` 的两条路由。
+ * 对外只新增 `/me/exports` 的三条路由。
  */
 export function createExportRepository(
   env: AppEnv,
@@ -107,6 +118,8 @@ const EXPORT_REPOSITORY_PROVIDER: FactoryProvider = {
     EXPORT_REPOSITORY_PROVIDER,
     InMemoryExportArtifactStore,
     { provide: EXPORT_ARTIFACT_STORE, useExisting: InMemoryExportArtifactStore },
+    InMemoryExportDownloadAuditSink,
+    { provide: EXPORT_DOWNLOAD_AUDIT, useExisting: InMemoryExportDownloadAuditSink },
   ],
 })
 export class ExportsModule {}
