@@ -1146,6 +1146,23 @@ describe('站内通知：存储异常（仓端口抛错 → 500，不泄露内�
     expect(save).not.toHaveBeenCalled();
   });
 
+  it('Postgres 状态转移冲突 → 409 STATE_TRANSITION_INVALID，且不泄露仓储错误', async () => {
+    const { baseUrl, repository, seeded } = await startNotificationsApp();
+    vi.spyOn(repository, 'save').mockRejectedValue({
+      code: 'TRANSITION_REJECTED',
+      message: 'internal SQL/user detail must not escape',
+    });
+
+    const res = await call(baseUrl, 'PATCH', `/me/notifications/${seeded.ownUnread.id}/read`, {
+      headers: bearer(SESSION_STUDENT_1),
+    });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error?.code).toBe('STATE_TRANSITION_INVALID');
+    expect(contentText(res)).not.toContain('TRANSITION_REJECTED');
+    expect(contentText(res)).not.toContain('internal SQL');
+  });
+
   it('写回抛异常 → 500，状态变化不成立（记录保持未读、无 readAt）', async () => {
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     const { baseUrl, repository, seeded } = await startNotificationsApp();

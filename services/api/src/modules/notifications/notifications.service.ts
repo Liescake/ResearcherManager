@@ -5,7 +5,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { DataScope, PermissionPoint } from '@rm/shared';
+import { DataScope, PermissionPoint, StateTransitionError } from '@rm/shared';
 import type { AuthorizationSubject } from '@rm/shared';
 import { AuthorizationGuard } from '../access-control/authorization-guard';
 import {
@@ -23,6 +23,18 @@ import {
 import type { NotificationView, StoredNotification } from './notifications.contract';
 import { NOTIFICATION_REPOSITORY } from './notifications.port';
 import type { NotificationRepository } from './notifications.port';
+
+const NOTIFICATION_TRANSITION_REJECTED = 'TRANSITION_REJECTED' as const;
+
+function isNotificationTransitionRejection(
+  error: unknown,
+): error is { readonly code: typeof NOTIFICATION_TRANSITION_REJECTED } {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { readonly code?: unknown }).code === NOTIFICATION_TRANSITION_REJECTED
+  );
+}
 
 /**
  * 站内通知切片（P7 最小垂直切片，本人通知箱）：
@@ -146,7 +158,17 @@ export class NotificationsService {
 
     // 5. 状态机唯一前向边：read 是终态，已读记录原样返回（不写库、不漂移 readAt）
     const mark = markNotificationRead(stored, new Date().toISOString());
-    const saved = mark.changed ? await this.repository.save(mark.record) : mark.record;
+    let saved = mark.record;
+    if (mark.changed) {
+      try {
+        saved = await this.repository.save(mark.record);
+      } catch (error) {
+        if (isNotificationTransitionRejection(error)) {
+          throw new StateTransitionError('notification', stored.status, mark.record.status);
+        }
+        throw error;
+      }
+    }
 
     // 6. 写出后的记录同样要过读取契约与归属复核（异常仓储不得借写回把他人记录交出去）
     return this.toOwnedView(saved, subject.userId);
