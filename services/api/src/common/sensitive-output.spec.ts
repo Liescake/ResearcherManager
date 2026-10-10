@@ -109,6 +109,106 @@ describe('findSensitiveOutput：命中的敏感取值', () => {
     ]);
   });
 
+  it('连接配置字段名的大小写与分隔符变体一律命中（DATABASE_URL / connectionString / api_key）', () => {
+    for (const field of [
+      'DATABASE_URL',
+      'database_url',
+      'databaseUrl',
+      'connectionString',
+      'connection_string',
+      'API_KEY',
+      'apiKey',
+      'api_key',
+      'PRIVATE_KEY',
+      'VERIFIED_AT',
+    ]) {
+      expect(findSensitiveOutput({ [field]: 'x' }), field).toEqual([
+        { path: `data.${field}`, kind: 'evidence-field' },
+      ]);
+    }
+    // 反向：正常运维字段名不会被这条规则误判
+    expect(findSensitiveOutput({ databaseConfigured: true })).toEqual([]);
+    expect(findSensitiveOutput({ dependencyGate: 'required', aiMatchingEnabled: true })).toEqual(
+      [],
+    );
+  });
+
+  it('owner / user 标识字段名（camelCase 与 snake_case）一律拦下', () => {
+    for (const [payload, path] of [
+      [{ userId: 'x' }, 'data.userId'],
+      [{ user_id: 'x' }, 'data.user_id'],
+      [{ ownerId: 'x' }, 'data.ownerId'],
+      [{ owner_id: 'x' }, 'data.owner_id'],
+      [{ ownerUserId: 'x' }, 'data.ownerUserId'],
+      [{ leaderUserId: 'x' }, 'data.leaderUserId'],
+      [{ reviewedByUserId: 'x' }, 'data.reviewedByUserId'],
+      [{ createdAt: 1, targetUserIds: ['x'] }, 'data.targetUserIds'],
+    ] as const) {
+      expect(findSensitiveOutput(payload), path).toContainEqual({ path, kind: 'owner-id' });
+    }
+  });
+
+  it('owner / user 标识字面量同样拦下（会话基线的 u-… 主体 ID）', () => {
+    expect(findSensitiveOutput({ detail: '主体 u-student-1 未就绪' })).toEqual([
+      { path: 'data.detail', kind: 'owner-id' },
+    ]);
+    expect(findSensitiveOutput({ detail: '已连接 userId=u-victim-9' })).toEqual([
+      { path: 'data.detail', kind: 'owner-id' },
+    ]);
+    // 边界：普通英文词、ISO 时间戳与 UUID 请求 ID 不会被误判为主体 ID
+    expect(
+      findSensitiveOutput({
+        timestamp: '2026-01-01T00:00:00.000Z',
+        requestId: '3f2504e0-4f89-41d3-9a0c-0305e82c3301',
+        version: '0.1.0',
+        backend: 'in-memory-baseline',
+      }),
+    ).toEqual([]);
+  });
+
+  it('provider 名称（真实第三方品牌与模型族）拦下，本项目枚举取值放行', () => {
+    for (const provider of [
+      'openai',
+      'OpenAI',
+      'anthropic',
+      'claude',
+      'gemini',
+      'deepseek',
+      'gpt-4o-mini',
+      'qwen',
+      'glm',
+      'azure',
+      'ollama',
+    ]) {
+      expect(findSensitiveOutput({ detail: `上游 ${provider} 不可达` })).toEqual([
+        { path: 'data.detail', kind: 'provider-name' },
+      ]);
+    }
+    // 脱敏事实（本项目自己的枚举）不是供应商身份
+    expect(findSensitiveOutput({ aiProvider: 'mock' })).toEqual([]);
+    expect(findSensitiveOutput({ aiProvider: 'http-json' })).toEqual([]);
+    expect(findSensitiveOutput({ aiProvider: 'disabled' })).toEqual([]);
+  });
+
+  it('原始异常（堆栈帧、依赖路径、Error: 文本与异常字段名）一律拦下', () => {
+    expect(
+      findSensitiveOutput({ detail: 'boom\n    at Object.<anonymous> (/app/dist/x.js:1:1)' }),
+    ).toEqual([{ path: 'data.detail', kind: 'raw-exception' }]);
+    expect(findSensitiveOutput({ detail: '异常来源 node_modules/pg/lib/index.js' })).toEqual([
+      { path: 'data.detail', kind: 'raw-exception' },
+    ]);
+    expect(findSensitiveOutput({ message: 'TypeError: x is not a function' })).toEqual([
+      { path: 'data.message', kind: 'raw-exception' },
+    ]);
+    for (const field of ['stack', 'stackTrace', 'exception', 'cause']) {
+      expect(findSensitiveOutput({ [field]: 'x' }), field).toEqual([
+        { path: `data.${field}`, kind: 'raw-exception' },
+      ]);
+    }
+    // 边界：异常**类名**（无冒号、无堆栈）是可安全写法，不误伤
+    expect(findSensitiveOutput({ detail: 'DependencyReadinessError' })).toEqual([]);
+  });
+
   it('嵌套与数组下标体现在命中路径上，便于定位且不泄露取值', () => {
     const findings = findSensitiveOutput({
       status: 'degraded',

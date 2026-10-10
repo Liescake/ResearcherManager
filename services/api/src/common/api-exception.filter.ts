@@ -2,6 +2,7 @@ import { ArgumentsHost, Catch, ExceptionFilter, HttpException, Logger } from '@n
 import { ApiErrorCode, BusinessRuleError, fail, statusForErrorCode } from '@rm/shared';
 import type { ApiEnvelope } from '@rm/shared';
 import { ZodError } from 'zod';
+import { projectApiErrorBody, stableInternalErrorBody } from './operational-output';
 import type { RequestLike, ResponseLike } from './request-context';
 import { resolveRequestId, safeRequestPath } from './request-context';
 
@@ -12,6 +13,18 @@ import { resolveRequestId, safeRequestPath } from './request-context';
  * - HttpException → 按状态码映射错误码；
  * - 其他异常 → INTERNAL_ERROR，且不向客户端泄露内部细节。
  * 日志只写脱敏信息（方法、路径、状态、错误码），不写请求体与隐私原文。
+ *
+ * **闭集脱敏投影（本次加固）**：错误响应不再直接输出「映射结果」，而是先经过统一运维出口契约
+ * （`common/operational-output.ts`）的投影：
+ * - 信封收敛为 `{ data: null, meta: { requestId }, error: { code, message, requestId, details? } }`；
+ * - **状态码与错误码永不变**（客户端按 code 分支，不解析 message）：文案安全则保留，
+ *   命中脱敏规则（连接串 / 口令 / SQL / 证据 ID / 内部路径 / owner-user ID / provider 名称 /
+ *   原始异常）则替换为该错误码的稳定默认文案；`details` 命中即整体丢弃；
+ * - **任何 5xx 一律走 `stableInternalErrorBody()`**：只有 `INTERNAL_ERROR` + 稳定默认文案 +
+ *   requestId，不带自定义 message、不带 details —— 500 的输出因此与具体异常无关、可回归断言。
+ *
+ * 这条投影与 health / runtime-info / 启动日志共用同一套判定，避免四个出口各写一遍规则而产生
+ * 不对称的缺口（例如新增出口时漏掉脱敏）。
  */
 @Catch()
 export class ApiExceptionFilter implements ExceptionFilter {
@@ -40,6 +53,17 @@ export class ApiExceptionFilter implements ExceptionFilter {
   }
 
   private toResponse(
+    exception: unknown,
+    requestId: string,
+  ): { status: number; body: ApiEnvelope<never> } {
+    const mapped = this.mapException(exception, requestId);
+    // 5xx：稳定脱敏错误体（与异常内容无关）；其余：闭集 + 脱敏投影（码与状态不变）
+    const body =
+      mapped.status >= 500 ? stableInternalErrorBody(requestId) : projectApiErrorBody(mapped.body);
+    return { status: mapped.status, body };
+  }
+
+  private mapException(
     exception: unknown,
     requestId: string,
   ): { status: number; body: ApiEnvelope<never> } {

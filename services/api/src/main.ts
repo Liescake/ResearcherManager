@@ -3,6 +3,12 @@ import { Logger, type INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
+import {
+  describeOperationalIssues,
+  describeStartupBanner,
+  describeStartupFailure,
+  renderOperationalLogValue,
+} from './common/operational-output';
 import { applyRequestBodyLimits } from './common/request-body-limits';
 import { applySecurityHeaders } from './common/security-headers';
 import { APP_ENV } from './config/config.module';
@@ -99,6 +105,19 @@ export async function createApp(
  * 全部通过后才 `listen`。只要 `DATABASE_URL` 解析成功，无论 `NODE_ENV` 是什么，
  * 装配都必须提供经过 attest 且证据完整的 SQL 执行器，并持有封存声明与验证证据的持久化依赖，
  * 否则在**任何连接之前**终止启动。
+ *
+ * **启动日志的出口契约**：三条日志一律经过统一运维出口契约
+ * （`common/operational-output.ts` 的 `startupLog` 档位）：
+ * - 监听地址只写 `host:port` 与路径，**不写 `scheme://`** —— 契约拒绝任何连接串形态，
+ *   而 `http://host:port` 与之无法区分；`API_HOST` / `API_PREFIX` 是不可信输入，先经过
+ *   `describeStartupBanner` 的闭集投影，被拒绝的字段只输出固定占位符（绝不回显取值）；
+ * - 配置摘要只能是 `describeEnv` 的闭集字段；若取值命中脱敏规则，落盘的只有占位符与
+ *   命中类别（**绝不输出取值**），并单独记一条 error 说明违规路径；
+ * - 启动失败只输出**投影后**的异常类名与稳定 `code`：`error.name` 只在**明确登记的类名闭集**
+ *   （`REGISTERED_ERROR_NAMES`）里才原样输出，未登记的名称（含 `EvilName` 这类形态合法的任意
+ *   ASCII 名）一律固定占位符；`error.message` **永不输出**，只写固定安全文案
+ *   （`STARTUP_FAILURE_TEXT_PLACEHOLDER`）—— 原始异常文本是自由文本，脱敏规则只是黑名单，
+ *   不足以放行。
  */
 async function bootstrap(): Promise<void> {
   const logger = new Logger('Bootstrap');
@@ -108,13 +127,26 @@ async function bootstrap(): Promise<void> {
 
   await app.listen(env.API_PORT, env.API_HOST);
 
-  logger.log(`服务已启动: http://${env.API_HOST}:${env.API_PORT}${env.API_PREFIX}`);
-  logger.log(`健康检查: ${env.API_PREFIX}/health`);
-  logger.log(`配置摘要: ${JSON.stringify(describeEnv(env))}`);
+  for (const line of describeStartupBanner(env)) {
+    logger.log(line);
+  }
+  logOperationalSummary(logger, describeEnv(env));
+}
+
+/**
+ * 写启动配置摘要：闭集 + 脱敏。违规时**先报命中路径/类别、再写占位符**，
+ * 保证日志里永远不会出现未脱敏的取值。
+ */
+function logOperationalSummary(logger: Logger, summary: Record<string, unknown>): void {
+  const rendered = renderOperationalLogValue('startupLog', summary);
+  if (!rendered.clean) {
+    logger.error(`配置摘要不符合运维出口契约: ${describeOperationalIssues(rendered.issues)}`);
+  }
+  logger.log(`配置摘要: ${rendered.text}`);
 }
 
 bootstrap().catch((error: unknown) => {
   const logger = new Logger('Bootstrap');
-  logger.error(`启动失败: ${error instanceof Error ? error.message : String(error)}`);
+  logger.error(describeStartupFailure(error));
   process.exitCode = 1;
 });

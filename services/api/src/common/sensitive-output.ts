@@ -14,7 +14,16 @@
  * - 内部路径：Windows 盘符路径、UNC 路径、`/etc`、`/srv` 等系统路径前缀；
  * - 私钥块：`-----BEGIN ... PRIVATE KEY-----`；
  * - 证据/连接配置字段名：`evidenceId`、`readinessRef`、`verifiedAt`、`migration*`、
- *   `connectionString`、`sql*` 等 —— 这些属于内部证据，不允许出现在运维出口。
+ *   `connectionString`、`sql*` 等 —— 这些属于内部证据，不允许出现在运维出口；
+ * - owner / user 标识：`ownerId` / `userId` / `ownerUserId` 等**字段名**（camelCase 与
+ *   snake_case），以及 `u-student-1` 这类主体 ID 字面量 —— 运维出口只回答「是否配置」，
+ *   不回答「是谁」；
+ * - provider 名称：真实第三方模型 / 云厂商品牌（OpenAI、Anthropic、Gemini、DeepSeek…）
+ *   与模型族标识（`gpt-*`）一律不出现在运维出口；本项目自己的枚举取值（`mock` /
+ *   `http-json` / `disabled`）属于脱敏事实，不在拒绝之列；
+ * - 原始异常：堆栈帧、`node_modules` / `node:internal` 路径、`Error: …` 形态的异常文本，
+ *   以及 `stack` / `stackTrace` / `exception` / `cause` 这类**字段名** —— 原始异常属于内部细节，
+ *   出口只允许稳定错误码与安全文案。
  *
  * 边界事实：只读扫描，不改写载荷、不建连接、不读磁盘；日志只写字段路径与命中类别，
  * 永不写命中取值（否则脱敏门禁自己变成泄漏点）。
@@ -26,7 +35,10 @@ export type SensitiveOutputKind =
   | 'sql-statement'
   | 'internal-path'
   | 'private-key'
-  | 'evidence-field';
+  | 'evidence-field'
+  | 'owner-id'
+  | 'provider-name'
+  | 'raw-exception';
 
 export interface SensitiveOutputFinding {
   /** 命中的载荷路径，例如 `data.checks[0].detail` */
@@ -40,9 +52,58 @@ const MAX_SCAN_DEPTH = 8;
 /**
  * 字段名不允许指向内部证据 / 连接配置。
  * 注意只匹配**字段名**：`DATABASE_URL` 作为「未配置」文案出现在 detail 取值里是合法的。
+ * 复合词允许 `_` / `-` 分隔（`DATABASE_URL`、`connectionString`、`api_key` 同族）。
  */
 const EVIDENCE_FIELD_PATTERN =
-  /(?:evidence|readiness|verifiedat|checkedat|migration|connectionstring|databaseurl|sql|password|passwd|secret|credential|privatekey|apikey|accesskey)/iu;
+  /(?:evidence|readiness|verified[_-]?at|checked[_-]?at|migration|connection[_-]?string|database[_-]?url|sql|password|passwd|secret|credential|private[_-]?key|api[_-]?key|access[_-]?key)/iu;
+
+/**
+ * owner / user 标识字段名（camelCase 与 snake_case）。
+ *
+ * 只匹配「以 id/ids 结尾且指代主体」的字段名，因此 `sessionSecret`、`memberRole`、
+ * `roles` 这类字段不会被误判；`ownerUserId` / `reviewedByUserId` / `targetUserId` 等
+ * 派生写法同样命中。
+ */
+const OWNER_ID_FIELD_PATTERN =
+  /(?:^|[_-])(?:owner|actor|leader|reviewer|reviewed_?by|created_?by|updated_?by|deleted_?by|target|subject|member)?[_-]?user[_-]?ids?$|(?:^|[_-])owner[_-]?ids?$/iu;
+
+/** 原始异常字段名：堆栈与异常对象本体绝不进入运维出口 */
+const RAW_EXCEPTION_FIELD_PATTERN =
+  /^(?:stack|stacktrace|stack_trace|exception|exceptiondetail|errordetail|cause)$/iu;
+
+interface FieldRule {
+  readonly kind: SensitiveOutputKind;
+  readonly pattern: RegExp;
+}
+
+/** 字段名级规则：命中即标记该路径（并与取值级规则并行判定） */
+const DENIED_FIELD_RULES: readonly FieldRule[] = [
+  { kind: 'evidence-field', pattern: EVIDENCE_FIELD_PATTERN },
+  { kind: 'owner-id', pattern: OWNER_ID_FIELD_PATTERN },
+  { kind: 'raw-exception', pattern: RAW_EXCEPTION_FIELD_PATTERN },
+];
+
+/**
+ * 原始异常的取值形态：堆栈帧、依赖目录路径，或 `TypeError: …` 这类异常文本。
+ * `describeError()` 只写异常**类名**、不带冒号，因此不会被本规则误伤。
+ */
+const RAW_EXCEPTION_VALUE_PATTERN =
+  /(?:^|\n)\s*at\s+\S|\bnode_modules[\\/]|\bnode:internal[\\/]|^[A-Za-z]*Error\s*:/mu;
+
+/**
+ * provider 名称：真实第三方模型 / 云厂商品牌与模型族标识。
+ * 刻意**不**包含本项目自己的 provider 枚举（`mock` / `http-json` / `disabled`），
+ * 它们是脱敏事实而不是供应商身份。
+ */
+const PROVIDER_NAME_PATTERN =
+  /\b(?:openai|anthropic|claude|gemini|deepseek|cohere|mistral|mixtral|llama|bedrock|vertex|azure|ollama|groq|openrouter|perplexity|moonshot|kimi|zhipu|glm|ernie|doubao|volcengine|hunyuan|minimax|stepfun|siliconflow|sensenova|sparkdesk|baichuan|qwen|tongyi|gpt|chatglm)\b/iu;
+
+/**
+ * owner / user 标识字面量：会话主体基线形如 `u-student-1`。
+ * 只在明确的边界字符之后判定，避免把普通英文词里的 `u-` 片段当成 ID。
+ */
+const OWNER_ID_VALUE_PATTERN =
+  /(?:^|[\s"'(=:,[])(?:u|usr|actor|owner|leader|reviewer)-[a-z0-9][a-z0-9_-]{2,}/u;
 
 interface ValueRule {
   readonly kind: SensitiveOutputKind;
@@ -52,6 +113,7 @@ interface ValueRule {
 /** 取值级规则：顺序即优先级，命中的第一个类别决定报告类别 */
 const VALUE_RULES: readonly ValueRule[] = [
   { kind: 'private-key', pattern: /-----BEGIN[A-Z ]*PRIVATE KEY-----/u },
+  { kind: 'raw-exception', pattern: RAW_EXCEPTION_VALUE_PATTERN },
   { kind: 'connection-string', pattern: /[a-z][a-z0-9+.-]*:\/\//iu },
   {
     kind: 'credential-pair',
@@ -67,6 +129,8 @@ const VALUE_RULES: readonly ValueRule[] = [
     pattern:
       /(?:[a-z]:[\\/]|\\\\[a-z0-9._-]+\\|(?:^|[\s"'(])\/(?:etc|var|home|root|usr|opt|srv|proc|sys)\/)/iu,
   },
+  { kind: 'provider-name', pattern: PROVIDER_NAME_PATTERN },
+  { kind: 'owner-id', pattern: OWNER_ID_VALUE_PATTERN },
 ];
 
 function matchValue(value: string): SensitiveOutputKind | undefined {
@@ -105,8 +169,10 @@ function collect(
     return;
   }
   for (const key of Object.keys(value)) {
-    if (EVIDENCE_FIELD_PATTERN.test(key)) {
-      findings.push({ path: `${path}.${key}`, kind: 'evidence-field' });
+    for (const rule of DENIED_FIELD_RULES) {
+      if (rule.pattern.test(key)) {
+        findings.push({ path: `${path}.${key}`, kind: rule.kind });
+      }
     }
     collect((value as Record<string, unknown>)[key], `${path}.${key}`, findings, depth + 1, seen);
   }
