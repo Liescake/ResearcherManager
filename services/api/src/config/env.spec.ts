@@ -120,4 +120,60 @@ describe('环境变量校验', () => {
     expect(summary).toContain('"databaseConfigured":true');
     expect(summary).toContain('"aiMatchingEnabled":true');
   });
+
+  it('AI_BASE_URL 通过出站端点安全校验：危险地址启动即失败且不回显原文', () => {
+    for (const dangerous of [
+      'http://127.0.0.1:8080/v1',
+      'http://169.254.169.254/latest/meta-data',
+      'http://metadata.google.internal/v1',
+      'http://[::1]:9000/v1',
+      'https://api.example.com/v1?token=sekret-token',
+      'https://user:pw@api.example.com/v1',
+      'ftp://api.example.com/v1',
+    ]) {
+      try {
+        loadEnv({ AI_BASE_URL: dangerous });
+        expect.unreachable(`应当拒绝: ${dangerous}`);
+      } catch (error) {
+        const message = (error as Error).message;
+        expect(message).toContain('AI_BASE_URL');
+        expect(message).not.toContain(dangerous);
+        expect(message).not.toContain('sekret-token');
+      }
+    }
+    // 正常公网地址放行
+    expect(loadEnv({ AI_BASE_URL: 'https://api.example.com/v1' }).AI_BASE_URL).toBe(
+      'https://api.example.com/v1',
+    );
+  });
+
+  it('AI_TRUSTED_HOSTS 只放行显式受信主机，且不放宽协议与结构约束', () => {
+    expect(
+      loadEnv({ AI_BASE_URL: 'http://127.0.0.1:11434/v1', AI_TRUSTED_HOSTS: '127.0.0.1' })
+        .AI_BASE_URL,
+    ).toBe('http://127.0.0.1:11434/v1');
+    expect(
+      loadEnv({ AI_BASE_URL: 'https://gw.internal:9000/v1', AI_TRUSTED_HOSTS: 'gw.internal' })
+        .AI_BASE_URL,
+    ).toBe('https://gw.internal:9000/v1');
+
+    // 未列入受信清单：按安全策略拒绝
+    expect(() => loadEnv({ AI_BASE_URL: 'http://127.0.0.1:11434/v1' })).toThrowError(
+      /环境变量校验失败/u,
+    );
+    // 受信不放宽协议
+    expect(() =>
+      loadEnv({ AI_BASE_URL: 'ftp://127.0.0.1/v1', AI_TRUSTED_HOSTS: '127.0.0.1' }),
+    ).toThrowError(/环境变量校验失败/u);
+    // 空白受信清单视为未配置
+    expect(loadEnv({ AI_TRUSTED_HOSTS: '   ' }).AI_TRUSTED_HOSTS).toBeUndefined();
+  });
+
+  it('AI_MAX_RESPONSE_BYTES：默认 1 MiB，可覆盖，非法值拒绝启动', () => {
+    expect(loadEnv({}).AI_MAX_RESPONSE_BYTES).toBe(1_048_576);
+    expect(loadEnv({ AI_MAX_RESPONSE_BYTES: '2048' }).AI_MAX_RESPONSE_BYTES).toBe(2048);
+    // 空串视为未配置，回落到默认值
+    expect(loadEnv({ AI_MAX_RESPONSE_BYTES: '' }).AI_MAX_RESPONSE_BYTES).toBe(1_048_576);
+    expect(() => loadEnv({ AI_MAX_RESPONSE_BYTES: '10' })).toThrowError(/环境变量校验失败/u);
+  });
 });

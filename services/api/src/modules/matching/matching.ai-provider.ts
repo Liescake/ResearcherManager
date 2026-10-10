@@ -23,6 +23,9 @@ export function createMatchingAiProvider(env: AppEnv): AiProvider {
       baseUrl: env.AI_BASE_URL,
       ...(env.AI_API_KEY ? { apiKey: env.AI_API_KEY } : {}),
       model: env.AI_MODEL ?? 'default',
+      // 端点安全策略：受信主机与响应体上限都由已校验的 env 决定（provider 侧再校验一次）
+      ...(env.AI_TRUSTED_HOSTS ? { trustedHosts: env.AI_TRUSTED_HOSTS } : {}),
+      maxResponseBytes: env.AI_MAX_RESPONSE_BYTES,
     });
   }
   return createMockProvider();

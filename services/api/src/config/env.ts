@@ -1,3 +1,4 @@
+import { DEFAULT_AI_MAX_RESPONSE_BYTES, resolveAiEndpoint } from '@rm/ai-adapter';
 import { API_PREFIX } from '@rm/shared';
 import { z } from 'zod';
 
@@ -49,7 +50,8 @@ const optionalBooleanFromEnv = z.preprocess(
 const optionalCount = (min: number, max: number, fallback: number) =>
   z.preprocess(emptyToUndefined, z.coerce.number().int().min(min).max(max).default(fallback));
 
-export const envSchema = z.object({
+/** 字段级环境变量 schema（未含跨字段的端点策略校验；对外使用下面的 `envSchema`） */
+const envShape = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
 
@@ -113,12 +115,41 @@ export const envSchema = z.object({
   AI_BASE_URL: optionalUrl,
   AI_API_KEY: optionalSecret,
   AI_MODEL: optionalSecret,
+  /**
+   * 显式受信主机 allowlist（逗号分隔，精确匹配；不支持通配符）。
+   * 只有在运维**明确**要访问本机/内网网关时才配置；它只放宽「主机安全」与「端口范围」判定，
+   * 不放宽协议、userinfo、query、hash 等结构约束（见 `@rm/ai-adapter` 的 `resolveAiEndpoint`）。
+   */
+  AI_TRUSTED_HOSTS: optionalSecret,
+  /** 模型响应体硬上限（字节）：超过即按安全 ProviderError 降级，不做 JSON 解析 */
+  AI_MAX_RESPONSE_BYTES: optionalCount(1024, 16_777_216, DEFAULT_AI_MAX_RESPONSE_BYTES),
   AI_TIMEOUT_MS: z.coerce.number().int().min(100).max(60000).default(8000),
   AI_MAX_RETRIES: z.coerce.number().int().min(0).max(5).default(1),
   AI_MATCHING_ENABLED: booleanFromEnv,
 
   EXPORT_FILE_TTL_MINUTES: z.coerce.number().int().min(5).max(1440).default(60),
   EXPORT_MAX_ROWS: z.coerce.number().int().min(1).max(1_000_000).default(50000),
+});
+
+/**
+ * 完整环境变量 schema：在字段级校验之上追加 AI 出站端点的启动期安全校验，
+ * 与 provider 侧复用**同一份**判定逻辑，避免「启动放行、运行拒绝」或反向的偏差。
+ * 只增补 `AI_BASE_URL` 的 issue，消息不包含原始取值。
+ */
+export const envSchema = envShape.superRefine((value, ctx) => {
+  if (value.AI_BASE_URL === undefined) {
+    return;
+  }
+  const resolution = resolveAiEndpoint(value.AI_BASE_URL, {
+    trustedHosts: value.AI_TRUSTED_HOSTS,
+  });
+  if (!resolution.ok) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['AI_BASE_URL'],
+      message: resolution.message,
+    });
+  }
 });
 
 export type AppEnv = z.infer<typeof envSchema>;

@@ -13,4 +13,5 @@ export * from './matching/invoke';
 export * from './provider/provider-port';
 export * from './provider/timeout';
 export * from './provider/mock-provider';
+export * from './provider/endpoint';
 export * from './provider/http-json-provider';
