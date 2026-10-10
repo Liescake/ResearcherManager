@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AiErrorCode } from '../errors';
+import { AiAdapterError, AiErrorCode } from '../errors';
 import { invokeMatchingWithFallback } from '../matching/invoke';
 import type { MatchFeatureBundle } from '../matching/types';
 import { createMockProvider } from '../provider/mock-provider';
+import type { AiProvider } from '../provider/provider-port';
 import { groundedRecommendation, ML_GROUP_ID, validBundle } from './fixtures';
 
 const CANDIDATE_ID = '22222222-2222-4222-8222-222222222222';
@@ -180,5 +181,165 @@ describe('匹配主流程与安全降级', () => {
       },
     });
     expect(outcome.durationMs).toBeGreaterThan(0);
+  });
+});
+
+/** 永不返回、但遵守取消信号的 provider（模拟挂起的上游连接） */
+function hangingProvider(): { provider: AiProvider; calls: () => number } {
+  let calls = 0;
+  const provider: AiProvider = {
+    id: 'hanging',
+    completeJson: (request) => {
+      calls += 1;
+      return new Promise<never>((_resolve, reject) => {
+        const abort = (): void => {
+          reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+        };
+        if (request.signal?.aborted) {
+          abort();
+          return;
+        }
+        request.signal?.addEventListener('abort', abort, { once: true });
+      });
+    },
+  };
+  return { provider, calls: () => calls };
+}
+
+describe('匹配重试与退避的总预算（共享 deadline）', () => {
+  it('重试不会成倍放大总耗时：多次尝试共享同一份业务 timeout', async () => {
+    const { provider, calls } = hangingProvider();
+    const startedAt = Date.now();
+
+    const outcome = await invokeMatchingWithFallback({
+      provider,
+      bundle: validBundle(),
+      modelVersion: 'mock-model-v1',
+      timeoutMs: 200,
+      maxRetries: 5,
+      retryBackoffMs: 0,
+    });
+
+    const elapsed = Date.now() - startedAt;
+    expect(outcome.status).toBe('fallback');
+    expect(outcome.errorCode).toBe(AiErrorCode.Timeout);
+    // 旧行为：每次尝试各给 200ms → 总耗时 6×200ms；现在只允许一次
+    expect(calls()).toBe(1);
+    expect(elapsed).toBeLessThan(1000);
+    expect(outcome.durationMs).toBeLessThan(1000);
+  });
+
+  it('退避等待被总预算截断，不会把总耗时推过 timeoutMs', async () => {
+    let calls = 0;
+    const provider: AiProvider = {
+      id: 'failing',
+      completeJson: async () => {
+        calls += 1;
+        throw new AiAdapterError(AiErrorCode.ProviderError, 'boom');
+      },
+    };
+    const startedAt = Date.now();
+
+    const outcome = await invokeMatchingWithFallback({
+      provider,
+      bundle: validBundle(),
+      modelVersion: 'mock-model-v1',
+      timeoutMs: 120,
+      maxRetries: 10,
+      // 远超预算的退避：必须被截断到剩余预算
+      retryBackoffMs: 5000,
+    });
+
+    const elapsed = Date.now() - startedAt;
+    expect(outcome.errorCode).toBe(AiErrorCode.Timeout);
+    expect(calls).toBe(1);
+    expect(elapsed).toBeLessThan(1000);
+    expect(outcome.durationMs).toBeLessThan(1000);
+  });
+
+  it('预算耗尽后不再发起新尝试（attempts 与实际调用次数一致）', async () => {
+    const { provider, calls } = hangingProvider();
+    const outcome = await invokeMatchingWithFallback({
+      provider,
+      bundle: validBundle(),
+      modelVersion: 'mock-model-v1',
+      timeoutMs: 150,
+      maxRetries: 3,
+      retryBackoffMs: 1000,
+    });
+    expect(calls()).toBe(1);
+    expect(outcome.attempts).toBe(1);
+    expect(outcome.errorCode).toBe(AiErrorCode.Timeout);
+  });
+
+  it('外部 signal 取消退避等待，不再重试', async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    const provider: AiProvider = {
+      id: 'failing',
+      completeJson: async () => {
+        calls += 1;
+        throw new AiAdapterError(AiErrorCode.ProviderError, 'boom');
+      },
+    };
+    setTimeout(() => controller.abort(), 30);
+    const startedAt = Date.now();
+
+    const outcome = await invokeMatchingWithFallback({
+      provider,
+      bundle: validBundle(),
+      modelVersion: 'mock-model-v1',
+      timeoutMs: 5000,
+      maxRetries: 5,
+      retryBackoffMs: 2000,
+      signal: controller.signal,
+    });
+
+    const elapsed = Date.now() - startedAt;
+    expect(calls).toBe(1);
+    expect(outcome.errorCode).toBe(AiErrorCode.Timeout);
+    // 若退避不可取消，这里至少会等满 2000ms
+    expect(elapsed).toBeLessThan(1500);
+  });
+
+  it('外部 signal 中止进行中的尝试，并保留降级语义', async () => {
+    const controller = new AbortController();
+    const { provider, calls } = hangingProvider();
+    setTimeout(() => controller.abort(), 30);
+    const startedAt = Date.now();
+
+    const outcome = await invokeMatchingWithFallback({
+      provider,
+      bundle: validBundle(),
+      modelVersion: 'mock-model-v1',
+      timeoutMs: 5000,
+      maxRetries: 2,
+      retryBackoffMs: 0,
+      signal: controller.signal,
+    });
+
+    expect(calls()).toBe(1);
+    expect(outcome.status).toBe('fallback');
+    expect(outcome.degraded).toBe(true);
+    expect(outcome.errorCode).toBe(AiErrorCode.Timeout);
+    expect(outcome.result.fallbackUsed).toBe(true);
+    expect(Date.now() - startedAt).toBeLessThan(1500);
+  });
+
+  it('已中止的 signal 立即失败，不调用模型', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const completeJson = vi.fn(async () => ({ recommendations: [] }));
+
+    const outcome = await invokeMatchingWithFallback({
+      provider: { id: 'spy', completeJson },
+      bundle: validBundle(),
+      modelVersion: 'mock-model-v1',
+      timeoutMs: 5000,
+      signal: controller.signal,
+    });
+
+    expect(completeJson).not.toHaveBeenCalled();
+    expect(outcome.errorCode).toBe(AiErrorCode.Timeout);
   });
 });

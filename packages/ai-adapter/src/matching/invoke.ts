@@ -32,14 +32,41 @@ export interface InvokeMatchingOptions {
   promptVersion?: string;
   /** 功能开关：关闭时直接走规则降级，不调用模型 */
   matchingEnabled?: boolean;
+  /**
+   * **业务总预算**（毫秒）：包含全部重试与退避等待的总时长上限，
+   * 不是「每次尝试各自的超时」。预算耗尽即停止（不再发起新尝试、不继续退避）。
+   */
   timeoutMs?: number;
   maxRetries?: number;
   requireGroundedReasons?: boolean;
   groundingMode?: GroundingMode;
   fallback?: FallbackOptions;
   retryBackoffMs?: number;
+  /** 调用方取消信号：与总 deadline 合并，取消退避等待与进行中的尝试 */
+  signal?: AbortSignal;
   now?: () => number;
   onDegrade?: (info: MatchingDegradeInfo) => void;
+}
+
+/**
+ * 把 `source` 的中止传播到 `target`，返回解绑函数（避免长生命周期信号上累积监听器）。
+ * 已中止的信号立即传播。
+ */
+function linkAbort(target: AbortController, source: AbortSignal | undefined): () => void {
+  if (source === undefined) {
+    return () => undefined;
+  }
+  if (source.aborted) {
+    target.abort();
+    return () => undefined;
+  }
+  const onAbort = (): void => {
+    target.abort();
+  };
+  source.addEventListener('abort', onAbort, { once: true });
+  return () => {
+    source.removeEventListener('abort', onAbort);
+  };
 }
 
 function mapValidationCode(code: MatchValidationCode): AiErrorCode {
@@ -136,57 +163,107 @@ export async function invokeMatchingWithFallback(
 
   const prompt = buildMatchingPrompt(options.bundle);
   const maxAttempts = 1 + maxRetries;
+  // 全局 deadline：重试与退避共享同一份预算，总耗时不会超过 timeoutMs
+  const deadlineAt =
+    Number.isFinite(timeoutMs) && timeoutMs > 0 ? startedAt + timeoutMs : startedAt;
+  const remainingBudget = (): number => deadlineAt - now();
+
+  // 取消控制器：外部 signal 与「预算耗尽」都经它中止退避等待与进行中的尝试
+  const controller = new AbortController();
+  const unlinkExternal = linkAbort(controller, options.signal);
+
+  const timeoutError = (): AiAdapterError =>
+    new AiAdapterError(AiErrorCode.Timeout, undefined, { timeoutMs });
+
   let lastError: AiAdapterError | undefined;
 
-  while (attempts < maxAttempts) {
-    attempts += 1;
-    try {
-      const raw = await withTimeout(
-        (signal) =>
-          options.provider.completeJson({
-            modelVersion: options.modelVersion,
-            promptVersion: prompt.promptVersion,
-            systemPrompt: prompt.systemPrompt,
-            userPrompt: prompt.userPrompt,
-            schemaHint: prompt.schemaHint,
-            signal,
-          }),
-        timeoutMs,
-      );
-
-      const validation = validateMatchingOutput(raw, options.bundle, {
-        requireGroundedReasons: options.requireGroundedReasons,
-        groundingMode: options.groundingMode,
-      });
-
-      if (validation.ok) {
-        return {
-          status: 'ai',
-          result: buildResult(validation.recommendations, false),
-          degraded: false,
-          attempts,
-          durationMs: now() - startedAt,
-        };
-      }
-
-      lastError = new AiAdapterError(mapValidationCode(validation.primaryCode), undefined, {
-        issues: validation.issues.slice(0, 5).map((issue) => `${issue.code}@${issue.path ?? ''}`),
-        hasIllegalGroupId: validation.hasIllegalGroupId,
-      });
-      options.onDegrade?.({ code: lastError.code, safeDetails: lastError.safeDetails });
-      // 输出格式问题重试成本高且收益低，直接降级（提示词/模型版本问题应通过评测修复）
-      break;
-    } catch (error) {
-      lastError = toAiAdapterError(error);
-      options.onDegrade?.({ code: lastError.code, safeDetails: lastError.safeDetails });
-      if (attempts >= maxAttempts) {
+  try {
+    while (attempts < maxAttempts) {
+      const remaining = remainingBudget();
+      if (controller.signal.aborted || remaining <= 0) {
+        // 预算已耗尽或调用方已取消：不再发起新尝试
+        controller.abort();
+        lastError = timeoutError();
+        options.onDegrade?.({ code: lastError.code, safeDetails: lastError.safeDetails });
         break;
       }
-      const backoff = (options.retryBackoffMs ?? DEFAULT_RETRY_BACKOFF_MS) * attempts;
-      if (backoff > 0) {
-        await sleep(backoff);
+
+      attempts += 1;
+      try {
+        const raw = await withTimeout(async (attemptSignal) => {
+          // 合并「本次尝试超时」与「总 deadline / 外部取消」，两者任一都会中止请求
+          const combined = new AbortController();
+          const unlinkAttempt = linkAbort(combined, attemptSignal);
+          const unlinkDeadline = linkAbort(combined, controller.signal);
+          try {
+            return await options.provider.completeJson({
+              modelVersion: options.modelVersion,
+              promptVersion: prompt.promptVersion,
+              systemPrompt: prompt.systemPrompt,
+              userPrompt: prompt.userPrompt,
+              schemaHint: prompt.schemaHint,
+              signal: combined.signal,
+            });
+          } finally {
+            unlinkAttempt();
+            unlinkDeadline();
+          }
+        }, remaining);
+
+        const validation = validateMatchingOutput(raw, options.bundle, {
+          requireGroundedReasons: options.requireGroundedReasons,
+          groundingMode: options.groundingMode,
+        });
+
+        if (validation.ok) {
+          return {
+            status: 'ai',
+            result: buildResult(validation.recommendations, false),
+            degraded: false,
+            attempts,
+            durationMs: now() - startedAt,
+          };
+        }
+
+        lastError = new AiAdapterError(mapValidationCode(validation.primaryCode), undefined, {
+          issues: validation.issues.slice(0, 5).map((issue) => `${issue.code}@${issue.path ?? ''}`),
+          hasIllegalGroupId: validation.hasIllegalGroupId,
+        });
+        options.onDegrade?.({ code: lastError.code, safeDetails: lastError.safeDetails });
+        // 输出格式问题重试成本高且收益低，直接降级（提示词/模型版本问题应通过评测修复）
+        break;
+      } catch (error) {
+        lastError = toAiAdapterError(error);
+        options.onDegrade?.({ code: lastError.code, safeDetails: lastError.safeDetails });
+        if (attempts >= maxAttempts) {
+          break;
+        }
+
+        const budgetAfterFailure = remainingBudget();
+        if (controller.signal.aborted || budgetAfterFailure <= 0) {
+          controller.abort();
+          lastError = timeoutError();
+          options.onDegrade?.({ code: lastError.code, safeDetails: lastError.safeDetails });
+          break;
+        }
+
+        const backoff = (options.retryBackoffMs ?? DEFAULT_RETRY_BACKOFF_MS) * attempts;
+        // 退避等待同样受总预算约束，并可由取消信号立即打断
+        const wait = Math.min(Math.max(backoff, 0), budgetAfterFailure);
+        if (wait > 0) {
+          try {
+            await sleep(wait, controller.signal);
+          } catch {
+            // 退避被取消（外部 signal 或预算耗尽）：按超时语义收口，不再重试
+            lastError = timeoutError();
+            options.onDegrade?.({ code: lastError.code, safeDetails: lastError.safeDetails });
+            break;
+          }
+        }
       }
     }
+  } finally {
+    unlinkExternal();
   }
 
   return buildDegradedOutcome(lastError?.code ?? AiErrorCode.ProviderError, 'fallback');
