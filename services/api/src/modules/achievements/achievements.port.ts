@@ -24,9 +24,10 @@ import type { AchievementType, ReviewStatus } from '@rm/shared';
  * 必须 `await`，因此「未认证就碰仓储」「先读后判」这类顺序错误不再可能被同步返回悄悄掩盖；
  * 同时「内存基线 ⇄ PostgreSQL」的替换只需要改一个 factory provider 的绑定。
  *
- * 本切片只承载成果的学生自服务部分：**创建本人成果**与**本人成果列表**。
- * 单条读取、更新（`achievement:self:update`）、审核（`achievement:review`）、
- * 附件实体校验、幂等键与审计落库属于后续切片。
+ * 本切片承载成果的学生自服务部分：**创建本人成果**、**本人成果列表**与**本人成果单条读取**
+ * （`achievement:self:read` 的资源级取数）。
+ * 更新（`achievement:self:update`）、审核（`achievement:review`）、附件实体校验、
+ * 幂等键与审计落库、列表分页与排序属于后续切片。
  */
 
 /** 存储层的成果（对应 docs/P1-字段级数据字典.md 的 achievements 字段） */
@@ -67,23 +68,32 @@ export interface AchievementRepositoryCapabilities {
  *    归属，并复核「返回记录的归属 === 请求取数 / 写入的归属」，不一致即判服务端缺陷；
  * 2. **存储 ID 域**：`userId` 必须落在 `ACHIEVEMENT_REPOSITORY_STORAGE_ID_DOMAIN`（UUID，
  *    规范小写形）内，否则 fail-closed（见下）；
- * 3. **按服务端主体隔离**（数据库形状上的**归属隔离强化**）：`listByUserId` 必须把归属下推进
- *    SQL（`WHERE user_id = $1`），让「他人记录」根本不出库，并在返回行上**逐条**复核归属
- *    （纵深防御）；本切片没有资源级取数方法，因此不存在「只按资源 ID 命中就返回」的路径；
+ * 3. **按服务端主体隔离**（数据库形状上的**归属隔离强化**）：`findById` **同时**接收服务端
+ *    主体，只返回「资源 ID 与归属同时命中」的记录——归属被**下推进 SQL**（`WHERE id = $1
+ *    AND user_id = $2::uuid`），让「他人记录」根本不出库，并在返回行上再复核一次归属
+ *    （纵深防御）。`listByUserId` 同样只按服务端主体取数；
  * 4. **每条返回记录都必须能被读取契约校验**：未知列、未知枚举、非法形状一律按服务端缺陷抛错，
  *    不得把未知状态或半成品记录交给上层；归属与个人级内容（标题/说明/佐证文件 ID）**绝不**
  *    进入错误消息与日志。
  *
- * 方法集刻意只有两个（`create` + `listByUserId`，没有单条读取、没有分页窗口）：
- * 单条读取（`achievement:self:read` 的资源级取数）与列表分页/排序都属于后续切片，一旦进入本
- * 契约，就必须与 service / controller / 两个实现一起改（例如单条读取必须**同时**接收服务端
- * 主体，才能把归属下推进 SQL），因此这里不预置「用不上的参数」。同名 spec 有边界断言，
- * 端口出现方法集漂移时会失败。
+ * 方法集恰好三个（`create` + `findById` + `listByUserId`）：
+ * - `findById` 是**资源级取数**，因此必须同时接收服务端主体，否则「只按资源 ID 命中就返回」
+ *   会让归属判定退化成取数之后的复核，存在性可被探测（此前同步端口用 403/404 的区别泄露了
+ *   存在性）。签名与两个实现因此必须一起改，不能只改其中一处；
+ * - 列表分页/排序属于后续切片：一旦分页窗口进入本契约，service / 内存基线 / PostgreSQL 实现
+ *   必须同步改，因此这里**不预置用不上的参数**。
+ * 同名 spec 有方法集边界断言（既包含这三个方法，也禁止出现分页窗口），漂移时会失败。
  */
 export interface AchievementRepository {
   readonly capabilities: AchievementRepositoryCapabilities;
   /** 写入一条已由 service 校验并补齐归属/审核态的记录；同 ID 冲突必须显式抛错，不得静默覆盖 */
   create(achievement: Achievement): Promise<Achievement>;
+  /**
+   * 未命中返回 `undefined`（不抛错）：只返回**同时**命中资源 ID 与**服务端主体归属**的记录。
+   * 「记录不存在」与「记录存在但不属于该主体」在此**不可区分**，调用方统一判 404，
+   * 避免用存在性探测他人成果。
+   */
+  findById(achievementId: string, ownerUserId: string): Promise<Achievement | undefined>;
   /**
    * 只按归属主体取数：调用方必须是已授权访问该主体资源的服务端代码。
    * 返回顺序为创建顺序（内存基线保留插入顺序；PostgreSQL 实现按 `created_at ASC, id ASC`

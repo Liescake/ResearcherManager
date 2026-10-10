@@ -21,8 +21,8 @@ import {
  * - **不声称生产可用**：能力声明固定为 `backend = postgres`、`persistent = true`、
  *   `productionReady = false`。生产启动会被 `PersistenceBoundaryService` /
  *   `DependencyReadinessService` 拒绝（`productionReady !== true` 即违规），直到补齐 attest 证据；
- * - **本切片只做必要读写**：`create`（创建本人成果）与 `listByUserId`（本人成果列表），
- *   单条读取、更新、审核、分页与软删除都留给后续切片（端口方法集有边界断言）。
+ * - **本切片只做必要读写**：`create`（创建本人成果）、`findById`（本人成果单条读取）与
+ *   `listByUserId`（本人成果列表），更新、审核、分页与软删除都留给后续切片（端口方法集有边界断言）。
  *
  * ## 为什么端口是异步的
  * `AchievementRepository`（`achievements.port.ts`）本身就是 Promise 契约：会话主体解析、画像与
@@ -186,6 +186,7 @@ export type PostgresAchievementRepositoryErrorCode =
   | 'EXECUTOR_NOT_PERSISTENT'
   | 'INVALID_SUBJECT'
   | 'INVALID_RECORD'
+  | 'INVALID_RECORD_ID'
   | 'INVALID_ROW'
   | 'RESULT_SET_VIOLATION'
   | 'CONFLICT'
@@ -296,6 +297,14 @@ const INSERT_SQL = `INSERT INTO ${TABLE_IDENTIFIER} (
 ) VALUES (${INSERT_VALUES})
 ON CONFLICT (id) DO NOTHING
 RETURNING ${COLUMN_LIST}`;
+
+/**
+ * 单条取数语句：**资源 ID 与归属同时命中**才返回（归属下推进 SQL，他人成果不出库）。
+ * 两个参数都走 `$n::uuid` 绑定；显式列清单，不使用 `SELECT *`。
+ */
+const SELECT_BY_ID_FOR_OWNER_SQL = `SELECT ${COLUMN_LIST}
+  FROM ${TABLE_IDENTIFIER}
+  WHERE id = $1::uuid AND user_id = $2::uuid`;
 
 /**
  * 按主体取数语句：主体走 `$1::uuid` 绑定，**归属下推进 SQL**（他人记录既不出库也不回流）；
@@ -639,6 +648,66 @@ export class PostgresAchievementRepository implements AchievementRepository {
   }
 
   /**
+   * 按「资源 ID + 服务端主体归属」取单条成果。
+   *
+   * - 两个标识都必须落在存储 ID 域内（UUID，规范小写形），否则 `INVALID_RECORD_ID` /
+   *   `INVALID_SUBJECT`，且**不访问数据库**；
+   * - 归属下推进 SQL：他人成果不会出库；未命中（不存在、或存在但不属于该主体）统一返回
+   *   `undefined`——调用方据此判 404，**不区分**「不存在」与「不是你的」，
+   *   避免用存在性探测他人成果；
+   * - 返回行必须通过严格行契约与读取契约，且**归属与主键**都必须等于请求的取值
+   *   （数据库回流出「他人记录」或 SQL 被改动时判服务端缺陷）；
+   * - 主键不唯一导致返回多行 → 结果集违约，fail-closed。
+   */
+  async findById(achievementId: string, ownerUserId: string): Promise<Achievement | undefined> {
+    const executor = this.usableExecutor();
+    const id = requireStorageUuid(
+      achievementId,
+      'INVALID_RECORD_ID',
+      '成果 ID 必须落在存储 ID 域内（合法且非空的 UUID）：非 UUID 的资源标识属于服务端缺陷，不得进入 SQL',
+      'achievementId',
+    );
+    const ownerId = requireStorageUuid(
+      ownerUserId,
+      'INVALID_SUBJECT',
+      '取数主体必须落在存储 ID 域内（合法且非空的 UUID）：非 UUID 的 userId 属于服务端缺陷，不得进入 SQL',
+      'userId',
+    );
+
+    const result = await executor.query(SELECT_BY_ID_FOR_OWNER_SQL, [id, ownerId]);
+
+    const rows = rowsOf(result);
+    if (rows.length === 0) {
+      return undefined;
+    }
+    if (rows.length > 1) {
+      throw new PostgresAchievementRepositoryError(
+        'RESULT_SET_VIOLATION',
+        '按资源 ID 取数返回了多行：主键唯一性被破坏',
+        ['id'],
+      );
+    }
+
+    const found = mapRow(rows[0]);
+    if (found.id !== id) {
+      throw new PostgresAchievementRepositoryError(
+        'IDENTITY_MISMATCH',
+        '返回记录的主键与请求的资源标识不一致（SQL 或数据库视图已被改动）',
+        ['id'],
+      );
+    }
+    if (found.userId !== ownerId) {
+      // 纵深防御：归属下推之外再复核一次，他人记录不得回流
+      throw new PostgresAchievementRepositoryError(
+        'OWNER_VIOLATION',
+        '返回记录的归属与请求取数的主体不一致（他人成果不得回流）',
+        ['user_id'],
+      );
+    }
+    return found;
+  }
+
+  /**
    * 按服务端主体取数（列表）。
    *
    * - 主体必须落在存储 ID 域内，否则 `INVALID_SUBJECT`，且不访问数据库；
@@ -710,8 +779,9 @@ export function assertPostgresAchievementSubject(userId: unknown): string {
  * 延迟后，判定顺序保持为「配置 → 持久化边界 / 依赖就绪 → 首次真正读写库」。
  *
  * 连接只在首次读写时建立并被复用；建立失败不缓存失败结果（下一次调用会重试）。
- * 主体域（写记录用严格记录契约）先判、再建连：非存储 ID 域的主体不会触发任何数据库连接，
- * 且**错误码与直接调用 adapter 完全一致**（读 `INVALID_SUBJECT`、写 `INVALID_RECORD`）。
+ * 存储 ID 域先判、再建连：非存储 ID 域的**资源标识**与主体（写记录用严格记录契约）都不会
+ * 触发任何数据库连接，且**错误码与直接调用 adapter 完全一致**
+ * （单条读取 `INVALID_RECORD_ID` / 读 `INVALID_SUBJECT` / 写 `INVALID_RECORD`）。
  */
 export function createLazyPostgresAchievementRepository(
   resolveExecutor: () => Promise<SqlExecutor>,
@@ -737,6 +807,18 @@ export function createLazyPostgresAchievementRepository(
       const writable = assertPostgresAchievementWritableRecord(achievement);
       const resolved = await executor();
       return new PostgresAchievementRepository(resolved).create(writable);
+    },
+    async findById(achievementId: string, ownerUserId: string): Promise<Achievement | undefined> {
+      // 两个标识都在进 SQL 之前判定，因此非法取值同样不会触发任何数据库连接
+      const id = requireStorageUuid(
+        achievementId,
+        'INVALID_RECORD_ID',
+        '成果 ID 必须落在存储 ID 域内（合法且非空的 UUID）：非 UUID 的资源标识属于服务端缺陷，不得进入 SQL',
+        'achievementId',
+      );
+      const ownerId = assertPostgresAchievementSubject(ownerUserId);
+      const resolved = await executor();
+      return new PostgresAchievementRepository(resolved).findById(id, ownerId);
     },
     async listByUserId(userId: string): Promise<readonly Achievement[]> {
       const ownerId = assertPostgresAchievementSubject(userId);

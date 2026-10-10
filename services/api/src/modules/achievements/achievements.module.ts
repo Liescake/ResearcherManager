@@ -18,9 +18,9 @@ import { AchievementsService } from './achievements.service';
 /**
  * 成果、附件与审核 模块（docs/P2-架构与数据设计.md §2 声明的边界）。
  *
- * 本切片只落地其中**成果的学生自服务部分**（创建本人成果 / 本人成果列表），
+ * 本切片只落地其中**成果的学生自服务部分**（创建本人成果 / 本人成果列表 / 本人成果单条读取），
  * 因此模块内目前只有 `achievements.*` 一组文件；附件实体、审核（`achievement:review`）、
- * 单条读取与更新、导出与统计属于后续切片，必须继续留在本模块内，不得跨模块直接调用。
+ * 更新与导出统计属于后续切片，必须继续留在本模块内，不得跨模块直接调用。
  *
  * 依赖方向（单向、无环，见 `access-control.module.spec.ts` 的模块图回归）：
  * `achievements → access-control（AuthorizationGuard）→ ruoyi-adapter（端口）→ authorization-policy`
@@ -49,7 +49,7 @@ import { AchievementsService } from './achievements.service';
  * 取夹具（未配置数据库时该令牌上就是这个内存实现）。
  *
  * 边界事实：本模块不含 RuoYi/Java 源码、不引入 Maven 依赖，也不改动 health / runtime-info /
- * education / profiles / memberships 等既有路由；对外只新增 `/me/achievements` 的两条路由。
+ * education / profiles / memberships / groups 等既有路由；对外只新增 `/me/achievements` 的三条路由。
  */
 export function createAchievementRepository(
   env: AppEnv,

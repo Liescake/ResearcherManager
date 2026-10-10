@@ -39,6 +39,7 @@ import {
   PostgresAchievementRepository,
   PostgresAchievementRepositoryError,
   assertPostgresAchievementRepositoryCapabilities,
+  createLazyPostgresAchievementRepository,
 } from './achievements.postgres-repository';
 
 /**
@@ -379,17 +380,21 @@ describe('PostgreSQL 成果仓储：repository 契约与能力声明', () => {
     expect(source).not.toContain('Inject(');
   });
 
-  it('端口只有 create + listByUserId 两个异步方法：无分页窗口、无单条读取（本切片边界）', () => {
+  it('端口方法集是 create + findById + listByUserId 三个异步方法，且仍无分页窗口（本切片边界）', () => {
     const source = readFileSync(PORT_PATH, 'utf8');
     const portStart = source.indexOf('export interface AchievementRepository {');
     expect(portStart).toBeGreaterThan(-1);
     const portBlock = source.slice(portStart);
 
     expect(portBlock).toContain('create(achievement: Achievement): Promise<Achievement>;');
+    // 单条读取是**资源级取数**：必须同时接收服务端主体，才能把归属下推进 SQL
+    // （只按资源 ID 命中会让归属判定退化成取数之后的复核，存在性因此可被探测）
+    expect(portBlock).toContain(
+      'findById(achievementId: string, ownerUserId: string): Promise<Achievement | undefined>;',
+    );
     expect(portBlock).toContain('listByUserId(userId: string): Promise<readonly Achievement[]>;');
-    // 单条读取（资源级取数）与分页窗口属于后续切片：端口不得预置用不上的参数，
+    // 列表分页窗口属于后续切片：端口不得预置用不上的参数，
     // 否则 service / 内存基线 / PostgreSQL 实现无法互换，切换存储那一步会被迫一次性改三处
-    expect(portBlock).not.toContain('findById');
     expect(portBlock).not.toMatch(/\b(?:window|limit|offset|page|cursor)\b/iu);
     // 旧的双契约（同步端口 + 并存的异步契约）已在本切片收敛为单一异步契约
     expect(source).not.toContain('AsyncAchievementRepository');
@@ -1022,6 +1027,130 @@ describe('PostgreSQL 成果仓储：归属隔离（他人记录既不出库也�
     expect(executor.calls[0]?.parameters).toEqual([OWNER_ID]);
   });
 
+  it('单条取数 SQL 必须同时带资源 ID 与归属谓词：只按 ID 命中就是「他人记录可探测」', async () => {
+    const executor = new RecordingExecutor([{ rows: [], rowCount: 0 }]);
+    await new PostgresAchievementRepository(executor).findById(ACHIEVEMENT_ID, OWNER_ID);
+
+    const sql = executor.calls[0]?.sql ?? '';
+    expect(sql).toContain('WHERE id = $1::uuid AND user_id = $2::uuid');
+    expect(sql).not.toContain('*');
+    expect(executor.calls[0]?.parameters).toEqual([ACHIEVEMENT_ID, OWNER_ID]);
+  });
+
+  it('单条取数未命中（不存在或不属于该主体）→ 返回 undefined，不抛错', async () => {
+    const missing = new RecordingExecutor([{ rows: [], rowCount: 0 }]);
+    await expect(
+      new PostgresAchievementRepository(missing).findById(ACHIEVEMENT_ID, OWNER_ID),
+    ).resolves.toBeUndefined();
+
+    // 「存在但不属于该主体」在 SQL 层同样只是「没有行」：两种情形不可区分
+    const notMine = new RecordingExecutor([{ rows: [], rowCount: 0 }]);
+    await expect(
+      new PostgresAchievementRepository(notMine).findById(OTHER_ACHIEVEMENT_ID, OWNER_ID),
+    ).resolves.toBeUndefined();
+  });
+
+  it('单条取数回流出他人归属 / 他人主键 → 分别 OWNER_VIOLATION / IDENTITY_MISMATCH', async () => {
+    const wrongOwner = new RecordingExecutor([
+      { rows: [rowFromRecord({ user_id: OTHER_OWNER_ID })], rowCount: 1 },
+    ]);
+    const ownerError = await captureRepoError(() =>
+      new PostgresAchievementRepository(wrongOwner).findById(ACHIEVEMENT_ID, OWNER_ID),
+    );
+    expect(ownerError.code).toBe('OWNER_VIOLATION');
+    expect(ownerError.issues).toEqual(['user_id']);
+    for (const value of [OWNER_ID, OTHER_OWNER_ID, ACHIEVEMENT.title]) {
+      expect(ownerError.message).not.toContain(value);
+    }
+
+    const wrongId = new RecordingExecutor([
+      { rows: [rowFromRecord({ id: OTHER_ACHIEVEMENT_ID })], rowCount: 1 },
+    ]);
+    const identityError = await captureRepoError(() =>
+      new PostgresAchievementRepository(wrongId).findById(ACHIEVEMENT_ID, OWNER_ID),
+    );
+    expect(identityError.code).toBe('IDENTITY_MISMATCH');
+    expect(identityError.issues).toEqual(['id']);
+    expect(identityError.message).not.toContain(OTHER_ACHIEVEMENT_ID);
+    expect(identityError.message).not.toContain(ACHIEVEMENT_ID);
+  });
+
+  it('单条取数返回多行 → RESULT_SET_VIOLATION（主键唯一性被破坏，不得任选一行）', async () => {
+    const executor = new RecordingExecutor([
+      { rows: [rowFromRecord(), rowFromRecord()], rowCount: 2 },
+    ]);
+    const error = await captureRepoError(() =>
+      new PostgresAchievementRepository(executor).findById(ACHIEVEMENT_ID, OWNER_ID),
+    );
+
+    expect(error.code).toBe('RESULT_SET_VIOLATION');
+    expect(error.issues).toEqual(['id']);
+  });
+
+  it('单条取数的资源 ID 与主体都必须在存储 ID 域内，非法取值在进入 SQL 之前被拒绝', async () => {
+    const executor = new RecordingExecutor([{ rows: [rowFromRecord()], rowCount: 1 }]);
+    const repository = new PostgresAchievementRepository(executor);
+
+    for (const [label, achievementId] of [
+      ['缺失', undefined],
+      ['空串', ''],
+      ['空 UUID', '00000000-0000-0000-0000-000000000000'],
+      ['非 UUID', 'a-1'],
+      ['大写规范形', HEX_OWNER_ID_UPPER],
+      ['混合大小写', HEX_OWNER_ID_MIXED],
+      ['注入载荷', `${ACHIEVEMENT_ID}' OR 1=1 --`],
+    ] as const) {
+      const error = await captureRepoError(() =>
+        repository.findById(achievementId as string, OWNER_ID),
+      );
+      expect(error.code, label).toBe('INVALID_RECORD_ID');
+      expect(error.issues, label).toEqual(['achievementId']);
+      // 错误信息不得回显非法取值本身
+      if (achievementId) expect(error.message).not.toContain(achievementId);
+    }
+
+    for (const [label, userId] of [
+      ['空 UUID', '00000000-0000-0000-0000-000000000000'],
+      ['非 UUID', 'u-student-1'],
+      ['大写规范形', HEX_OWNER_ID_UPPER],
+      ['注入载荷', `${OWNER_ID}' OR 1=1 --`],
+    ] as const) {
+      const error = await captureRepoError(() => repository.findById(ACHIEVEMENT_ID, userId));
+      expect(error.code, label).toBe('INVALID_SUBJECT');
+      expect(error.issues, label).toEqual(['userId']);
+      expect(error.message).not.toContain(userId);
+    }
+
+    // 非法取值一次数据库访问都没有产生（fail-closed 发生在建连 / 发 SQL 之前）
+    expect(executor.calls).toHaveLength(0);
+  });
+
+  it('规范小写 UUID 的资源 ID 与主体可以正常单条取数（大小写约束不是「拒绝一切」）', async () => {
+    const executor = new RecordingExecutor([
+      { rows: [rowFromRecord({ id: ACHIEVEMENT_ID, user_id: HEX_OWNER_ID })], rowCount: 1 },
+    ]);
+    const found = await new PostgresAchievementRepository(executor).findById(
+      ACHIEVEMENT_ID,
+      HEX_OWNER_ID,
+    );
+
+    expect(found?.id).toBe(ACHIEVEMENT_ID);
+    expect(executor.calls[0]?.parameters).toEqual([ACHIEVEMENT_ID, HEX_OWNER_ID]);
+  });
+
+  it('延迟建连实现先判存储 ID 域、再建连：非法资源 ID 不会触发任何数据库连接', async () => {
+    let connects = 0;
+    const repository = createLazyPostgresAchievementRepository(async () => {
+      connects += 1;
+      return new RecordingExecutor();
+    });
+
+    const error = await captureRepoError(() => repository.findById('a-1', OWNER_ID));
+
+    expect(error.code).toBe('INVALID_RECORD_ID');
+    expect(connects).toBe(0);
+  });
+
   it('列表里混入他人记录 → OWNER_VIOLATION（整批 fail-closed，不静默过滤也不返回）', async () => {
     const executor = new RecordingExecutor([
       {
@@ -1306,17 +1435,32 @@ describe('PostgreSQL 成果仓储：公开视图与错误信息（不泄露归�
         new PostgresAchievementRepository(
           new RecordingExecutor([{ rows: [rowFromRecord()], rowCount: 1 }]),
         ).listByUserId(`${OWNER_ID}' OR 1=1 --`),
+      // 单条读取：回流出他人归属
+      () =>
+        new PostgresAchievementRepository(
+          new RecordingExecutor([
+            { rows: [rowFromRecord({ user_id: OTHER_OWNER_ID })], rowCount: 1 },
+          ]),
+        ).findById(ACHIEVEMENT_ID, OWNER_ID),
+      // 单条读取：资源 ID 非法（注入载荷）
+      () =>
+        new PostgresAchievementRepository(
+          new RecordingExecutor([{ rows: [rowFromRecord()], rowCount: 1 }]),
+        ).findById(`${ACHIEVEMENT_ID}' OR 1=1 --`, OWNER_ID),
     ];
 
     const secrets = [
       OWNER_ID,
       OTHER_OWNER_ID,
+      ACHIEVEMENT_ID,
+      OTHER_ACHIEVEMENT_ID,
       ACHIEVEMENT.title,
       ACHIEVEMENT.description ?? '',
       ACHIEVEMENT.awardLevel ?? '',
       ACHIEVEMENT.evidenceFileId ?? '',
       longTitle,
       `${OWNER_ID}' OR 1=1 --`,
+      `${ACHIEVEMENT_ID}' OR 1=1 --`,
       'DROP TABLE',
     ];
 
@@ -1492,6 +1636,9 @@ describe('PostgreSQL 成果仓储：按配置绑定、无驱动依赖、与 sche
     expect(source).toContain('persistent: false');
     expect(source).toContain('productionReady: false');
     expect(source).toContain('async create(achievement: Achievement): Promise<Achievement>');
+    expect(source).toContain(
+      'async findById(achievementId: string, ownerUserId: string): Promise<Achievement | undefined>',
+    );
     expect(source).toContain('async listByUserId(userId: string): Promise<readonly Achievement[]>');
   });
 
@@ -1499,10 +1646,14 @@ describe('PostgreSQL 成果仓储：按配置绑定、无驱动依赖、与 sche
     const source = readApiFile(join('src', 'modules', 'achievements', 'achievements.port.ts'));
     expect(source).toContain('export interface AchievementRepository {');
     expect(source).toContain('create(achievement: Achievement): Promise<Achievement>;');
+    expect(source).toContain(
+      'findById(achievementId: string, ownerUserId: string): Promise<Achievement | undefined>;',
+    );
     expect(source).toContain('listByUserId(userId: string): Promise<readonly Achievement[]>;');
     // 旧的「同步端口」与并存的 `AsyncAchievementRepository` 已收敛：只允许一个端口声明
     expect(source).not.toContain('AsyncAchievementRepository');
     expect(source).not.toContain('create(achievement: Achievement): Achievement;');
+    expect(source).not.toContain('findById(achievementId: string): Achievement | undefined;');
     expect(source).not.toContain('listByUserId(userId: string): readonly Achievement[];');
   });
 });

@@ -36,13 +36,14 @@ import { AchievementsModule, createAchievementRepository } from './achievements.
 /**
  * 成果切片（`/me/achievements`）的真实 HTTP 回归：
  *
- * - 成功：本人创建 / 本人列表；归属、审核态与时间戳由服务端决定，响应不含 `userId`；
+ * - 成功：本人创建 / 本人列表 / 本人单条读取；归属、审核态与时间戳由服务端决定，响应不含 `userId`；
  * - 输入拒绝 400：未知类型枚举、空/超长标题、控制字符、非法取得时间、非 UUID 佐证文件 ID、
  *   说明含身份证号/密钥/长数字标识，以及未声明字段（客户端 `userId`/`roles`/`scope`/`groupId`/
  *   `reviewStatus`/`id`/时间戳一律 400，给出可区分的拒绝原因）；
  * - 认证 401：无凭证、scheme 不对、凭证过短、会话不存在、会话主体含未登记角色（fail-closed）；
  * - 越权 403：角色无该权限点（admin）、角色虽有权限点但范围不是 SELF（group_leader）、
  *   且授权**先于仓储访问**（拒绝时仓储方法零调用）；判定入参只来自服务端（断言端口调用参数）；
+ *   单条读取中**他人成果与不存在的成果一律 404**（归属下推到取数，存在性不可探测）；
  * - claims 伪造：请求体注入归属/角色/范围/小组、自定义头注入 `x-user-id`/`x-roles`/`x-scope`/
  *   `x-group-id` 均不影响主体与归属；
  * - fail-closed 500：存储层出现未登记枚举、非法时间戳、他人归属时不得作为正常输出返回，
@@ -288,6 +289,54 @@ describe('成果：成功路径（真实 HTTP + 统一响应信封）', () => {
     expect(list.text).not.toContain('u-student-2');
   });
 
+  it('本人单条读取：200、返回读取视图（不含 userId）；他人成果与不存在的成果一律 404', async () => {
+    const { baseUrl, repository } = await startAchievementsApp();
+    const mine = await repository.create(
+      fixtureAchievement({ userId: 'u-student-1', title: '本人成果' }),
+    );
+    const others = await repository.create(
+      fixtureAchievement({ userId: 'u-student-2', title: '他人成果' }),
+    );
+
+    const res = await call(baseUrl, 'GET', `/me/achievements/${mine.id}`, {
+      headers: { ...bearer(SESSION_STUDENT_1), 'x-request-id': 'test-request-achievement-detail' },
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.error).toBeNull();
+    expect(res.body.meta.requestId).toBe('test-request-achievement-detail');
+    const data = res.body.data as Record<string, unknown>;
+    expect(data.id).toBe(mine.id);
+    expect(data.title).toBe('本人成果');
+    // 视图字段闭集：没有 userId，也没有审核人/审核意见/审核时间等内部处理字段
+    expect(Object.keys(data).sort()).toEqual([
+      'createdAt',
+      'id',
+      'reviewStatus',
+      'title',
+      'type',
+      'updatedAt',
+    ]);
+    expect(res.text).not.toContain('u-student-1');
+
+    // 他人成果：与「不存在」完全同一响应（归属下推到取数，存在性不可探测）
+    const foreign = await call(baseUrl, 'GET', `/me/achievements/${others.id}`, {
+      headers: bearer(SESSION_STUDENT_1),
+    });
+    expect(foreign.status).toBe(404);
+    expect(foreign.body.data).toBeNull();
+    expect(foreign.body.error?.code).toBe('NOT_FOUND');
+    expect(foreign.text).not.toContain('他人成果');
+    expect(foreign.text).not.toContain('u-student-2');
+
+    // 不存在的成果：同一 404 口径（不区分「不存在」与「不是你的」）
+    const missing = await call(baseUrl, 'GET', `/me/achievements/${randomUUID()}`, {
+      headers: bearer(SESSION_STUDENT_1),
+    });
+    expect(missing.status).toBe(404);
+    expect(missing.body.error?.code).toBe('NOT_FOUND');
+  });
+
   it('自定义头里的归属/角色/范围声明不参与任何判定（claims 伪造无效）', async () => {
     const { baseUrl, repository } = await startAchievementsApp();
 
@@ -478,6 +527,7 @@ describe('成果：越权 403（AuthorizationGuard + 服务端常量判定入参
     const { app, baseUrl, repository } = await startAchievementsApp();
     const listSpy = vi.spyOn(repository, 'listByUserId');
     const createSpy = vi.spyOn(repository, 'create');
+    const findSpy = vi.spyOn(repository, 'findById');
     // 注意：仓储实例由 DI 提供，这里直接对同一实例打桩，只观察「是否被调用」
     expect(app.get(ACHIEVEMENT_REPOSITORY)).toBe(repository);
 
@@ -492,8 +542,67 @@ describe('成果：越权 403（AuthorizationGuard + 服务端常量判定入参
     });
     expect(write.status).toBe(403);
 
+    const detail = await call(baseUrl, 'GET', `/me/achievements/${randomUUID()}`, {
+      headers: bearer(SESSION_ADMIN_1),
+    });
+    expect(detail.status).toBe(403);
+
     expect(listSpy).not.toHaveBeenCalled();
     expect(createSpy).not.toHaveBeenCalled();
+    expect(findSpy).not.toHaveBeenCalled();
+  });
+
+  it('单条读取：非法 ID → 400（授权通过后才判形状，不进仓储）；admin → 403', async () => {
+    const { baseUrl, repository } = await startAchievementsApp();
+    const findSpy = vi.spyOn(repository, 'findById');
+
+    const malformed = await call(baseUrl, 'GET', '/me/achievements/not-a-uuid', {
+      headers: bearer(SESSION_STUDENT_1),
+    });
+    expect(malformed.status).toBe(400);
+    expect(malformed.body.data).toBeNull();
+    expect(malformed.body.error?.code).toBe('VALIDATION_FAILED');
+    expect(findSpy).not.toHaveBeenCalled();
+
+    const forbidden = await call(baseUrl, 'GET', `/me/achievements/${randomUUID()}`, {
+      headers: bearer(SESSION_ADMIN_1),
+    });
+    expect(forbidden.status).toBe(403);
+    expect(forbidden.body.error?.code).toBe('FORBIDDEN');
+    // 越权先于输入校验与任何取数
+    expect(findSpy).not.toHaveBeenCalled();
+  });
+
+  it('判定入参只来自服务端：单条读取用 achievement:self:read + SELF + 会话主体，与路径 ID 无关', async () => {
+    const { app, baseUrl, repository } = await startAchievementsApp();
+    const others = await repository.create(
+      fixtureAchievement({ userId: 'u-student-2', title: '他人成果' }),
+    );
+    const adapter = app.get<RuoYiAuthzAdapter>(RUOYI_AUTHZ_ADAPTER);
+    const checkAuthorization = vi.spyOn(adapter, 'checkAuthorization');
+
+    const res = await call(baseUrl, 'GET', `/me/achievements/${others.id}?userId=u-victim-1`, {
+      headers: {
+        ...bearer(SESSION_STUDENT_1),
+        'x-user-id': 'u-victim-1',
+        'x-roles': Role.SuperAdmin,
+        'x-scope': DataScope.Global,
+        'x-group-id': 'g-1',
+      },
+    });
+
+    expect(res.status).toBe(404);
+    expect(checkAuthorization).toHaveBeenCalledWith(
+      { userId: 'u-student-1', roles: [Role.Student] },
+      {
+        permission: PermissionPoint.AchievementSelfRead,
+        scope: DataScope.Self,
+        resourceUserId: 'u-student-1',
+      },
+    );
+    expect(JSON.stringify(checkAuthorization.mock.calls)).not.toContain('u-victim-1');
+    expect(res.text).not.toContain('u-victim-1');
+    expect(res.text).not.toContain('他人成果');
   });
 
   it('判定入参只来自服务端：列表用 achievement:self:read + SELF + 会话主体', async () => {
@@ -604,6 +713,45 @@ describe('成果：未知枚举与存储异常 fail-closed（不得当正常输�
     expect(res.body.error?.code).toBe('INTERNAL_ERROR');
     expect(res.text).not.toContain('他人成果');
     expect(res.text).not.toContain('u-student-2');
+  });
+
+  it('单条读取：仓储漏过滤归属（返回他人记录）→ 403 归属二次授权（纵深防御，不当作本人成果返回）', async () => {
+    vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const { baseUrl, repository } = await startAchievementsApp();
+    const others = fixtureAchievement({ userId: 'u-student-2', title: '他人成果' });
+    vi.spyOn(repository, 'findById').mockResolvedValue(others);
+
+    const res = await call(baseUrl, 'GET', `/me/achievements/${others.id}`, {
+      headers: bearer(SESSION_STUDENT_1),
+    });
+
+    expect(res.status).toBe(403);
+    expect(res.body.data).toBeNull();
+    expect(res.body.error?.code).toBe('FORBIDDEN');
+    expect(res.text).not.toContain('他人成果');
+    expect(res.text).not.toContain('u-student-2');
+  });
+
+  it('单条读取：记录损坏（未知枚举）→ 500，且不泄露标题与归属', async () => {
+    vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const { baseUrl, repository } = await startAchievementsApp();
+    const corrupted = fixtureAchievement({
+      userId: 'u-student-1',
+      type: 'unknown_type' as AchievementType,
+      title: '受损成果标题',
+    });
+    vi.spyOn(repository, 'findById').mockResolvedValue(corrupted);
+
+    const res = await call(baseUrl, 'GET', `/me/achievements/${corrupted.id}`, {
+      headers: bearer(SESSION_STUDENT_1),
+    });
+
+    expect(res.status).toBe(500);
+    expect(res.body.data).toBeNull();
+    expect(res.body.error?.code).toBe('INTERNAL_ERROR');
+    expect(res.text).not.toContain('unknown_type');
+    expect(res.text).not.toContain('受损成果标题');
+    expect(res.text).not.toContain('u-student-1');
   });
 
   it('创建回写记录损坏（未知枚举）→ 500，且不泄露标题', async () => {

@@ -1,6 +1,11 @@
 import 'reflect-metadata';
 import { randomUUID } from 'node:crypto';
-import { ForbiddenException, InternalServerErrorException, Logger } from '@nestjs/common';
+import {
+  ForbiddenException,
+  InternalServerErrorException,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import { AchievementType, DataScope, ReviewStatus, Role, achievementInputSchema } from '@rm/shared';
 import { ZodError } from 'zod';
 import { describe, expect, it, vi } from 'vitest';
@@ -14,8 +19,8 @@ import { AchievementsService } from './achievements.service';
 
 /**
  * 成果服务层回归（不启 HTTP）：把「判定入参来自服务端」「授权先于仓储访问」
- * 「未知枚举 fail-closed」「仓储越界取数不当作正常输出」四条约束固定在 service 这一层，
- * 避免它们只靠 HTTP 用例间接覆盖。
+ * 「未知枚举 fail-closed」「仓储越界取数不当作正常输出」「单条读取把归属下推到取数」
+ * 五条约束固定在 service 这一层，避免它们只靠 HTTP 用例间接覆盖。
  *
  * 端口是**异步契约**（内存基线与 PostgreSQL 实现同签名），因此这里也断言「先授权、后 await 取数」
  * 的顺序事实：授权拒绝时仓储方法一次都不被调用。
@@ -34,11 +39,12 @@ class StubAchievementRepository implements AchievementRepository {
 
   readonly created: Achievement[] = [];
   createCalls = 0;
+  findCalls = 0;
   listCalls = 0;
   /** 供用例模拟「仓储未按主体过滤 / 数据被外部改写」的越界返回 */
   listOverride: readonly Achievement[] | undefined;
 
-  private readonly records = new Map<string, Achievement>();
+  protected readonly records = new Map<string, Achievement>();
 
   constructor(seed: readonly Achievement[] = []) {
     for (const record of seed) this.records.set(record.id, record);
@@ -51,10 +57,35 @@ class StubAchievementRepository implements AchievementRepository {
     return Promise.resolve(achievement);
   }
 
+  /** 与端口契约一致：只返回「资源 ID 与归属同时命中」的记录 */
+  findById(achievementId: string, ownerUserId: string): Promise<Achievement | undefined> {
+    this.findCalls += 1;
+    const found = this.records.get(achievementId);
+    return Promise.resolve(found && found.userId === ownerUserId ? found : undefined);
+  }
+
   listByUserId(userId: string): Promise<readonly Achievement[]> {
     this.listCalls += 1;
     if (this.listOverride) return Promise.resolve(this.listOverride);
     return Promise.resolve([...this.records.values()].filter((record) => record.userId === userId));
+  }
+}
+
+/**
+ * **异常仓储**：无视传入的主体，把命中的记录原样返回。
+ *
+ * 用来验证 service 的**归属二次授权**（纵深防御）：即使仓储没按主体过滤，
+ * 他人记录也不会被当成正常输出返回。
+ */
+class OwnerLeakingAchievementRepository extends StubAchievementRepository {
+  override findById(achievementId: string, _ownerUserId: string): Promise<Achievement | undefined> {
+    return Promise.resolve(this.records.get(achievementId));
+  }
+
+  override listByUserId(userId: string): Promise<readonly Achievement[]> {
+    // 连列表也“泄露”：不过滤归属
+    void userId;
+    return Promise.resolve([...this.records.values()]);
   }
 }
 
@@ -144,6 +175,67 @@ describe('AchievementsService：主体与归属只来自服务端', () => {
     expect(JSON.stringify(items)).not.toContain('u-student-2');
   });
 
+  it('单条读取：按「资源 ID + 服务端主体」取数，返回读取视图（不含 userId）', async () => {
+    const mine = record({ userId: 'u-student-1', title: '本人成果' });
+    const repository = new StubAchievementRepository([mine]);
+    const service = serviceWith(repository);
+
+    const view = await service.getMyAchievement(student, mine.id);
+
+    expect(repository.findCalls).toBe(1);
+    expect(view.id).toBe(mine.id);
+    expect(view.title).toBe('本人成果');
+    expect(Object.keys(view)).not.toContain('userId');
+    expect(JSON.stringify(view)).not.toContain('u-student-1');
+  });
+
+  it('单条读取：他人成果 → 404（归属下推到取数），不区分「不存在」，也不泄露内容与归属', async () => {
+    const others = record({ userId: 'u-student-2', title: '他人成果' });
+    const repository = new StubAchievementRepository([others]);
+    const service = serviceWith(repository);
+
+    const error = await captureError(async () => service.getMyAchievement(student, others.id));
+
+    // 「不存在」与「存在但不属于该主体」在端口层不可区分：统一 404，
+    // 因此他人成果的存在性不可探测
+    expect(error).toBeInstanceOf(NotFoundException);
+    expect((error as NotFoundException).getStatus()).toBe(404);
+    const serialized = JSON.stringify((error as NotFoundException).getResponse());
+    expect(serialized).not.toContain('他人成果');
+    expect(serialized).not.toContain('u-student-2');
+  });
+
+  it('单条读取：不存在的成果同样 404（与「不是你的」共用同一响应）', async () => {
+    const service = serviceWith(new StubAchievementRepository());
+
+    const error = await captureError(async () => service.getMyAchievement(student, randomUUID()));
+
+    expect(error).toBeInstanceOf(NotFoundException);
+    expect((error as NotFoundException).getStatus()).toBe(404);
+  });
+
+  it('单条读取：仓储未按主体过滤（返回他人记录）→ 归属二次授权 403（纵深防御）', async () => {
+    const others = record({ userId: 'u-student-2', title: '他人成果' });
+    const service = serviceWith(new OwnerLeakingAchievementRepository([others]));
+
+    const error = await captureError(async () => service.getMyAchievement(student, others.id));
+
+    expect(error).toBeInstanceOf(ForbiddenException);
+    expect((error as ForbiddenException).getStatus()).toBe(403);
+    expect(JSON.stringify(error)).not.toContain('他人成果');
+    expect(JSON.stringify(error)).not.toContain('u-student-2');
+  });
+
+  it('单条读取：非法成果 ID → ZodError，且不进仓储、不做归属判定', async () => {
+    const repository = new StubAchievementRepository([record()]);
+    const service = serviceWith(repository);
+
+    expect(
+      await captureError(async () => service.getMyAchievement(student, 'not-a-uuid')),
+    ).toBeInstanceOf(ZodError);
+    expect(repository.findCalls).toBe(0);
+  });
+
   it('授权先于仓储访问：端口拒绝时仓储的读写方法一次都不被调用', async () => {
     const denying: RuoYiAuthzAdapter = {
       capabilities: new BaselineRuoYiAuthzAdapter(policy).capabilities,
@@ -162,9 +254,15 @@ describe('AchievementsService：主体与归属只来自服务端', () => {
     expect(
       await captureError(async () => service.createMyAchievement(student, { ...validBody })),
     ).toBeInstanceOf(ForbiddenException);
+    expect(
+      await captureError(async () =>
+        service.getMyAchievement(student, '11111111-1111-4111-8111-111111111111'),
+      ),
+    ).toBeInstanceOf(ForbiddenException);
 
     expect(repository.listCalls).toBe(0);
     expect(repository.createCalls).toBe(0);
+    expect(repository.findCalls).toBe(0);
     expect(repository.created).toHaveLength(0);
   });
 });
@@ -305,5 +403,25 @@ describe('AchievementsService：存储异常 fail-closed', () => {
     const serialized = JSON.stringify(error);
     expect(serialized).not.toContain('他人成果');
     expect(serialized).not.toContain('u-student-2');
+  });
+
+  it('单条读取：存储记录损坏（未登记枚举）→ 500，且不泄露标题与归属', async () => {
+    vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const corrupted = record({
+      userId: 'u-student-1',
+      type: 'unknown_type' as AchievementType,
+      title: '受损成果标题',
+    });
+    const service = serviceWith(new StubAchievementRepository([corrupted]));
+
+    const error = await captureError(async () => service.getMyAchievement(student, corrupted.id));
+
+    expect(error).toBeInstanceOf(InternalServerErrorException);
+    expect((error as InternalServerErrorException).getStatus()).toBe(500);
+    expect((error as InternalServerErrorException).message).toBe(ACHIEVEMENT_INTEGRITY_MESSAGE);
+    const serialized = JSON.stringify(error);
+    expect(serialized).not.toContain('unknown_type');
+    expect(serialized).not.toContain('受损成果标题');
+    expect(serialized).not.toContain('u-student-1');
   });
 });

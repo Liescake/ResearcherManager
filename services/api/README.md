@@ -71,10 +71,10 @@ NestJS API 服务：**唯一业务规则入口**，前端不直接访问数据�
     结果通知、幂等键、审计落库、列表分页与排序。
 - **成果切片（`achievements`，学生自服务）**：`src/modules/achievements/`（该模块即
   docs/P2-架构与数据设计.md §2 声明的「成果、附件与审核」边界，本切片只落地成果自服务）：
-  - 路由：`POST/GET /api/v1/me/achievements`
+  - 路由：`POST/GET /api/v1/me/achievements` 与 `GET /api/v1/me/achievements/{achievementId}`
     （权限点 `achievement:self:create` / `achievement:self:read`，数据范围固定 `SELF`；
-    单条读取、更新 `PATCH /me/achievements/{id}`（`achievement:self:update`）、审核
-    （`achievement:review`）、附件实体校验、导出与统计不在本切片）；
+    更新 `PATCH /me/achievements/{id}`（`achievement:self:update`）、审核（`achievement:review`）、
+    附件实体校验、导出与统计不在本切片）；
   - 请求校验：`@rm/shared` 的 `achievementInputSchema`（未知类型枚举、空/超长标题、控制字符、
     `achievedAt` 非法时间、`evidenceFileId` 非 UUID、说明含身份证号/密钥/长数字标识
     → 400 `VALIDATION_FAILED` + 字段路径）；另有**字段闭集**：请求体出现 `userId`/`roles`/
@@ -84,14 +84,20 @@ NestJS API 服务：**唯一业务规则入口**，前端不直接访问数据�
     `reviewStatus`/时间戳只由服务端写入（入口恒为共享审核态的 `pending`，自授权通过审核需要
     `achievement:review`）；自定义头（`x-user-id`/`x-roles`/`x-scope`/`x-group-id`）与请求体
     一样不进入任何判定；
-  - 授权：两条路由都先经 `AuthorizationGuard`（`RUOYI_AUTHZ_ADAPTER` 端口），
+  - 授权：三条路由都先经 `AuthorizationGuard`（`RUOYI_AUTHZ_ADAPTER` 端口），
     **先于任何仓储访问**——缺权限点（如 `admin`）或权限点存在但范围不是 `SELF`
     （如 `group_leader` 的 `achievement:self:read` 只在 `GROUP` 范围生效）都得到同一个 403，
     且拒绝时仓储方法一次都不被调用；
+  - 单条读取（`GET /me/achievements/{achievementId}`）的判定顺序：**先行 SELF 授权**
+    （`resourceUserId` = 会话主体，不访问存储）→ 路径参数按共享 `uuidSchema` 判形状（非法 400）
+    → `findById(achievementId, 会话主体)` 把**归属下推到取数**
+    （PostgreSQL 侧 `WHERE id = $1::uuid AND user_id = $2::uuid`，他人成果根本不出库）
+    → 归属二次授权（纵深防御）。因此「成果不存在」与「成果不属于该主体」**统一 404**、
+    不可区分，他人成果的存在性无法被探测；
   - 输出：对外视图不含 `userId`，也不含审核人/审核意见/审核时间/审计事件 ID；读取契约仍校验
     存储形状（枚举闭集 + ISO 时间格式），并额外复核**记录归属与会话主体一致**，
     违者 500 且不泄露字段取值（损坏与越界取数共用同一文案，调用方无法区分内部原因）；
-  - 尚不包含：单条读取、更新与撤回、审核状态流转、附件实体（本切片只校验 `evidenceFileId`
+  - 尚不包含：更新与撤回、审核状态流转、附件实体（本切片只校验 `evidenceFileId`
     的 UUID 形状，不校验文件是否存在）、幂等键、审计落库、列表分页与排序。
 - **小组切片（`groups`，浏览与创建）**：`src/modules/groups/`（该模块即
   docs/P2-架构与数据设计.md §2 声明的「小组资料、开放状态与招募要求」边界）：
@@ -144,7 +150,7 @@ NestJS API 服务：**唯一业务规则入口**，前端不直接访问数据�
 
 **未包含**：数据库连接、微信登录、RuoYi RBAC 实现，以及升学记录/学生画像/入组申请/成果/小组之外的其他业务接口
 （画像首次提交锁定与管理员代改、升学记录的状态流转/审核、更新与撤回、升学率统计、入组申请的审核与
-退组、成员关系联动、小组存在性与招募状态校验、小组详情与修改/停用、小组成员与负责人指派、成果的单条读取/
+退组、成员关系联动、小组存在性与招募状态校验、小组详情与修改/停用、小组成员与负责人指派、成果的
 更新/审核与附件实体、列表分页与排序、所有写接口的幂等键与审计落库）。它们属于后续切片。
 
 ## 命令

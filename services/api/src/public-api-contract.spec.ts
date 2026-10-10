@@ -93,6 +93,7 @@ const DECLARED_ROUTES: readonly DeclaredRoute[] = [
   { method: 'POST', path: '/me/education-records', anonymousStatus: 401 },
   { method: 'GET', path: `/me/education-records/${SAMPLE_ID}`, anonymousStatus: 401 },
   { method: 'GET', path: '/me/achievements', anonymousStatus: 401 },
+  { method: 'GET', path: `/me/achievements/${SAMPLE_ID}`, anonymousStatus: 401 },
   { method: 'POST', path: '/me/achievements', anonymousStatus: 401 },
   { method: 'GET', path: '/me/statistics', anonymousStatus: 401 },
   { method: 'GET', path: '/me/applications', anonymousStatus: 401 },
@@ -137,7 +138,9 @@ const UNREGISTERED_SHAPES: readonly { readonly method: HttpMethod; readonly path
   { method: 'PATCH', path: '/me/achievements' },
   { method: 'PUT', path: '/me/achievements' },
   { method: 'DELETE', path: '/me/achievements' },
-  { method: 'GET', path: `/me/achievements/${SAMPLE_ID}` },
+  // 单条读取已声明（见正例）；同一路径的更新仍未实现，必须继续是 404 而不是被详情路由吸收
+  { method: 'PATCH', path: `/me/achievements/${SAMPLE_ID}` },
+  { method: 'PUT', path: `/me/achievements/${SAMPLE_ID}` },
   { method: 'POST', path: '/me/statistics' },
   { method: 'PATCH', path: '/me/statistics' },
   { method: 'DELETE', path: '/me/statistics' },

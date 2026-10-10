@@ -1,6 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { Inject, Injectable, InternalServerErrorException, Logger } from '@nestjs/common';
-import { DataScope, PermissionPoint, achievementInputSchema } from '@rm/shared';
+import {
+  Inject,
+  Injectable,
+  InternalServerErrorException,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
+import { DataScope, PermissionPoint, achievementInputSchema, uuidSchema } from '@rm/shared';
 import type { AuthorizationSubject } from '@rm/shared';
 import { AuthorizationGuard } from '../access-control/authorization-guard';
 import {
@@ -17,15 +23,16 @@ import type { Achievement, AchievementRepository } from './achievements.port';
 
 /**
  * 成果切片（P5 最小垂直切片，学生自服务部分）：
- * - `GET  /me/achievements`  本人成果列表（`achievement:self:read`）
- * - `POST /me/achievements`  创建本人成果（`achievement:self:create`）
+ * - `GET  /me/achievements`              本人成果列表（`achievement:self:read`）
+ * - `GET  /me/achievements/{id}`         本人成果单条（`achievement:self:read`，按资源归属判定）
+ * - `POST /me/achievements`              创建本人成果（`achievement:self:create`）
  *
  * 四条硬约束：
  * 1. **主体与归属都来自服务端**：`userId` 取自会话主体，`reviewStatus` 由服务端常量写入
  *    （恒为 pending），权限点与数据范围是服务端常量 `SELF`；客户端提交的
  *    `userId`/`roles`/`scope`/`groupId`/`reviewStatus` 既不能进入判定，也不能落库——
  *    它们由输入闭集直接拒绝（400），不是静默剥离。
- * 2. **授权先于任何仓储访问**：两条路由都先经 `AuthorizationGuard`（其下是
+ * 2. **授权先于任何仓储访问**：三条路由都先经 `AuthorizationGuard`（其下是
  *    `RUOYI_AUTHZ_ADAPTER` 端口 → canonical 谓词），拒绝即 403；`scope` 恒为服务端常量 `SELF`，
  *    `resourceUserId` 取会话主体。未授权主体既观察不到成果是否存在，也拿不到字段级校验反馈。
  * 3. **请求字段闭集**：只接受共享 `achievementInputSchema` 的字段
@@ -36,7 +43,16 @@ import type { Achievement, AchievementRepository } from './achievements.port';
  *    与会话主体一致**，违反者按服务端缺陷 500 处理（仓储未按主体过滤即属此类），
  *    不允许把未知枚举或他人记录当成正常输出返回。
  *
- * 尚不包含（明确留给后续切片）：单条读取、更新（`achievement:self:update`）、
+ * ## 单条读取的判定顺序与 403 / 404 口径（与 education 切片同口径）
+ * 1. **先行 SELF 授权**（`resourceUserId` = 会话主体）：未授权主体连「是否存在该资源」都
+ *    观察不到（403）；
+ * 2. **取数**：`findById(achievementId, subject.userId)` 把归属下推进仓储（PostgreSQL 侧是
+ *    `WHERE id = $1 AND user_id = $2::uuid`），因此**他人成果根本不出库**；未命中（不存在，
+ *    或存在但不属于该主体）统一 404 —— 两者**不可区分**，无法用于存在性探测；
+ * 3. **归属二次授权（纵深防御）**：仓储返回的记录仍要按**存储归属**再判一次 SELF；异常实现
+ *    或数据被外部改写时由同一 guard 拒绝，与第 1 步文案一致。
+ *
+ * 尚不包含（明确留给后续切片）：更新（`achievement:self:update`）、
  * 审核（`achievement:review`，含审核人/意见/时间落库）、附件实体校验、
  * 幂等键与审计落库、列表分页与排序。
  *
@@ -62,6 +78,34 @@ export class AchievementsService {
     this.authorizeSelf(subject, PermissionPoint.AchievementSelfRead);
     const records = await this.repository.listByUserId(subject.userId);
     return records.map((record) => this.toView(record, subject.userId));
+  }
+
+  /**
+   * 本人成果单条读取：**先授权、再把归属下推到取数**。
+   *
+   * 判定顺序（被测试固定）：
+   * 1. 先行 SELF 授权（`resourceUserId` = 会话主体），拒绝即 403，且不访问存储；
+   * 2. 路径参数先按共享 `uuidSchema` 判形状（非法 → 400，不进仓储）；
+   * 3. `findById(id, subject.userId)`：归属下推到仓储，他人成果不出库；未命中统一 404
+   *    （「不存在」与「不是你的」不可区分）；
+   * 4. 归属二次授权：判定入参取自**存储归属**（不是请求体、也不是会话主体），
+   *    仓储未按主体过滤时由同一 guard 拒绝。
+   */
+  async getMyAchievement(
+    subject: AuthorizationSubject,
+    achievementId: string,
+  ): Promise<AchievementView> {
+    this.authorizeSelf(subject, PermissionPoint.AchievementSelfRead);
+
+    const id = uuidSchema.parse(achievementId);
+    const record = await this.repository.findById(id, subject.userId);
+    if (!record) {
+      throw new NotFoundException('目标资源不存在或不可见');
+    }
+
+    // 二次 SELF 授权：判定入参取自**存储归属**
+    this.authorizeSelf(subject, PermissionPoint.AchievementSelfRead, readRecordOwnerId(record));
+    return this.toView(record, subject.userId);
   }
 
   /** 创建本人成果：归属与审核态都由服务端决定，请求体只提供业务字段 */

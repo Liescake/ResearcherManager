@@ -49,6 +49,22 @@ export class InMemoryAchievementRepository implements AchievementRepository {
     return { ...achievement };
   }
 
+  /**
+   * 单条读取**同时**按资源 ID 与归属命中：与 PostgreSQL 实现（`WHERE id = $1 AND user_id = $2`）
+   * 同语义。
+   *
+   * 只按资源 ID 命中会把「他人记录」交给 service，让归属判定退化成**取数之后**的复核
+   * （也正是存在性可被探测的原因）。这里与数据库实现一致地做归属命中，
+   * 因此「不存在」与「存在但不属于该主体」在两种实现下都返回 `undefined`。
+   */
+  async findById(achievementId: string, ownerUserId: string): Promise<Achievement | undefined> {
+    const record = this.achievements.get(achievementId);
+    if (record === undefined || record.userId !== ownerUserId) {
+      return undefined;
+    }
+    return { ...record };
+  }
+
   async listByUserId(userId: string): Promise<readonly Achievement[]> {
     return [...this.achievements.values()]
       .filter((record) => record.userId === userId)
