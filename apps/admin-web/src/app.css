@@ -504,13 +504,21 @@ button:disabled {
   min-width: 180px;
 }
 
+/* 确认框是原生 <dialog>（showModal 打开）：模态语义、焦点陷阱、Escape 由浏览器保证，
+   这里只负责外观。注意它由 showModal 放进 top layer，尺寸与定位不再受所在表格单元格约束。 */
 .confirm {
   background: #fff8e8;
   border: 1px solid #f0d59a;
   border-radius: 8px;
   color: var(--color-warning);
   font-size: 13px;
+  max-width: min(420px, calc(100vw - 32px));
   padding: 10px 12px;
+}
+
+/* 模态遮罩：明确「背景不可交互」的视觉信号（与之对应的是原生模态的 inert 语义） */
+.confirm::backdrop {
+  background: rgb(15 23 42 / 45%);
 }
 
 .confirm:focus-visible {

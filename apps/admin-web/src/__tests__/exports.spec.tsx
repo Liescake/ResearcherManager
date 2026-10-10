@@ -16,9 +16,11 @@ import type { Loadable } from '../state/async';
 /**
  * 导出记录区的**静态渲染**测试（react-dom/server，不引入 jsdom）。
  *
- * 覆盖的是「哪个状态显示什么、按钮在不在、aria 是否完整」这类结构断言；
+ * 覆盖的是「哪个状态显示什么、按钮在不在、aria 与焦点锚点是否完整」这类结构断言；
  * 交互时序（确认 / 取消 / 防重复提交 / 成功与失败的状态迁移）由
- * `state/revoke-flow.spec.ts` 的纯函数测试固定——两者合起来等价于一次完整的交互验收。
+ * `state/revoke-flow.spec.ts` 的纯函数测试固定，确认框的运行时语义（showModal 打开、初始焦点、
+ * Tab 不逃逸、Escape 取消、关闭后焦点回到触发按钮 / 回落到行）由
+ * `components/dialog-focus.spec.ts` 的纯函数测试固定——三者合起来等价于一次完整的交互验收。
  */
 const PENDING_ID = '00000000-0000-4000-8000-000000000001';
 const COMPLETED_ID = '00000000-0000-4000-8000-000000000002';
@@ -134,17 +136,51 @@ describe('导出记录区的状态展示', () => {
 });
 
 describe('撤销确认弹窗', () => {
-  it('点击撤销后必须确认：弹窗带 alertdialog 语义与完整 aria 关联', () => {
+  it('点击撤销后必须确认：原生模态 dialog 带 alertdialog 语义与完整 aria 关联', () => {
     const html = renderPanel(
       { status: 'ready', data: page([exportView(PENDING_ID, 'pending')]) },
       { flow: { ...INITIAL_REVOKE_FLOW, confirmingId: PENDING_ID } },
     );
+    // 原生 <dialog>：模态语义（背景 inert、Tab 不逃逸、Escape 触发取消）由 showModal() 提供
+    expect(html).toContain('<dialog');
+    expect(html).toContain('</dialog>');
     expect(html).toContain('role="alertdialog"');
+    expect(html).toContain('aria-modal="true"');
+    expect(html).toContain('aria-busy="false"');
     expect(html).toContain(EXPORT_REVOKE_CONFIRM_TITLE);
     expect(html).toContain(`aria-labelledby="revoke-title-${PENDING_ID}"`);
     expect(html).toContain(`aria-describedby="revoke-desc-${PENDING_ID}"`);
     expect(html).toContain(`id="revoke-title-${PENDING_ID}"`);
     expect(html).toContain(`id="revoke-desc-${PENDING_ID}"`);
+    // 不用 open 属性打开（那是非模态打开：既无焦点陷阱，也会让 showModal() 抛错）
+    expect(/<dialog[^>]*\bopen\b/.test(html)).toBe(false);
+  });
+
+  it('打开时焦点目标在框内：主操作在先，容器可被程序聚焦，框内没有别的可聚焦控件', () => {
+    const html = renderPanel(
+      { status: 'ready', data: page([exportView(PENDING_ID, 'pending')]) },
+      { flow: { ...INITIAL_REVOKE_FLOW, confirmingId: PENDING_ID } },
+    );
+    // 容器 tabindex=-1：提交中焦点收到这里（不进入 Tab 顺序）
+    expect(html).toContain('tabindex="-1"');
+    const confirmIndex = html.indexOf('>确认撤销</button>');
+    const cancelIndex = html.indexOf('>取消</button>');
+    expect(confirmIndex).toBeGreaterThan(-1);
+    expect(cancelIndex).toBeGreaterThan(confirmIndex);
+    // 框内没有输入控件或链接：Tab 只能在「确认 / 取消 / 容器」之间循环
+    expect(html).not.toContain('<input');
+    expect(html).not.toContain('<a ');
+  });
+
+  it('每一行都备好两个焦点回落的锚点：触发按钮与常驻 tabindex=-1 的行', () => {
+    const html = renderPanel(
+      { status: 'ready', data: page([exportView(PENDING_ID, 'pending')]) },
+      { flow: { ...INITIAL_REVOKE_FLOW, confirmingId: PENDING_ID } },
+    );
+    // 取消 / 失败后焦点回到触发撤销的按钮；成功撤销后该按钮随状态更新消失，焦点落到行本身，
+    // 因此行的 tabindex=-1 必须常驻（否则回落目标在成功那一刻也不存在了）
+    expect(html).toContain('<tr tabindex="-1">');
+    expect(revokeButtonCount(html)).toBe(1);
   });
 
   it('弹窗只提供「确认撤销 / 取消」两个动作，没有任何可填字段', () => {
@@ -195,6 +231,12 @@ describe('提交中与结果展示', () => {
     // 提交中不存在可再次点击的「确认撤销」按钮（不会重复提交）
     expect(html.split('>确认撤销</button>').length - 1).toBe(0);
     expect(revokeButtonCount(html)).toBe(1);
+    // 提交中确认与取消都是禁用按钮：焦点必须落在对话框容器（tabindex=-1）上，
+    // 否则浏览器会把它丢回 body ——「正在撤销…」期间框内就没有焦点了
+    expect(/<button[^>]*disabled[^>]*>正在撤销…<\/button>/.test(html)).toBe(true);
+    expect(/<button[^>]*disabled[^>]*>取消<\/button>/.test(html)).toBe(true);
+    expect(html).toContain('<dialog');
+    expect(html).toContain('tabindex="-1"');
   });
 
   it('成功：提示下载失效，且该条由本地视图更新为「已撤销」并移除撤销入口', () => {
@@ -209,6 +251,9 @@ describe('提交中与结果展示', () => {
     expect(html).toContain('已撤销：下载入口立即失效');
     expect(html).toContain('下载入口已失效');
     expect(revokeButtonCount(html)).toBe(0);
+    // 成功撤销后该行的撤销按钮已消失（焦点回落目标只剩行锚点），确认框也已关闭
+    expect(html).not.toContain('<dialog');
+    expect(html).toContain('<tr tabindex="-1">');
   });
 
   it('失败：显示统一安全拒绝文案（不区分原因、不泄露存在性），本地视图保持不变', () => {
@@ -226,6 +271,12 @@ describe('提交中与结果展示', () => {
     // 失败不当成成功：该条仍是处理中，撤销入口还在（可重试）
     expect(html).toContain('处理中');
     expect(revokeButtonCount(html)).toBe(1);
+    // 失败后确认框关闭，触发撤销的按钮重新可用：它是关闭后焦点回填的目标
+    expect(html).not.toContain('<dialog');
+    const revokeButton = /<button[^>]*>撤销<\/button>/.exec(html)?.[0] ?? '';
+    expect(revokeButton).not.toBe('');
+    expect(revokeButton).not.toContain('disabled');
+    expect(html).toContain('<tr tabindex="-1">');
   });
 
   it('失败：503 沿用「服务暂时不可用」，而不是笼统的服务端异常', () => {

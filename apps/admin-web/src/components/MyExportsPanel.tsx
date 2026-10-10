@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { useRef, type ReactNode } from 'react';
 import { ENDPOINTS, endpointRef } from '../api/endpoints';
 import { mergeRevokedViews } from '../api/export-view';
 import { exportStatusLabel, isExportRevocableStatus } from '../api/types';
@@ -7,6 +7,7 @@ import type { Loadable } from '../state/async';
 import type { RevokeFlowState } from '../state/revoke-flow';
 import { formatDateTime, formatShortId } from '../lib/format';
 import { AsyncStateView } from './AsyncStateView';
+import { ConfirmDialog } from './ConfirmDialog';
 import { ErrorPanel, NoticeBar } from './StatePanel';
 
 /**
@@ -27,6 +28,10 @@ import { ErrorPanel, NoticeBar } from './StatePanel';
  *
  * 组件本身是**受控的纯展示**：状态与回调全部来自 `props`，因此它可以被静态渲染测试覆盖
  * （本项目不引入 jsdom，交互时序由 `state/revoke-flow.ts` 的纯函数单测固定）。
+ *
+ * 确认弹窗的无障碍**运行时语义**（原生模态、初始焦点、Tab 不逃逸、Escape 取消、焦点回收）
+ * 由 `ConfirmDialog` + `components/dialog-focus.ts` 承担：前者接线，后者是纯函数并被 node 单测
+ * 逐条固定。本文件只负责给每一行备好两个焦点锚点（见 `ExportRow`）。
  */
 export interface MyExportsPanelProps {
   state: Loadable<MyExportPage>;
@@ -167,9 +172,20 @@ function ExportRow({
   const revocable = isExportRevocableStatus(item.status);
   const confirming = flow.confirmingId === item.id;
   const pending = flow.pendingId === item.id;
+  /**
+   * 焦点锚点一：**触发撤销的按钮**。确认框关闭（取消 / 成功 / 失败）后焦点回到它，
+   * 键盘使用者不会被丢回页面开头。
+   */
+  const revokeButtonRef = useRef<HTMLButtonElement | null>(null);
+  /**
+   * 焦点锚点二：**行本身**。撤销成功后该行由本地视图更新为「已撤销」，撤销按钮随之消失，
+   * 此时触发按钮已不可用，焦点必须落到一个仍然存在的元素上。
+   * 行常驻 `tabindex=-1`：不进入 Tab 顺序（不改变键盘遍历路径），但可被程序聚焦。
+   */
+  const rowRef = useRef<HTMLTableRowElement | null>(null);
 
   return (
-    <tr>
+    <tr ref={rowRef} tabIndex={-1}>
       <td>
         <code title={item.id}>{formatShortId(item.id)}</code>
       </td>
@@ -189,6 +205,7 @@ function ExportRow({
           <div className="rowactions">
             <button
               type="button"
+              ref={revokeButtonRef}
               className="button--secondary"
               onClick={() => onRequestRevoke({ id: item.id, status: item.status })}
               disabled={busy || mode === 'demo'}
@@ -198,47 +215,19 @@ function ExportRow({
               撤销
             </button>
             {confirming && (
-              <div
-                className="confirm"
-                role="alertdialog"
-                aria-modal="false"
-                aria-busy={pending}
-                aria-labelledby={`revoke-title-${item.id}`}
-                aria-describedby={`revoke-desc-${item.id}`}
-                tabIndex={-1}
-                onKeyDown={(event) => {
-                  if (event.key === 'Escape') {
-                    event.stopPropagation();
-                    onCancelRevoke();
-                  }
-                }}
-              >
-                <p className="state__title" id={`revoke-title-${item.id}`}>
-                  {EXPORT_REVOKE_CONFIRM_TITLE}
-                </p>
-                <p className="muted" id={`revoke-desc-${item.id}`}>
-                  {CONFIRM_DESCRIPTION}
-                </p>
-                <div className="confirm__actions">
-                  <button
-                    type="button"
-                    onClick={onConfirmRevoke}
-                    disabled={pending}
-                    // 弹窗打开后焦点落在确认按钮上：键盘使用者不必先 Tab 寻找
-                    autoFocus
-                  >
-                    {pending ? '正在撤销…' : '确认撤销'}
-                  </button>
-                  <button
-                    type="button"
-                    className="button--secondary"
-                    onClick={onCancelRevoke}
-                    disabled={pending}
-                  >
-                    取消
-                  </button>
-                </div>
-              </div>
+              <ConfirmDialog
+                titleId={`revoke-title-${item.id}`}
+                descriptionId={`revoke-desc-${item.id}`}
+                title={EXPORT_REVOKE_CONFIRM_TITLE}
+                description={CONFIRM_DESCRIPTION}
+                confirmLabel="确认撤销"
+                busyLabel="正在撤销…"
+                busy={pending}
+                onConfirm={onConfirmRevoke}
+                onCancel={onCancelRevoke}
+                returnFocusRef={revokeButtonRef}
+                fallbackFocusRef={rowRef}
+              />
             )}
           </div>
         ) : (
