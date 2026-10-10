@@ -9,8 +9,9 @@
     "node": ">=22.12.0"
   },
   "scripts": {
-    "verify": "pnpm verify:skeleton && pnpm verify:migrations && pnpm verify:openapi && pnpm verify:docker",
+    "verify": "pnpm verify:skeleton && pnpm verify:contracts && pnpm verify:migrations && pnpm verify:openapi && pnpm verify:docker",
     "verify:skeleton": "node scripts/verify-skeleton.mjs",
+    "verify:contracts": "node services/ruoyi-api/contracts/validate.mjs",
     "verify:migrations": "node scripts/db-migrations-lint.mjs",
     "verify:openapi": "node scripts/openapi-contract-lint.mjs",
     "verify:docker": "node scripts/docker-packaging-check.mjs",
