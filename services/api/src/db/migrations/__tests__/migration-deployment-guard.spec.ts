@@ -158,6 +158,7 @@ describe('部署守卫契约：身份与来源目录', () => {
       '0013_export_jobs.sql',
       '0014_ai_match_records_guards.sql',
       '0015_export_jobs_expiry.sql',
+      '0016_export_jobs_revocation.sql',
     ];
     const candidates = collectMigrationDeploymentCandidates(MIGRATIONS_DIR);
     expect(candidates.map((item) => item.fileName)).toEqual(REAL_MIGRATIONS);
@@ -187,6 +188,7 @@ describe('部署守卫契约：身份与来源目录', () => {
       '0013',
       '0014',
       '0015',
+      '0016',
     ]);
     expect(report.executionOrder).toEqual([
       '0001',
@@ -204,6 +206,7 @@ describe('部署守卫契约：身份与来源目录', () => {
       '0013',
       '0014',
       '0015',
+      '0016',
     ]);
   });
 

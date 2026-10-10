@@ -5,13 +5,18 @@
  * 本切片承载**本人导出请求的最小垂直切片**：
  * - `POST /me/exports` 创建本人的导出请求（服务端白名单资源 + 字段）；
  * - `GET  /me/exports` 本人导出请求列表与状态；
- * - `GET  /me/exports/:exportId/download` 下载本人**已完成**导出的产物内容。
+ * - `GET  /me/exports/:exportId/download` 下载本人**已完成**导出的产物内容；
+ * - `POST /me/exports/:exportId/revoke` **本人撤销**自己的导出请求（写 `revoked_at`，
+ *   与状态机正交的单调事实；撤销后下载立即统一 404 失效，但**不做**物理删除与产物清理）。
  *
- * **真实文件生成、字段级脱敏、有效期与清理、管理端 `POST /admin/exports`**
- * （`export:{resource}:create`，见 docs/P2-API契约基线.md §「统计、导出、配置」）仍属于后续切片：
+ * **真实文件生成、字段级脱敏、管理端 `POST /admin/exports`**
+ * （`export:{resource}:create`，见 docs/P2-API契约基线.md §「统计、导出、配置」）与
+ * **异步产物清理**（过期回收 / 撤销后清理：本切片只登记能力边界
+ * `EXPORT_REVOCATION_CLEANUP_BOUNDARY`）仍属于后续切片：
  * 下载切片只把「已完成导出的产物能不能被本人取走」这一段收敛到契约内
- * （含**服务端有效期**：创建时由服务端写入、下载时按绝对时刻判定，过期与不存在同形收敛到统一拒绝；
- * **清理 / 回收 / 撤销 / 续期**仍属后续切片），
+ * （含**服务端有效期**：创建时由服务端写入、下载时按绝对时刻判定，过期与不存在同形收敛到统一拒绝），
+ * 撤销切片只把「本人能不能取回交付能力」这一段收敛到契约内（撤销即下载失效，
+ * 记录与产物都保留），
  * 产物内容由 `ExportArtifactStore` 的显式端口给出（真实实现留给后续切片），
  * 本切片**不伪造生产文件下载**，也不声称任何实现可生产可用。
  *
@@ -61,6 +66,13 @@ export function isExportResource(value: unknown): value is ExportResource {
  * 导出任务状态**闭集**：入口恒为 `pending`，只允许推进到一个终态
  * （`completed` = 产物已在服务端生成；`failed` = 未生成出产物）。
  * 未登记取值一律视为存储损坏（500），绝不当作合法值外发。
+ *
+ * 刻意**没有** `revoked`：撤销（`revoked_at`）是一条与状态机**正交**的服务端事实，
+ * 不是第四个状态 —— 撤销不改写 `status` / `artifact_id`（不物理删除、不同步清理产物），
+ * 只把「这条导出已被本人取回交付能力」记在独立列上。公开视图把它呈现为 `revoked`
+ * （见 `exports.contract.ts` 的 `EXPORT_VIEW_STATUS_VALUES`），但**存储侧状态闭集保持三态**，
+ * 因此 0013 已应用的状态闭集 CHECK 与「产物短引用当且仅当 completed 存在」的跨字段 CHECK
+ * 逐字不变（见 `db/migrations/0016_export_jobs_revocation.sql`）。
  */
 export const ExportStatus = {
   Pending: 'pending',
@@ -87,7 +99,8 @@ export function isExportStatus(value: unknown): value is ExportStatus {
  * - `ownerUserId`：会话主体（`SESSION_SUBJECT_RESOLVER` 解析值），非客户端输入；
  * - `status`：由状态机写入（入口恒为 `pending`），客户端提交同名字段一律 400；
  * - `createdAt` / `updatedAt`：服务端时钟；
- * - `expiresAt`：**服务端创建**的产物有效期（绝对时刻，见下）。
+ * - `expiresAt`：**服务端创建**的产物有效期（绝对时刻，见下）；
+ * - `revokedAt`：**服务端写入**的撤销时刻（绝对时刻，见下；与状态机正交的单调事实）。
  *
  * 记录里**没有**文件名、路径、下载地址与存储 key：产物位置只存在于
  * `ExportArtifactStore` 内部（内存基线里是内部 Map 的存储键），
@@ -124,6 +137,22 @@ export interface ExportRequest {
    * 缺省 = 存储侧 `NULL` = 「没有可用的服务端有效期」⇒ 下载边界 fail-closed。
    */
   readonly expiresAt?: string;
+  /**
+   * 服务端**撤销**时刻（UTC ISO 8601 绝对时刻，服务端唯一写入方；缺省 = 未被撤销）。
+   *
+   * 三条硬性质（与本切片其余字段同构）：
+   * - **服务端独占**：值只由 service 在撤销入口用服务端时钟写入，客户端提交的 `revokedAt` /
+   *   `revoked_at` / `status`（请求体或查询串）一律 400，**不是静默剥离**；
+   * - **单向单调**：`undefined → 时刻` 只能发生一次，之后任何写回路径都不得清空或改写它
+   *   （状态机推进的 `save` 不写该列；数据库 adapter 的 `POSTGRES_EXPORT_REVOKE_COLUMNS`
+   *   是唯一写入点，且带 `revoked_at IS NULL` 的条件谓词）；
+   * - **与状态机正交**：撤销**不改写** `status` / `artifactId` —— 记录可以既是 `completed`
+   *   又是已撤销。下载边界按「已撤销 ⇒ 统一拒绝」判定（`revoked_at` **优先**于 `status`），
+   *   因此「并发撤销 / 完成」时撤销事实永远使下载失效，而不是被一次并发完成覆盖掉。
+   *
+   * 它同样**不进入公开视图**（撤销时刻不外发；列表只把 `status` 呈现为 `revoked`）。
+   */
+  readonly revokedAt?: string;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -349,7 +378,91 @@ export interface ExportRepository {
    *   绝不能被伪装成「不存在」。
    */
   findByIdForOwner(id: string, ownerUserId: string): Promise<ExportRequest | undefined>;
+  /**
+   * **本人撤销**（`POST /me/exports/:exportId/revoke` 的唯一写入入口）：把「这条导出已被本人
+   * 取回交付能力」这一**单调**事实写进 `revoked_at`，并**条件更新**：
+   *
+   * ```
+   * WHERE id = $1 AND requester_id = $2 AND status = ANY(可撤销前驱集合) AND revoked_at IS NULL
+   * SET   revoked_at = $3, updated_at = $4
+   * ```
+   *
+   * - `ownerUserId` 只来自服务端会话主体，`revokedAt` 只来自服务端时钟；调用方（service）
+   *   必须先完成入口授权与读取契约复核；
+   * - **不改写** `status` / `artifact_id` / `created_at` / `expires_at` / `resource` / `fields`：
+   *   撤销不是状态机转移，也不删除产物（无物理删除、无同步清理 —— 清理属异步后续切片）；
+   * - **条件谓词**同时钉住归属、可撤销前驱集合与 `revoked_at IS NULL`：
+   *   拿他人的记录 ID 写不中他人数据（`undefined`，与「不存在」不可区分）；
+   *   `failed` 结论写不中（`not-revocable`）；已撤销的记录写不中（`already-revoked`，幂等）；
+   * - **并发**：撤销与状态机推进（`save`）互不覆盖 —— `save` 的 `SET` 列表里没有 `revoked_at`，
+   *   而本方法接受「`pending` 或 `completed`」两种前驱，因此并发完成之后撤销仍然生效，
+   *   撤销事实**优先**（下载边界按已撤销统一拒绝）；
+   * - 返回 `undefined` 表示「记录不存在或不属于该主体」（与「不是可撤销结论」**不可区分**地
+   *   收敛在调用方的统一拒绝出口 —— 但本方法仍然如实区分这两种内部结论，因为调用方需要
+   *   幂等响应与 404 的差别：`already-revoked` 必须幂等成功，`not-revocable` 必须拒绝）。
+   */
+  revokeForOwner(
+    id: string,
+    ownerUserId: string,
+    revokedAt: string,
+  ): Promise<ExportRevocationResult | undefined>;
 }
+
+/**
+ * 撤销写入的**结论闭集**（内存基线与数据库 adapter 必须给出同一组取值）：
+ * - `revoked`：本次调用**真的**把一条未撤销且可撤销的记录置为已撤销（条件更新命中 1 行）；
+ * - `already-revoked`：记录**已经**被撤销（重复请求 ⇒ 幂等成功，**不是**错误，也不改写时刻）；
+ * - `not-revocable`：记录存在且属于请求主体，但当前结论**不可撤销**（`failed` ——
+ *   与存储层 CHECK `export_jobs_revoked_at_matches_status` 同一条规则）。
+ *
+ * 「不存在 / 不属于请求主体」**不是**这里的一个取值，而是方法返回的 `undefined`：
+ * 两者在端口层不可区分，因此不会泄露「该记录是否存在」。三种结论都**必然**携带记录本身
+ * （服务端已授权主体自己的记录），调用方据此构造幂等响应或拒绝判定。
+ */
+export const ExportRevocationOutcome = {
+  Revoked: 'revoked',
+  AlreadyRevoked: 'already-revoked',
+  NotRevocable: 'not-revocable',
+} as const;
+export type ExportRevocationOutcome =
+  (typeof ExportRevocationOutcome)[keyof typeof ExportRevocationOutcome];
+export const EXPORT_REVOCATION_OUTCOME_VALUES = [
+  ExportRevocationOutcome.Revoked,
+  ExportRevocationOutcome.AlreadyRevoked,
+  ExportRevocationOutcome.NotRevocable,
+] as const;
+
+export function isExportRevocationOutcome(value: unknown): value is ExportRevocationOutcome {
+  return (
+    typeof value === 'string' &&
+    (EXPORT_REVOCATION_OUTCOME_VALUES as readonly string[]).includes(value)
+  );
+}
+
+/** 撤销写入的结果：结论 + 该主体自己的记录（记录已由仓储按归属取回并逐列复核） */
+export interface ExportRevocationResult {
+  readonly outcome: ExportRevocationOutcome;
+  readonly record: ExportRequest;
+}
+
+/**
+ * **撤销不清产物**的能力边界（可机器判定的声明，见本切片 spec）。
+ *
+ * 撤销只落一个时刻列：它**不**调用产物存储，产物存储端口上也**没有**删除 / 清理方法
+ * （`EXPORT_ARTIFACT_STORE_FORBIDDEN_METHODS`）。产物的过期回收 / 撤销后清理属于
+ * **异步清理切片**，必须先有独立的有效期扫描与回收入口，不能在撤销请求里同步做
+ * （同步清理会让「撤销」变成一次可能失败的多阶段副作用，并把产物存储故障升级成 5xx）。
+ */
+export const EXPORT_REVOCATION_CLEANUP_BOUNDARY = {
+  /** 撤销路径对产物存储的调用次数：恒为 0 */
+  artifactStoreCalls: 0,
+  /** 撤销是否删除记录：否（端口上没有删除 / 归档方法） */
+  deletesRecord: false,
+  /** 撤销是否清理产物：否（清理属异步后续切片） */
+  cleansArtifact: false,
+  /** 承接清理的切片标识（登记，不实现） */
+  deferredTo: 'async-artifact-cleanup',
+} as const;
 
 /**
  * PostgreSQL 后端标识（能力声明 `backend` 的规范取值）。
@@ -383,15 +496,17 @@ export const EXPORT_REPOSITORY_STORAGE_ID_DOMAIN = 'uuid';
  * 真库集成验证闭环），因此两份契约已收敛：运行时绑定（内存基线）与数据库 adapter 现在实现
  * **同一份**签名，「切换到数据库」与「回退到内存基线」仍是可整步执行 / 整步回退的操作。
  *
- * 方法集**只有五个**（`create` / `save` / `listByOwnerId` / `listByOwnerIdPage` /
- * `findByIdForOwner`）：唯一的单条读取入口也把主体写进签名（`findByIdForOwner`），
- * 不存在需要额外补主体参数的「裸 findById」；无窗口与有窗口两个列表入口都从入参取**服务端**主体，
- * 数据库实现把归属**下推进 SQL**（`WHERE requester_id = $1`）。
+ * 方法集**只有六个**（`create` / `save` / `listByOwnerId` / `listByOwnerIdPage` /
+ * `findByIdForOwner` / `revokeForOwner`）：唯一的单条读取入口也把主体写进签名
+ * （`findByIdForOwner`），不存在需要额外补主体参数的「裸 findById」；无窗口与有窗口两个列表入口
+ * 都从入参取**服务端**主体，数据库实现把归属**下推进 SQL**（`WHERE requester_id = $1`）。
+ * 唯一的写入型单条入口是 `revokeForOwner`，它同样把归属写进签名与 SQL 谓词，
+ * 且**只**写 `revoked_at` / `updated_at` 两列（条件更新，不删记录、不清理产物）。
  *
  * 实现者（`exports.in-memory-repository.ts` 与 `exports.postgres-repository.ts`）必须满足
  * **完全相同**的语义
  * （含「同 ID 重复创建视为服务端缺陷、不得静默覆盖」与「写回未知 id / 改写归属必须报错」），
- * 并额外守住六条边界：
+ * 并额外守住七条边界：
  * 1. **状态机唯一入口与唯一出口**：`create` 只接受入口状态 `pending`（服务端常量
  *    `EXPORT_ENTRY_STATUS`）；`save` 只接受 `pending -> completed | failed` 的合法转移，
  *    非法转移**不产生任何写入**，并由 service 的状态机门禁映射为 409
@@ -415,6 +530,15 @@ export const EXPORT_REPOSITORY_STORAGE_ID_DOMAIN = 'uuid';
  *    `ownerUserId`、`artifactId` 以及文件名 / 路径 / 下载地址 / 存储 key / 内部资源内容 /
  *    原始错误文本既不出现在 adapter 的公开投影里，也不进入错误信息；公开视图由
  *    `exports.contract.ts` 的 `toExportRequestView` 逐字段裁剪（恰好 `EXPORT_REQUEST_VIEW_FIELDS`）。
+ * 7. **撤销是「只写一个时刻」的单调操作，绝不是状态机转移，也不做任何清理**：
+ *    `revokeForOwner` 的 `SET` 只有 `revoked_at` / `updated_at`（不写 `status` / `artifact_id` /
+ *    `created_at` / `expires_at` / `resource` / `fields`），`WHERE` 同时钉住 `id`、归属、
+ *    `EXPORT_REVOCABLE_STATUSES`（`pending` / `completed`）与 `revoked_at IS NULL`。
+ *    因此：重复撤销幂等（`already-revoked`，时刻不被改写）、`failed` 不可撤销（`not-revocable`）、
+ *    他人记录不可见也不可写（`undefined`）、状态机写回（`save`）永不覆盖或清空撤销事实。
+ *    撤销**不删除记录**（端口上没有删除 / 归档方法）、**不同步清理产物**
+ *    （`EXPORT_REVOCATION_CLEANUP_BOUNDARY` 声明撤销路径对产物存储的调用次数恒为 0，
+ *    清理属异步后续切片），因此撤销请求不会因为产物存储故障而失败。
  */
 export type AsyncExportRepository = ExportRepository;
 
@@ -529,6 +653,29 @@ export interface ExportArtifactStore {
   read(artifactId: string): Promise<ExportArtifactContent | undefined>;
 }
 
+/**
+ * **产物存储端口上刻意不存在的清理能力**（可机器判定的能力边界）。
+ *
+ * 撤销（`revokeForOwner`）**不同步清理产物**：它只落一个时刻列，产物存储端口既不提供
+ * 删除 / 清理入口，也没有任何「按句柄失效」的方法。这样声明有两个作用：
+ * 1. 撤销请求的成功与失败**不依赖**产物存储：产物存储故障不会把撤销升级成 5xx，
+ *    也不会出现「记录已撤销、产物却没清掉 / 清了但记录没落」这种半成品状态；
+ * 2. 产物的过期回收 / 撤销后清理必须先有**独立的异步清理切片**（有效期扫描 + 回收入口 +
+ *    幂等重试），本切片只把这条边界登记下来，不实现它。
+ *
+ * spec 会逐名断言产物存储实例（含内存基线）上没有这些方法。
+ */
+export const EXPORT_ARTIFACT_STORE_FORBIDDEN_METHODS: readonly string[] = Object.freeze([
+  'delete',
+  'remove',
+  'purge',
+  'revoke',
+  'invalidate',
+  'cleanup',
+  'truncate',
+  'archive',
+]);
+
 /** DI 令牌：导出产物存储（真实实现应写入对象存储/临时文件区并保留有效期与清理策略） */
 export const EXPORT_ARTIFACT_STORE = Symbol('EXPORT_ARTIFACT_STORE');
 
@@ -591,3 +738,75 @@ export interface ExportDownloadAuditSink {
 
 /** DI 令牌：下载审计出口 */
 export const EXPORT_DOWNLOAD_AUDIT = Symbol('EXPORT_DOWNLOAD_AUDIT');
+
+/**
+ * **撤销审计结果**闭集：只记「这次撤销尝试的结果码」，不记原因、不记任何业务取值。
+ *
+ * - `success`：本次调用真的把一条未撤销且可撤销的记录置为已撤销；
+ * - `duplicate`：重复撤销（记录**已经**被撤销）—— 这是**幂等成功**，不是失败，
+ *   因此必须与 `success` 区分：审计要能回答「这条记录被撤销了几次」，
+ *   而不是把幂等重放混成一次新的撤销；
+ * - `unavailable`：撤销**没有**发生。统一安全拒绝（记录不存在 / 跨主体 / `failed` 结论 /
+ *   已过期 / 非法路径参数）与 fail-closed 500（存储记录违约、执行器故障、审计前取数故障）
+ *   **共享**这个结果码：它与调用方的对外出口一样**不区分原因**，因此审计本身也不泄露
+ *   「该记录是否存在、处于什么结论、是否已过期」；
+ * - 未登记取值一律视为存储损坏，绝不作为合法结果外发。
+ */
+export const ExportRevocationAuditResult = {
+  Success: 'success',
+  Duplicate: 'duplicate',
+  Unavailable: 'unavailable',
+} as const;
+export type ExportRevocationAuditResult =
+  (typeof ExportRevocationAuditResult)[keyof typeof ExportRevocationAuditResult];
+export const EXPORT_REVOCATION_AUDIT_RESULT_VALUES = [
+  ExportRevocationAuditResult.Success,
+  ExportRevocationAuditResult.Duplicate,
+  ExportRevocationAuditResult.Unavailable,
+] as const;
+
+/**
+ * 撤销审计条目：**恰好四个字段**，每一个都是服务端生成的脱敏值。
+ *
+ * - `requestId`：服务端生成的请求关联 ID（**不使用**客户端可提交的 `x-request-id`：
+ *   客户端可控值不得进入审计，否则审计可被伪造成指向任意请求）；
+ * - `exportIdDigest`：导出 ID 的**单向摘要**（`sha256:<32 位十六进制>`）；记摘要而不是原值，
+ *   使审计可用于关联而不落任何原始标识；
+ * - `requesterDigest`：**请求主体**（服务端会话主体）的单向摘要。撤销是一条「谁取回了自己的
+ *   交付能力」的事实，因此审计需要能按主体聚合 —— 但主体标识本身同样**不落原值**：
+ *   记的是同一个 `sha256:<32 位十六进制>` 单向摘要（与导出 ID 同一套摘要口径），
+ *   因此审计泄露不等于主体标识泄露；
+ * - `result`：结果码闭集（见上）。
+ *
+ * **刻意没有**的字段：请求体 / 字节 / 响应体（**绝不记 body**）、产物内容与任何产物句柄、
+ * storage key / 路径 / 下载地址 / 签名地址 / 文件名、归属主体的**原值**、角色 / 权限、
+ * 查询串、请求头 / 凭据 / secret、IP、UA、原始错误文本。
+ * 审计端口在类型层面就装不下这些取值（严格契约见 `exports.contract.ts` 的
+ * `exportRevocationAuditEntrySchema`），因此「撤销审计顺手把 body 或 PII 写进去」不可能悄悄发生。
+ */
+export interface ExportRevocationAuditEntry {
+  readonly requestId: string;
+  readonly exportIdDigest: string;
+  readonly requesterDigest: string;
+  readonly result: ExportRevocationAuditResult;
+}
+
+/**
+ * 撤销审计端口（**只追加单条脱敏记录**）。
+ *
+ * 与 `ExportDownloadAuditSink` 一样刻意独立于 `audit` 模块（理由同下载审计），
+ * 但它是**另一条**最小事实集：撤销多一个 `requesterDigest`、结果闭集多一个 `duplicate`。
+ * 两者共用同一份摘要口径（`exports.contract.ts` 的 `digestExportId` / `digestRequesterId`），
+ * 因此「同一主体 / 同一条导出」在两条留痕里可被关联，而两处都不落原始标识。
+ *
+ * 失败语义：`record` 抛异常即表示「留痕失败」，由 service fail-closed 为 500 ——
+ * 审计不可用时绝不返回「看起来撤销成功但没有留痕」的响应；反过来，`success` 留痕失败
+ * **不**回滚已落库的撤销时刻（撤销是单调事实），响应是 500，客户端重试会因为幂等
+ * 落到 `duplicate` 分支 —— 这正是「单调事实 + 幂等入口」要的行为。
+ */
+export interface ExportRevocationAuditSink {
+  record(entry: ExportRevocationAuditEntry): Promise<void>;
+}
+
+/** DI 令牌：撤销审计出口 */
+export const EXPORT_REVOCATION_AUDIT = Symbol('EXPORT_REVOCATION_AUDIT');

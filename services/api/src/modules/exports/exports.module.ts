@@ -17,7 +17,13 @@ import type { ExportCursorCodec } from './exports.cursor';
 import { InMemoryExportDownloadAuditSink } from './exports.download-audit.in-memory';
 import { InMemoryExportRepository } from './exports.in-memory-repository';
 import { createLazyPostgresExportRepository } from './exports.postgres-repository';
-import { EXPORT_ARTIFACT_STORE, EXPORT_DOWNLOAD_AUDIT, EXPORT_REPOSITORY } from './exports.port';
+import { InMemoryExportRevocationAuditSink } from './exports.revocation-audit.in-memory';
+import {
+  EXPORT_ARTIFACT_STORE,
+  EXPORT_DOWNLOAD_AUDIT,
+  EXPORT_REPOSITORY,
+  EXPORT_REVOCATION_AUDIT,
+} from './exports.port';
 import type { ExportRepository } from './exports.port';
 import { ExportsService } from './exports.service';
 
@@ -28,9 +34,12 @@ import { ExportsService } from './exports.service';
  * - `POST /me/exports` 创建本人的导出请求（服务端白名单资源 + 字段）；
  * - `GET  /me/exports` 本人导出请求列表与状态（**键集分页**：`cursor` / `limit` +
  *   不透明签名游标，游标编解码由 `EXPORT_CURSOR_CODEC` 提供）；
- * - `GET  /me/exports/:exportId/download` 下载本人已完成导出的产物内容。
+ * - `GET  /me/exports/:exportId/download` 下载本人已完成导出的产物内容；
+ * - `POST /me/exports/:exportId/revoke` **撤销**本人的导出请求（写 `revoked_at` 的条件更新；
+ *   撤销后下载立即统一 404 失效，列表对该主体呈现 `revoked`）。
  *
- * 真实文件生成与字段级脱敏、**过期产物的清理**（本切片只落地服务端有效期与过期拒绝）、
+ * 真实文件生成与字段级脱敏、**异步产物清理**（本切片只落地服务端有效期与过期拒绝、
+ * 以及「撤销不删记录、不清产物」的能力边界）、
  * 管理端 `POST /admin/exports`（`export:{resource}:create`）与**列表筛选**属于后续切片，
  * 必须继续留在本模块内，不得跨模块直接调用其他领域模块的仓储（导出范围只由本模块的服务端
  * 字段白名单决定）。
@@ -43,7 +52,7 @@ import { ExportsService } from './exports.service';
  * | 条件 | 绑定 | 依据 |
  * |---|---|---|
  * | 未解析出 `DATABASE_URL` | `InMemoryExportRepository` | 开发/测试保持现状；生产环境它自身拒绝构造 |
- * | 已解析出 `DATABASE_URL` 且有 `SQL_CONNECTION_FACTORY` | `createLazyPostgresExportRepository` | 延迟建连（`export_jobs`，迁移 `0013` 建表、`0015` 补服务端有效期列 `expires_at`）；生产准入由启动期依赖就绪门禁判定 |
+ * | 已解析出 `DATABASE_URL` 且有 `SQL_CONNECTION_FACTORY` | `createLazyPostgresExportRepository` | 延迟建连（`export_jobs`，迁移 `0013` 建表、`0015` 补服务端有效期列 `expires_at`、`0016` 补服务端撤销列 `revoked_at`）；生产准入由启动期依赖就绪门禁判定 |
  * | 已解析出 `DATABASE_URL` 但没有执行器工厂 | **抛错** | fail-closed：绝不悄悄退回内存导出存储 |
  *
  * 「延迟建连」很关键：装配阶段不碰数据库，所以「数据库已配置但执行器未 attest / 依赖未就绪」
@@ -81,10 +90,19 @@ import { ExportsService } from './exports.service';
  * 真实审计落库（以及读取/查询面）属后续切片：`audit` 模块的事件与资源类型是闭集，
  * 扩它需要同步公开权限与事件目录，不在本切片范围内。
  *
+ * ## 为什么撤销留痕是**另一个**独立的内存基线出口
+ * `EXPORT_REVOCATION_AUDIT` 绑定 `InMemoryExportRevocationAuditSink`（同样如实声明非生产、
+ * 在生产环境拒绝构造）。撤销留痕与下载留痕刻意分开：两者的结果码闭集不同
+ * （下载是 `success` / `unavailable` / `failed`，撤销是 `success` / `duplicate` / `unavailable`），
+ * 撤销还多一个**请求主体单向摘要**。合成一个端口会让两条最小事实集互相迁就
+ * （下载被迫多带一个主体摘要，或撤销被迫借用一个 `failed` 结果码）。
+ * 它同样只接收脱敏条目（恰好四个字段）并按严格契约校验：**不写 request body**、
+ * 不写 PII / 路径 / storage key / 产物句柄 / secret。
+ *
  * 边界事实：本模块不含 RuoYi/Java 源码、不引入 Maven 依赖、不新增第三方依赖
  * （复用 `@rm/shared`），也不改动 health / runtime-info / profiles / groups / memberships /
  * achievements / education / matching / statistics / notifications / audit 等既有路由；
- * 对外只新增 `/me/exports` 的三条路由。
+ * 对外只新增 `/me/exports` 的四条路由。
  */
 export function createExportRepository(
   env: AppEnv,
@@ -145,6 +163,8 @@ const EXPORT_CURSOR_CODEC_PROVIDER: FactoryProvider = {
     { provide: EXPORT_ARTIFACT_STORE, useExisting: InMemoryExportArtifactStore },
     InMemoryExportDownloadAuditSink,
     { provide: EXPORT_DOWNLOAD_AUDIT, useExisting: InMemoryExportDownloadAuditSink },
+    InMemoryExportRevocationAuditSink,
+    { provide: EXPORT_REVOCATION_AUDIT, useExisting: InMemoryExportRevocationAuditSink },
   ],
 })
 export class ExportsModule {}

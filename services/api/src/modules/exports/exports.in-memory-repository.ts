@@ -1,14 +1,20 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { APP_ENV } from '../../config/config.module';
 import type { AppEnv } from '../../config/env';
-import { assertExportPageWindow, compareExportKeysets } from './exports.port';
+import {
+  ExportRevocationOutcome,
+  assertExportPageWindow,
+  compareExportKeysets,
+} from './exports.port';
 import type {
   ExportPage,
   ExportPageWindow,
   ExportRepository,
   ExportRepositoryCapabilities,
   ExportRequest,
+  ExportRevocationResult,
 } from './exports.port';
+import { isExportRevocableStatus } from './exports.state-machine';
 
 /**
  * 导出请求仓储的**内存基线**：开发与测试用，缺失真实持久化实现时的显式替身。
@@ -22,9 +28,10 @@ import type {
  * - 不做授权判定、不生成归属/状态/时间戳：这些只由 service 从服务端会话、状态机与时钟写入；
  * - **不做读取契约校验**：存储层损坏（未知枚举、字段不在白名单、状态与产物不自洽）必须能被
  *   出口的 fail-closed 门禁看见，因此基线不代替出口做校验，也不静默修正非法记录；
- *   写入只保证「主键唯一」「归属不可改写」「服务端有效期不可改写」这三条存储自身的完整性约束
- *   （第三条与数据库 adapter 的 `expires_at` 不可变列同语义）；
- * - **没有**删除/归档方法：本切片不提供「删除导出请求」的能力；
+ *   写入只保证「主键唯一」「归属不可改写」「服务端有效期不可改写」「撤销时刻单调不可回退」
+ *   这几条存储自身的完整性约束（第四条与数据库 adapter 的 `revoked_at` 条件写入同语义）；
+ * - **没有**删除/归档方法：本切片不提供「删除导出请求」的能力，撤销也**不删记录、
+ *   不同步清理产物**（只写 `revokedAt` / `updatedAt` 两列，见 `revokeForOwner`）；
  * - **没有**不带归属条件的单条读取：单条读取只有 `findByIdForOwner(id, ownerUserId)`，
  *   归属是取数条件本身（不存在 `findById` / `findByOwner` / `query` 这类入口）；
  * - **列表只有两个归属受限入口**：`listByOwnerId`（无窗口）与 `listByOwnerIdPage`（键集窗口）。
@@ -53,6 +60,11 @@ export class InMemoryExportRepository implements ExportRepository {
       // 主键冲突属于服务端缺陷（ID 由服务端生成），不得静默覆盖既有导出请求
       throw new Error(`导出请求 ID 冲突: ${request.id}`);
     }
+    if (request.revokedAt !== undefined) {
+      // 撤销时刻只允许由 `revokeForOwner` 在记录**已存在**之后写入（与数据库 adapter 的
+      // `assertEntryRecord` 同语义）：「一出生就已被取回」是一条没有发生过的事实
+      throw new Error(`导出请求创建路径不接受撤销时刻: ${request.id}`);
+    }
     this.requests.set(request.id, copyRequest(request));
     return copyRequest(request);
   }
@@ -74,8 +86,23 @@ export class InMemoryExportRepository implements ExportRepository {
       // 任何理由改动它；允许改写就等于允许把已过期的交付物「续期」回可下载状态。
       throw new Error(`导出请求有效期不可改写，拒绝更新: ${request.id}`);
     }
-    this.requests.set(request.id, copyRequest(request));
-    return copyRequest(request);
+    if (
+      existing.revokedAt !== undefined &&
+      request.revokedAt !== undefined &&
+      existing.revokedAt !== request.revokedAt
+    ) {
+      // **撤销时刻不可改写**（单调事实）：写回路径不得把已有的撤销时刻换成别的值
+      throw new Error(`导出请求撤销时刻不可改写，拒绝更新: ${request.id}`);
+    }
+    // **撤销事实不得被写回清空**：数据库 adapter 的写回 `SET` 列表里没有 `revoked_at`，
+    // 因此一次并发的本人撤销会在状态机推进之后依然留在行上；内存基线按同一语义把已存在的
+    // 撤销时刻带过去（调用方传来的记录往往是在撤销发生**之前**读到的快照）。
+    const preserved: ExportRequest =
+      request.revokedAt === undefined && existing.revokedAt !== undefined
+        ? { ...request, revokedAt: existing.revokedAt }
+        : request;
+    this.requests.set(request.id, copyRequest(preserved));
+    return copyRequest(preserved);
   }
 
   /**
@@ -155,6 +182,49 @@ export class InMemoryExportRepository implements ExportRepository {
       return undefined;
     }
     return copyRequest(record);
+  }
+
+  /**
+   * **本人撤销**（内存基线）。
+   *
+   * 语义与数据库 adapter 的
+   * `UPDATE export_jobs SET revoked_at = $3::timestamptz, updated_at = $4::timestamptz
+   *  WHERE id = $1::uuid AND requester_id = $2::uuid
+   *    AND status::text = ANY($5::text[]) AND revoked_at IS NULL
+   *  RETURNING …` **完全一致**（含 0 行时的「归属范围内诊断」分类）：
+   *
+   * 1. **归属是取数条件本身**：记录不存在或不属于该主体 ⇒ `undefined`（两者不可区分，
+   *    端口层面不可能泄露「该 ID 是否存在」）；
+   * 2. **已撤销优先**：`revokedAt` 已存在 ⇒ `already-revoked`，**幂等**返回既有记录，
+   *    **不改写**撤销时刻（撤销是单调事实：NULL → 时刻只能发生一次）；
+   * 3. **不可撤销结论**：`status` 不在 `EXPORT_REVOCABLE_STATUSES` 内（`failed`）⇒
+   *    `not-revocable`，**不产生任何写入**（这条规则与存储层 CHECK
+   *    `export_jobs_revoked_at_matches_status` 同语义）；
+   * 4. 其余 ⇒ 写入 `{ revokedAt, updatedAt }`（**只写这两列**）并返回 `revoked`。
+   *
+   * 刻意**不动** `status` / `artifactId` / `expiresAt` / `createdAt` / `resource` / `fields`：
+   * 撤销不是状态机转移，也不删除产物（无物理删除、无同步清理）。
+   * 内存基线不做并发竞态（单线程执行到这里就是原子的一段），但**条件谓词逐条照搬**，
+   * 因此两种实现在「同一格输入 → 同一格输出」上不会漂移。
+   */
+  async revokeForOwner(
+    id: string,
+    ownerUserId: string,
+    revokedAt: string,
+  ): Promise<ExportRevocationResult | undefined> {
+    const current = this.requests.get(id);
+    if (current === undefined || current.ownerUserId !== ownerUserId) {
+      return undefined;
+    }
+    if (current.revokedAt !== undefined) {
+      return { outcome: ExportRevocationOutcome.AlreadyRevoked, record: copyRequest(current) };
+    }
+    if (!isExportRevocableStatus(current.status)) {
+      return { outcome: ExportRevocationOutcome.NotRevocable, record: copyRequest(current) };
+    }
+    const revoked: ExportRequest = { ...current, revokedAt, updatedAt: revokedAt };
+    this.requests.set(id, copyRequest(revoked));
+    return { outcome: ExportRevocationOutcome.Revoked, record: copyRequest(revoked) };
   }
 }
 

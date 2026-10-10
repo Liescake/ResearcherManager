@@ -1376,3 +1376,117 @@ describe('导出下载：仓储单条取数的归属隔离（内存基线）', (
     expect(reread?.expiresAt).toBe(stored.expiresAt);
   });
 });
+
+/**
+ * **撤销回归**（本切片新增的判定位点）：`revoked_at` **优先**于状态。
+ *
+ * 撤销与状态机正交（撤销不改写 `status` / `artifactId`），因此「并发撤销 / 完成」可以让一条
+ * 记录同时是 `completed` **且**已撤销。下载边界必须按已撤销统一拒绝 —— 否则一次并发完成
+ * 就能把刚被本人取回的交付能力重新放开。
+ */
+describe('导出下载：撤销回归（revoked_at 优先使下载失效）', () => {
+  /** 撤销用例专用 ID：不复用共享夹具的 id，避免影响既有用例的可见记录集合 */
+  const REVOKED_COMPLETED_ID = 'a1a1a1a1-1111-4111-8111-111111111111';
+  const REVOKED_PENDING_ID = 'b2b2b2b2-2222-4222-8222-222222222222';
+  const CONTROL_COMPLETED_ID = 'c3c3c3c3-3333-4333-8333-333333333333';
+
+  async function startRevokedApp(): Promise<TestApp> {
+    const app = await startDownloadApp({ seed: false });
+    const revokedArtifact = app.artifacts.store({
+      exportRequestId: REVOKED_COMPLETED_ID,
+      ownerUserId: STUDENT_1,
+      resource: ExportResource.Profile,
+      fields: profileFields(),
+    });
+    const controlArtifact = app.artifacts.store({
+      exportRequestId: CONTROL_COMPLETED_ID,
+      ownerUserId: STUDENT_1,
+      resource: ExportResource.Profile,
+      fields: profileFields(),
+    });
+
+    await app.repository.create(
+      fixtureExportRequest({ id: REVOKED_COMPLETED_ID, artifactId: revokedArtifact.artifactId }),
+    );
+    await app.repository.create(
+      fixtureExportRequest({ id: CONTROL_COMPLETED_ID, artifactId: controlArtifact.artifactId }),
+    );
+    await app.repository.create(
+      fixtureExportRequest({
+        id: REVOKED_PENDING_ID,
+        status: ExportStatus.Pending,
+        artifactId: undefined,
+      }),
+    );
+
+    // 走**真实撤销写入路径**（不是手搓一条带 revokedAt 的记录）：已完成的产物依然留在
+    // 产物存储里（撤销不做物理删除与同步清理），撤销只落一个时刻列。
+    await app.repository.revokeForOwner(REVOKED_COMPLETED_ID, STUDENT_1, new Date().toISOString());
+    return app;
+  }
+
+  it('已撤销的 completed：下载与「不存在」完全同形（统一 404），且产物未被清理', async () => {
+    const app = await startRevokedApp();
+
+    const revoked = await rawCall(app.baseUrl, 'GET', downloadPath(REVOKED_COMPLETED_ID), {
+      headers: bearer(SESSION_STUDENT_1),
+    });
+    const unknown = await rawCall(app.baseUrl, 'GET', downloadPath(UNKNOWN_ID), {
+      headers: bearer(SESSION_STUDENT_1),
+    });
+
+    // 逐字节同形：状态码 / 错误码 / 文案完全一致，因此拒绝不泄露「这条导出是否存在、已撤销」
+    expectUniformRejection(revoked);
+    expect(contentOf(revoked)).toBe(contentOf(unknown));
+
+    // 撤销**没有**清理产物：产物存储里那条内容仍然可读（能力边界登记在端口上）
+    const stored = await app.repository.findByIdForOwner(REVOKED_COMPLETED_ID, STUDENT_1);
+    expect(stored?.revokedAt).toBeDefined();
+    expect(stored?.status).toBe(ExportStatus.Completed);
+    const reread = await app.artifacts.read(stored?.artifactId ?? '');
+    expect(reread?.bytes.byteLength).toBeGreaterThan(0);
+
+    // 反向对照：同一份夹具里**未撤销**的 completed 仍然可以下载（拒绝不是「一律 404」）
+    const control = await rawCall(app.baseUrl, 'GET', downloadPath(CONTROL_COMPLETED_ID), {
+      headers: bearer(SESSION_STUDENT_1),
+    });
+    expect(control.status).toBe(200);
+  });
+
+  it('并发撤销 / 完成：一次后续的「完成」写回不得把已撤销的导出变回可下载', async () => {
+    const app = await startRevokedApp();
+    const artifactId = randomUUID();
+    // 撤销先落地（此时结论仍是 pending）
+    const revocation = await app.repository.revokeForOwner(
+      REVOKED_PENDING_ID,
+      STUDENT_1,
+      new Date().toISOString(),
+    );
+    expect(revocation?.outcome).toBe('revoked');
+    const pending = await app.repository.findByIdForOwner(REVOKED_PENDING_ID, STUDENT_1);
+    expect(pending?.revokedAt).toBeDefined();
+    expect(pending?.status).toBe(ExportStatus.Pending);
+
+    // 模拟「撤销先落地、状态机推进随后到达」：写回只改 status / artifact_id / updated_at，
+    // 撤销时刻是单调事实 —— 内存基线与数据库 adapter 都不得清空它
+    const completed = await app.repository.save({
+      ...(pending as ExportRequest),
+      status: ExportStatus.Completed,
+      artifactId,
+      updatedAt: new Date().toISOString(),
+    });
+    expect(completed.status).toBe(ExportStatus.Completed);
+    expect(completed.revokedAt).toBe(pending?.revokedAt);
+
+    // 下载边界按「已撤销优先」判定：记录已经是 completed 且带产物句柄，但仍然不可下载
+    const res = await rawCall(app.baseUrl, 'GET', downloadPath(REVOKED_PENDING_ID), {
+      headers: bearer(SESSION_STUDENT_1),
+    });
+    expectUniformRejection(res);
+
+    // 存储事实仍然保留（不物理删除、不清理产物、不改写撤销时刻）
+    const stored = await app.repository.findByIdForOwner(REVOKED_PENDING_ID, STUDENT_1);
+    expect(stored?.revokedAt).toBe(pending?.revokedAt);
+    expect(stored?.status).toBe(ExportStatus.Completed);
+  });
+});

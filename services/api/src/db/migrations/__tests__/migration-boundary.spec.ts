@@ -159,6 +159,7 @@ describe('readMigrationDirectory：与仓库真实迁移对齐', () => {
       '0013_export_jobs.sql',
       '0014_ai_match_records_guards.sql',
       '0015_export_jobs_expiry.sql',
+      '0016_export_jobs_revocation.sql',
     ]);
     expect(descriptors.map((item) => item.version)).toEqual([
       '0001',
@@ -176,10 +177,12 @@ describe('readMigrationDirectory：与仓库真实迁移对齐', () => {
       '0013',
       '0014',
       '0015',
+      '0016',
     ]);
     // 全部迁移都必须是「可回滚」：建表迁移由 DROP TABLE IF EXISTS 恢复，约束迁移由
     // ALTER TABLE ... DROP CONSTRAINT IF EXISTS 恢复，加列迁移由 DROP COLUMN IF EXISTS 恢复
     expect(descriptors.map((item) => item.reversible)).toEqual([
+      true,
       true,
       true,
       true,
@@ -258,6 +261,46 @@ describe('readMigrationDirectory：与仓库真实迁移对齐', () => {
     // 列迁移不得顺手建表 / 建索引（一份迁移只做一件事）
     expect(expiryMigration).not.toMatch(/CREATE\s+TABLE\b/iu);
     expect(expiryMigration).not.toMatch(/CREATE\s+(?:UNIQUE\s+)?INDEX\b/iu);
+
+    // 0016 同样是**加列迁移**（不建表、不建索引）：它必须真的给 0013 建出的 export_jobs 加出
+    // 服务端撤销列与「撤销只落在可撤销结论上」的不变式，而不是只在注释里声明
+    const revocationMigration = readFileSync(
+      join(repoRoot, 'db', 'migrations', '0016_export_jobs_revocation.sql'),
+      'utf8',
+    );
+    expect(revocationMigration).toMatch(/ALTER\s+TABLE\s+export_jobs\b/iu);
+    expect(revocationMigration).toMatch(
+      /ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+revoked_at\s+timestamptz/iu,
+    );
+    expect(revocationMigration).toContain('ADD CONSTRAINT export_jobs_revoked_at_matches_status');
+    expect(revocationMigration).toContain('ADD CONSTRAINT export_jobs_revoked_at_after_created_at');
+    // 撤销列必须可空（NULL = 未被撤销）且**无 DEFAULT**（撤销时刻只能由服务端写入）
+    const addRevokedColumn = /ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+revoked_at[^;]*/iu.exec(
+      revocationMigration,
+    )?.[0];
+    expect(addRevokedColumn).toBeDefined();
+    expect(addRevokedColumn).not.toMatch(/\bNOT\s+NULL\b/iu);
+    expect(addRevokedColumn).not.toMatch(/\bDEFAULT\b/iu);
+    // 撤销不得改写 0013 已钉住的状态闭集与「产物短引用当且仅当 completed」的跨字段不变式：
+    // 撤销与状态机正交（它不是第四个 status 取值），因此那两条 CHECK 在本迁移里既不 ADD 也不 DROP
+    // （名字可以出现在说明注释里，但绝不能出现在任何约束语句里）
+    for (const pinned of ['export_jobs_status_check', 'export_jobs_artifact_matches_status']) {
+      expect(revocationMigration).not.toMatch(
+        new RegExp(`(?:ADD|DROP)\\s+CONSTRAINT\\s+(?:IF\\s+EXISTS\\s+)?${pinned}\\b`, 'iu'),
+      );
+    }
+    expect(revocationMigration).toMatch(
+      /DROP\s+CONSTRAINT\s+IF\s+EXISTS\s+export_jobs_revoked_at_matches_status/iu,
+    );
+    expect(revocationMigration).toMatch(
+      /DROP\s+CONSTRAINT\s+IF\s+EXISTS\s+export_jobs_revoked_at_after_created_at/iu,
+    );
+    expect(revocationMigration).not.toMatch(/CREATE\s+TABLE\b/iu);
+    expect(revocationMigration).not.toMatch(/CREATE\s+(?:UNIQUE\s+)?INDEX\b/iu);
+    // 回滚方式必须登记在迁移头部（可被集成测试提取后演练，而不是另抄一份）
+    expect(revocationMigration).toMatch(
+      /ALTER\s+TABLE\s+export_jobs\s+DROP\s+COLUMN\s+IF\s+EXISTS\s+revoked_at/iu,
+    );
 
     // 0008 是**约束补齐**（不建表）：它必须真的给 0004 建出的表加约束，而不是只在注释里声明
     const constraintMigration = readFileSync(

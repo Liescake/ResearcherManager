@@ -22,7 +22,8 @@ db/migrations/
 ├─ 0012_user_compliance.sql    本人合规状态聚合读模型（PostgreSQL 合规格切片）
 ├─ 0013_export_jobs.sql        导出请求事实表（PostgreSQL 导出仓储切片 · 状态读 / 创建 / 完成）
 ├─ 0014_ai_match_records_guards.sql  ai_match_records 存储层守卫补齐（存储 ID 域 + 结果行形状）
-└─ 0015_export_jobs_expiry.sql 导出请求事实表补服务端有效期列（导出下载切片 · 过期拒绝）
+├─ 0015_export_jobs_expiry.sql 导出请求事实表补服务端有效期列（导出下载切片 · 过期拒绝）
+└─ 0016_export_jobs_revocation.sql 导出请求事实表补服务端撤销列（导出本人撤销切片 · 取回交付能力）
 ```
 
 `0002`–`0005` 是第一个真实业务持久化切片（本人统计聚合读）所需的四张来源表：每张表都带
@@ -78,6 +79,24 @@ db/migrations/
 不加 DEFAULT 同样是有意的 —— 有效期只能由服务端时钟写入，存储层不得自行发明一个到期时刻。
 回滚方式登记在迁移头部：`ALTER TABLE export_jobs DROP COLUMN IF EXISTS expires_at`
 （只回滚本迁移新增的列与约束，不动 `0013` 建出的表、其它列与既有数据）。
+
+`0016` 给 `export_jobs` **补出服务端撤销列** `revoked_at timestamptz`（可空、无 DEFAULT）与两条
+CHECK：`export_jobs_revoked_at_matches_status`（`revoked_at IS NULL OR status IN ('pending',
+'completed')` —— 即 `failed` 结论不可撤销）与 `export_jobs_revoked_at_after_created_at`
+（撤销时刻不得早于创建时刻，NULL 放行）。`0013` / `0015` 都已应用且校验和钉住、不可改写，
+因此加列只能走新迁移；`revoked_at` 也由此成为 adapter 列清单里的真实列（第 10 列，下载失效判定与
+列表的 `revoked` 呈现都读它），但仍然**不进入公开视图**（撤销时刻不外发），所以同时被登记进
+`POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS` 与 `POSTGRES_EXPORT_PII_COLUMNS`。
+
+**撤销与状态机正交**：它不是第四个 `status` 取值，因此 `0013` 已建出的状态闭集 CHECK
+（`export_jobs_status_check`）与「产物短引用当且仅当 `completed` 时存在」的跨字段 CHECK
+（`export_jobs_artifact_matches_status`）在 `0016` 里**逐字不变** —— 撤销不删除记录、
+不清理产物（清理属异步后续切片），也不改写既有结论终态。可空是**语义**而不是遗漏：
+`NULL` = 「这条记录没有被撤销」；不加 DEFAULT 同样是有意的 —— 撤销时刻只能由服务端时钟写入。
+「已过期不可撤销」刻意**不**写成 CHECK：过期是相对当前时刻的性质，CHECK 必须对同一行永远成立，
+该规则留在 service 的撤销边界（与下载边界共用同一个过期判定）。
+回滚方式登记在迁移头部：`ALTER TABLE export_jobs DROP COLUMN IF EXISTS revoked_at`
+（只回滚本迁移新增的列与两个 CHECK，不动 `0013` / `0015` 建出的表、其它列与既有数据）。
 
 ## 命名与顺序
 

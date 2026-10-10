@@ -11,12 +11,14 @@ import {
   EXPORT_PAGE_DEFAULT_LIMIT,
   EXPORT_PAGE_MAX_LIMIT,
   EXPORT_RESOURCE_VALUES,
+  EXPORT_REVOCATION_AUDIT_RESULT_VALUES,
   EXPORT_STATUS_VALUES,
   ExportResource,
   ExportStatus,
   isExportResource,
 } from './exports.port';
-import type { ExportDownloadAuditEntry } from './exports.port';
+import type { ExportDownloadAuditEntry, ExportRevocationAuditEntry } from './exports.port';
+import { isExportRevocableStatus } from './exports.state-machine';
 
 /**
  * 导出切片的**输入闭集**、**服务端字段白名单**、**读取契约**与**输出白名单**。
@@ -43,9 +45,12 @@ import type { ExportDownloadAuditEntry } from './exports.port';
  * 输出白名单（`EXPORT_REQUEST_VIEW_FIELDS`）：对外视图**恰好**是
  * `id` / `resource` / `fields` / `status` / `createdAt` / `updatedAt`，
  * 不含归属 `ownerUserId`、不含产物句柄 `artifactId`、**也不含服务端有效期 `expiresAt`**
- * （到期时刻不外发：它只用于服务端判定，少一个对外事实就少一处可用来推断交付窗口的信息），
+ * 与**撤销时刻 `revokedAt`**
+ * （到期时刻与撤销时刻都不外发：它们只用于服务端判定，少一个对外事实就少一处可用来推断
+ * 交付窗口的信息），
  * 更**不含任何文件路径、下载地址、存储 key 或文件名**——这些字段在存储记录与端口返回值里
- * 就不存在（见 `exports.port.ts`）。因此本切片不扩大对外响应面：视图字段一个都不新增。
+ * 就不存在（见 `exports.port.ts`）。因此本切片不扩大对外响应面：视图字段一个都不新增，
+ * 撤销只让 `status` 多出一个**派生**取值 `revoked`（见 `EXPORT_VIEW_STATUS_VALUES`）。
  *
  * 读取契约（存储记录离开进程前的最后一道门）：字段闭集（`.strict()`）、枚举闭集、
  * 字段白名单子集与去重、状态与产物句柄自洽、**可选的服务端有效期（UTC ISO 或缺失）**、
@@ -233,6 +238,9 @@ const storedExportRequestObjectSchema = z
     // 「本地时间 / 带时区偏移 / 非 ISO 形态」的取值在这里就被拒绝，
     // 不会以「某个本地时刻」的语义流入判定。
     expiresAt: z.string().datetime().optional(),
+    // 服务端撤销时刻：缺省 = 未被撤销（存储侧 `NULL`）。与 `expiresAt` 同形（UTC ISO，只接受
+    // `Z` 结尾），因此撤销判定同样发生在绝对时刻轴上，与本地时区 / 夏令时无关。
+    revokedAt: z.string().datetime().optional(),
     createdAt: z.string().datetime(),
     updatedAt: z.string().datetime(),
   })
@@ -268,6 +276,19 @@ export const storedExportRequestSchema = storedExportRequestObjectSchema.superRe
         message: `${value.status} 状态不得携带服务端产物句柄`,
       });
     }
+
+    // 撤销与状态机正交，但**撤销只允许落在可撤销结论上**：`revokedAt` 存在时 `status` 必须是
+    // `pending` / `completed`（`failed` 没有可交付内容，撤销它只会凭空改写历史结论）。
+    // 这条规则与迁移 0016 的 CHECK `export_jobs_revoked_at_matches_status` 是同一件事的两种表达
+    // （前者可机器判定、后者在存储层兜底），因此不会出现「应用层放过、存储层拒绝」的漂移。
+    // 刻意**不**校验「撤销时刻晚于创建时刻」以外的时间关系：旧于当前的撤销时刻是合法历史事实。
+    if (value.revokedAt !== undefined && !isExportRevocableStatus(value.status)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['revokedAt'],
+        message: `${value.status} 结论不可被撤销（撤销只允许落在 pending / completed 上）`,
+      });
+    }
   },
 );
 
@@ -285,6 +306,34 @@ export const EXPORT_REQUEST_VIEW_FIELDS = [
 
 export type ExportRequestViewField = (typeof EXPORT_REQUEST_VIEW_FIELDS)[number];
 
+/**
+ * 对外**视图状态**的第四个取值：`revoked`。
+ *
+ * 它是**派生**状态，不是存储状态：存储侧 `status` 闭集仍然是三态
+ * （`pending` / `completed` / `failed`，见 `EXPORT_STATUS_VALUES`），撤销是独立的
+ * `revokedAt` 列。对外之所以必须给出一个可读状态，是因为「本人列表只对自己显示这条导出
+ * 已被取回」是本切片的交付要求；把它做成第四个**存储**状态会改写 0013 已应用的
+ * `status` CHECK 与「产物短引用当且仅当 completed 存在」的跨字段 CHECK，
+ * 也会让撤销看起来像一次状态机推进（它不是）。
+ *
+ * 不变量：视图状态 === `revoked` **当且仅当**存储记录的 `revokedAt` 存在；
+ * 因此下载边界（`revokedAt` 优先）与列表呈现（同一份 `toExportRequestView`）不会漂移。
+ */
+export const EXPORT_VIEW_REVOKED_STATUS = 'revoked' as const;
+
+/** 对外视图状态的完整闭集（存储三态 + 派生的 `revoked`） */
+export const EXPORT_VIEW_STATUS_VALUES = [
+  ...EXPORT_STATUS_VALUES,
+  EXPORT_VIEW_REVOKED_STATUS,
+] as const;
+export type ExportViewStatus = (typeof EXPORT_VIEW_STATUS_VALUES)[number];
+
+export function isExportViewStatus(value: unknown): value is ExportViewStatus {
+  return (
+    typeof value === 'string' && (EXPORT_VIEW_STATUS_VALUES as readonly string[]).includes(value)
+  );
+}
+
 /** 对外视图的必需字段：本切片的视图字段全部必需（没有条件字段，产物句柄一律不外发） */
 export const EXPORT_REQUEST_VIEW_REQUIRED_FIELDS = [
   'id',
@@ -301,21 +350,22 @@ export const exportRequestViewSchema = z
     id: uuidSchema,
     resource: z.enum(EXPORT_RESOURCE_VALUES),
     fields: z.array(z.enum(EXPORTABLE_FIELD_NAME_VALUES)).min(1).max(EXPORT_MAX_FIELD_COUNT),
-    status: z.enum(EXPORT_STATUS_VALUES),
+    status: z.enum(EXPORT_VIEW_STATUS_VALUES),
     createdAt: z.string().datetime(),
     updatedAt: z.string().datetime(),
   })
   .strict();
 
 /**
- * 对外视图：**不含**归属 `ownerUserId`、产物句柄 `artifactId`，
- * 也不含文件名/路径/下载地址/存储 key（这些字段在本切片的存储记录里就不存在）。
+ * 对外视图：**不含**归属 `ownerUserId`、产物句柄 `artifactId`、服务端有效期 `expiresAt`
+ * 与**撤销时刻 `revokedAt`**，也不含文件名/路径/下载地址/存储 key
+ * （这些字段在本切片的存储记录里就不存在，或者只承载不外发）。
  */
 export interface ExportRequestView {
   id: string;
   resource: ExportResource;
   fields: string[];
-  status: ExportStatus;
+  status: ExportViewStatus;
   createdAt: string;
   updatedAt: string;
 }
@@ -370,13 +420,19 @@ export function parseExportRequestView(view: unknown): ExportRequestViewParse {
   return { ok: false, issues: toIssues(parsed.error) };
 }
 
-/** 校验后的存储记录 → 对外视图（逐字段显式赋值，不使用对象展开，避免未知字段外泄） */
+/**
+ * 校验后的存储记录 → 对外视图（逐字段显式赋值，不使用对象展开，避免未知字段外泄）。
+ *
+ * `status` 是**派生**的：记录带 `revokedAt` 时对外呈现 `revoked`，否则原样呈现存储状态。
+ * 撤销时刻本身**不外发**（视图白名单里没有 `revokedAt`）：客户端只需要知道
+ * 「这条导出已被取回」，不需要（也不应该）知道服务端在哪个瞬时点写入的该事实。
+ */
 export function toExportRequestView(record: StoredExportRequest): ExportRequestView {
   return {
     id: record.id,
     resource: record.resource,
     fields: [...record.fields],
-    status: record.status,
+    status: record.revokedAt === undefined ? record.status : EXPORT_VIEW_REVOKED_STATUS,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
   };
@@ -903,9 +959,16 @@ export function buildExportDownloadDisposition(fileName: unknown): string {
   );
 }
 
-/** 下载审计摘要前缀与形态：`sha256:<32 位小写十六进制>` */
-export const EXPORT_DOWNLOAD_AUDIT_DIGEST_PREFIX = 'sha256:';
-export const EXPORT_DOWNLOAD_AUDIT_DIGEST_PATTERN = /^sha256:[0-9a-f]{32}$/u;
+/** 审计摘要前缀与形态：`sha256:<32 位小写十六进制>`（下载与撤销两条留痕共用同一套口径） */
+export const EXPORT_AUDIT_DIGEST_PREFIX = 'sha256:';
+export const EXPORT_AUDIT_DIGEST_PATTERN = /^sha256:[0-9a-f]{32}$/u;
+
+/**
+ * 下载审计摘要的历史拼写（值不变，与 `EXPORT_AUDIT_DIGEST_*` 逐字节相同）。
+ * 保留它只为让既有引用与既有断言不必改名；**不是**第二份口径。
+ */
+export const EXPORT_DOWNLOAD_AUDIT_DIGEST_PREFIX = EXPORT_AUDIT_DIGEST_PREFIX;
+export const EXPORT_DOWNLOAD_AUDIT_DIGEST_PATTERN = EXPORT_AUDIT_DIGEST_PATTERN;
 
 /** sha256 的前 `length` 位十六进制（内部工具，长度由调用方固定为常量） */
 function logSafeDigestHex(value: unknown, length: number): string {
@@ -920,7 +983,20 @@ function logSafeDigestHex(value: unknown, length: number): string {
  * 非字符串输入（存储或调用链损坏）按空串摘要，绝不把异常对象序列化进审计。
  */
 export function digestExportId(exportId: unknown): string {
-  return `${EXPORT_DOWNLOAD_AUDIT_DIGEST_PREFIX}${logSafeDigestHex(exportId, 32)}`;
+  return `${EXPORT_AUDIT_DIGEST_PREFIX}${logSafeDigestHex(exportId, 32)}`;
+}
+
+/**
+ * 请求主体（服务端会话主体）→ 撤销审计摘要：与 `digestExportId` **同一套**单向摘要口径
+ * （同一个前缀、同样只取 sha256 前 32 位十六进制）。
+ *
+ * 撤销审计需要能回答「谁取回了自己的交付能力」，因此必须有一个可按主体聚合的关联值；
+ * 记摘要而不是主体标识原值，使审计在保留关联能力的同时**不落任何原始标识**
+ * （摘要不可逆 ⇒ 审计泄露不等于主体标识泄露）。非字符串输入按空串摘要，绝不把异常对象
+ * 序列化进审计。
+ */
+export function digestRequesterId(requesterId: unknown): string {
+  return `${EXPORT_AUDIT_DIGEST_PREFIX}${logSafeDigestHex(requesterId, 32)}`;
 }
 
 /** 下载审计条目的字段白名单（顺序即文档顺序）：**恰好三个** */
@@ -995,6 +1071,217 @@ export type ExportDownloadAuditEntryParse =
 /** 校验一条下载审计条目；失败时只给字段路径与违规类型（不回显任何取值） */
 export function parseExportDownloadAuditEntry(entry: unknown): ExportDownloadAuditEntryParse {
   const parsed = exportDownloadAuditEntrySchema.safeParse(entry);
+  if (parsed.success) {
+    return { ok: true, value: parsed.data };
+  }
+  return { ok: false, issues: toIssues(parsed.error) };
+}
+
+/**
+ * ## 撤销切片（`POST /me/exports/:exportId/revoke`）的出口契约
+ *
+ * 与下载切片同构：这里只放「服务端常量 + 纯函数」，撤销的安全边界由四类固定判定构成：
+ * 1. **路径参数形态**（UUID）与**请求体 / 查询串闭集**（都是空集）；
+ * 2. **可撤销判定**（`classifyExportRevocation`：已撤销 ⇒ 幂等；`failed` / 已过期 ⇒ 统一拒绝）；
+ * 3. **统一安全拒绝**（`EXPORT_REVOCATION_UNAVAILABLE_MESSAGE`：与下载共用同一条
+ *    「不区分原因」的文案口径，且**状态码同形** 404）；
+ * 4. **脱敏审计**（`exportRevocationAuditEntrySchema`：requestId + 两个单向摘要 + 结果码）。
+ */
+
+/**
+ * 撤销端点的路径参数契约：与下载端点**同一份** UUID 形态契约（`uuidSchema`）。
+ * 非 UUID 一律按**统一安全拒绝**处理（与「不存在」同一个出口），因此非法形态既不会进入
+ * 存储，也不会泄露存在性；错误消息与审计结果都不回显该取值。
+ */
+export const exportRevokeIdSchema = uuidSchema;
+
+/**
+ * 撤销端点的**统一安全拒绝**文案：不存在 / 跨主体 / `failed` 结论 / 已过期 / 非法路径参数
+ * 全部共用这一条，**不区分原因**，因此调用方无法据此区分
+ * 「有没有这条导出、它是什么结论、它是否已经过期」。
+ *
+ * 刻意**不复用**下载的文案（「导出文件不存在或不可下载」）：撤销不是下载，把下载文案回给
+ * 撤销调用方会让「我在撤销什么」这件事变得含混；但两条文案的**口径**完全一致
+ * （同一个 404、同一条「不区分原因」的稳定文案、同一个审计不可用结果码）。
+ */
+export const EXPORT_REVOCATION_UNAVAILABLE_MESSAGE = '导出请求不存在或不可撤销';
+
+/**
+ * 撤销判定结论（纯函数出口，服务端唯一判定点）：
+ * - `revocable`：可以尝试条件写入（是否真的写成由仓储的条件更新决定）；
+ * - `already-revoked`：**已经**被撤销 ⇒ 幂等成功（**不是**错误，也不再改写撤销时刻）；
+ * - `unavailable`：**不可撤销** ⇒ 统一安全拒绝（`failed` 结论 / 已过期）。
+ *
+ * 不存在 / 跨主体**不在**这里：那两个结论在取数阶段就返回了 `undefined`，与
+ * `unavailable` 收敛到**同一个**对外出口（同一个 404、同一条文案、同一个审计结果码）。
+ */
+export const ExportRevocationVerdict = {
+  Revocable: 'revocable',
+  AlreadyRevoked: 'already-revoked',
+  Unavailable: 'unavailable',
+} as const;
+export type ExportRevocationVerdict =
+  (typeof ExportRevocationVerdict)[keyof typeof ExportRevocationVerdict];
+
+/**
+ * 可撤销判定（纯函数，服务端唯一判定点）。判定顺序**被测试固定**，且顺序本身是安全性质：
+ * 1. **已撤销优先**：`revokedAt` 存在 ⇒ `already-revoked`。它必须排在过期与结论判定之前，
+ *    否则「撤销一条早已过期、且已经撤销过」的导出会被判成 `unavailable` 而不是幂等成功 ——
+ *    撤销是**单调事实**，历史结论不能因为时间流逝而让重复请求从「幂等成功」漂移成「拒绝」；
+ * 2. **结论必须可撤销**：`failed` ⇒ `unavailable`（与存储层 CHECK
+ *    `export_jobs_revoked_at_matches_status` 同一条规则：撤销只允许落在 `pending` / `completed`）；
+ * 3. **已过期不可撤销**：`isExportDownloadExpired(expiresAt, nowMs)` 为真 ⇒ `unavailable`。
+ *    这一条与下载边界**共用同一个判定函数**，因此「能不能撤销」与「能不能下载」的过期语义
+ *    不可能漂移；
+ * 4. 其余 ⇒ `revocable`。
+ *
+ * `nowMs` 由调用方传入**服务端时钟读数的单次取值**（`Date.now()`），客户端提交的任何时间类
+ * 取值都不参与判定（`?expiresAt=` / `?revokedAt=` 在查询串闭集处就已经 400）。
+ */
+export function classifyExportRevocation(
+  record: {
+    readonly status: ExportStatus;
+    readonly revokedAt?: string;
+    readonly expiresAt?: string;
+  },
+  nowMs: number,
+): ExportRevocationVerdict {
+  if (record.revokedAt !== undefined) {
+    return ExportRevocationVerdict.AlreadyRevoked;
+  }
+  if (!isExportRevocableStatus(record.status)) {
+    return ExportRevocationVerdict.Unavailable;
+  }
+  if (isExportDownloadExpired(record.expiresAt, nowMs)) {
+    return ExportRevocationVerdict.Unavailable;
+  }
+  return ExportRevocationVerdict.Revocable;
+}
+
+/** 撤销端点声明的查询参数闭集：**空集**（与下载端点同口径：任何查询参数一律 400） */
+export const EXPORT_REVOCATION_QUERY_FIELDS = EXPORT_QUERY_FIELDS;
+
+/**
+ * 撤销端点声明的请求体字段闭集：**空集**（`POST` 不接受任何请求体字段）。
+ *
+ * 撤销需要的每一个入参都来自服务端：路径参数只有 `exportId`（形态由 service 校验）；
+ * 归属取会话主体；结论、有效期与撤销时刻都只能来自服务端存储与服务端时钟。
+ * 因此 `{ "userId": … }` / `{ "ownerId": … }` / `{ "artifactId": … }` / `{ "path": … }` /
+ * `{ "status": … }` / `{ "revokedAt": … }` 之类是必须**显式拒绝**的越权尝试（400），
+ * 而不是「被忽略的输入」；客户端的伪造头同样不进入判定（控制器只读 `authorization`）。
+ */
+export const EXPORT_REVOCATION_REQUEST_FIELDS = [] as const;
+
+/**
+ * 撤销端点的请求体闭集门禁：出现任何字段即抛 `ZodError` → 400，
+ * 拒绝原因区分「服务端独占字段」与「未声明字段」，且**不回显提交的取值**。
+ *
+ * 非对象请求体（缺体、`null`、数组、标量）不在这里拒绝：撤销没有必需的请求体字段，
+ * 空体是正常情形；数组与标量由「未声明字段」之外的路径处理（它们没有键名，
+ * 因此本函数不把它们当成输入，控制器也不读取它们 —— 撤销的判定完全不依赖请求体）。
+ */
+export function assertDeclaredExportRevocationRequestFields(body: unknown): void {
+  const unexpected = unexpectedFields(body, EXPORT_REVOCATION_REQUEST_FIELDS);
+  if (!unexpected) return;
+
+  const forbidden: readonly string[] = FORBIDDEN_EXPORT_REVOCATION_REQUEST_FIELDS;
+  throwUnexpectedFields(unexpected, (key) =>
+    forbidden.includes(key) ? `禁止设置服务端字段 ${key}` : `请求体包含未声明字段 ${key}`,
+  );
+}
+
+/**
+ * 撤销请求体里**服务端独占**的字段（禁止客户端提交）：归属、授权、结论、撤销时刻、
+ * 产物位置与产物句柄。它是 `FORBIDDEN_EXPORT_REQUEST_FIELDS` 的**超集**：
+ * 在创建请求体禁止项之上补出撤销切片自己的服务端事实（`revokedAt` / `revoked_at` /
+ * `revocation` / `revoke`）与下载切片的有效期（`expiresAt` 已在超集内）。
+ *
+ * 位置类字段（`fileUrl` / `downloadUrl` / `signedUrl` / `storageKey` / `objectKey` /
+ * `storageHandle` / `path`）刻意与创建请求体共用同一份清单：即使只被客户端声明，
+ * 也必须以可区分的原因拒绝 —— 这两类拒绝在安全上等价，但前者能明确表达
+ * 「这是服务端独占的能力引用」。
+ */
+export const FORBIDDEN_EXPORT_REVOCATION_REQUEST_FIELDS = [
+  ...FORBIDDEN_EXPORT_REQUEST_FIELDS,
+  'revokedAt',
+  'revoked_at',
+  'revocation',
+  'revoke',
+  'revokedBy',
+  'deleteArtifact',
+  'cleanup',
+] as const;
+
+/** 撤销审计条目的字段白名单（顺序即文档顺序）：**恰好四个** */
+export const EXPORT_REVOCATION_AUDIT_FIELDS = [
+  'requestId',
+  'exportIdDigest',
+  'requesterDigest',
+  'result',
+] as const;
+
+/**
+ * 撤销审计条目**禁止出现**的字段：在下载审计的禁止清单（产物内容 / 字节 / 响应体、
+ * 产物句柄、存储位置、归属主体、角色与权限、请求侧输入、原始错误）之上，
+ * 补出撤销切片自己的高危取值：**请求体**（body / requestBody）、**主体标识原值**
+ * （requesterId / requesterUserId / sessionId / subjectId）、**撤销时刻**（revokedAt）、
+ * 结论（status）与凭据类字段（secret / token / credential / authorization）。
+ *
+ * 该清单与 `exportRevocationAuditEntrySchema` 的 `.strict()` 是同一件事的两种表达
+ * （前者可读、后者可机器判定），因此「审计顺手多记一个字段」会被严格契约拒绝，
+ * 而不是被静默剥离。
+ */
+export const FORBIDDEN_EXPORT_REVOCATION_AUDIT_FIELDS = [
+  ...FORBIDDEN_EXPORT_DOWNLOAD_AUDIT_FIELDS,
+  'requestBody',
+  'requesterId',
+  'requesterUserId',
+  'requester_id',
+  'subjectId',
+  'sessionId',
+  'session',
+  'credential',
+  'credentials',
+  'secret',
+  'token',
+  'xRequestId',
+  'status',
+  'state',
+  'revokedAt',
+  'revoked_at',
+  'expiresAt',
+  'resource',
+  'fields',
+] as const;
+
+/**
+ * 撤销审计条目契约（**严格**）：恰好 `requestId` / `exportIdDigest` / `requesterDigest` /
+ * `result` 四个字段，任何多余字段（即任何业务取值）都会让解析失败。
+ *
+ * 两个摘要都是 `sha256:<32 位十六进制>` 单向摘要（`digestExportId` / `digestRequesterId`），
+ * 因此审计可关联而不可反推原值；`requestId` 是**服务端生成**的 UUID（客户端可提交的
+ * `x-request-id` 不进入审计）。
+ */
+export const exportRevocationAuditEntrySchema = z
+  .object({
+    requestId: uuidSchema,
+    exportIdDigest: z
+      .string()
+      .regex(EXPORT_AUDIT_DIGEST_PATTERN, '撤销审计导出摘要必须是 sha256 前 32 位十六进制'),
+    requesterDigest: z
+      .string()
+      .regex(EXPORT_AUDIT_DIGEST_PATTERN, '撤销审计主体摘要必须是 sha256 前 32 位十六进制'),
+    result: z.enum(EXPORT_REVOCATION_AUDIT_RESULT_VALUES),
+  })
+  .strict();
+
+export type ExportRevocationAuditEntryParse =
+  | { readonly ok: true; readonly value: ExportRevocationAuditEntry }
+  | { readonly ok: false; readonly issues: readonly ExportContractIssue[] };
+
+/** 校验一条撤销审计条目；失败时只给字段路径与违规类型（不回显任何取值） */
+export function parseExportRevocationAuditEntry(entry: unknown): ExportRevocationAuditEntryParse {
+  const parsed = exportRevocationAuditEntrySchema.safeParse(entry);
   if (parsed.success) {
     return { ok: true, value: parsed.data };
   }

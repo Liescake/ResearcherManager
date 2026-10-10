@@ -7,6 +7,7 @@ import {
   EXPORT_ARTIFACT_STORE,
   EXPORT_DOWNLOAD_AUDIT,
   EXPORT_REPOSITORY,
+  EXPORT_REVOCATION_AUDIT,
 } from '../modules/exports/exports.port';
 import { GROUP_REPOSITORY } from '../modules/groups/groups.port';
 import { MATCHING_AI_PROVIDER, MATCHING_FEATURE_SOURCE } from '../modules/matching/matching.port';
@@ -136,6 +137,13 @@ export const PERSISTENCE_BINDINGS: readonly PersistenceBindingDescriptor[] = [
     module: 'exports',
     responsibility:
       '下载留痕出口（只追加脱敏三元组：服务端 requestId / 导出 ID 单向摘要 / 结果码）——留痕必须可跨重启保留，否则生产环境不得声称可用',
+    role: 'business',
+  },
+  {
+    token: EXPORT_REVOCATION_AUDIT,
+    module: 'exports',
+    responsibility:
+      '撤销留痕出口（只追加脱敏四元组：服务端 requestId / 导出 ID 单向摘要 / 请求主体单向摘要 / 结果码 success|duplicate|unavailable）——与下载留痕刻意分开，且同样必须可跨重启保留，否则生产环境不得声称可用',
     role: 'business',
   },
   {

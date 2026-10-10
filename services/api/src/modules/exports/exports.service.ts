@@ -14,17 +14,23 @@ import {
   EXPORT_DOWNLOAD_MAX_BYTES,
   EXPORT_DOWNLOAD_UNAVAILABLE_MESSAGE,
   EXPORT_REQUEST_INTEGRITY_MESSAGE,
+  EXPORT_REVOCATION_UNAVAILABLE_MESSAGE,
+  ExportRevocationVerdict,
   assertDeclaredExportListQueryFields,
   assertDeclaredExportQueryFields,
   assertDeclaredExportRequestFields,
+  assertDeclaredExportRevocationRequestFields,
   assertSafeExportDownloadHeaderValue,
   buildExportDownloadDisposition,
   buildExportDownloadFilename,
+  classifyExportRevocation,
   digestExportId,
+  digestRequesterId,
   exportDownloadIdSchema,
   exportExpiresAtFrom,
   exportListQuerySchema,
   exportRequestInputSchema,
+  exportRevokeIdSchema,
   isExportDownloadExpired,
   parseExportRequestView,
   parseStoredExportRequest,
@@ -41,8 +47,11 @@ import {
   EXPORT_ARTIFACT_STORE,
   EXPORT_DOWNLOAD_AUDIT,
   EXPORT_REPOSITORY,
+  EXPORT_REVOCATION_AUDIT,
   ExportDownloadAuditResult,
   ExportResource,
+  ExportRevocationAuditResult,
+  ExportRevocationOutcome,
   ExportStatus,
   isExportTransitionRejection,
 } from './exports.port';
@@ -52,6 +61,8 @@ import type {
   ExportDownloadAuditSink,
   ExportRepository,
   ExportRequest,
+  ExportRevocationAuditSink,
+  ExportRevocationResult,
 } from './exports.port';
 import { EXPORT_ENTRY_STATUS, assertExportTransition } from './exports.state-machine';
 
@@ -59,9 +70,10 @@ import { EXPORT_ENTRY_STATUS, assertExportTransition } from './exports.state-mac
  * 导出切片（本人侧）：
  * - `POST /me/exports` 创建**本人**的导出请求（服务端白名单资源 + 字段）；
  * - `GET  /me/exports` 本人导出请求列表与状态；
- * - `GET  /me/exports/:exportId/download` 下载本人**已完成**导出的产物内容。
+ * - `GET  /me/exports/:exportId/download` 下载本人**已完成**导出的产物内容；
+ * - `POST /me/exports/:exportId/revoke` **本人撤销**自己的导出请求（写 `revoked_at`）。
  *
- * 七条硬约束（前六条对三条路由都成立，第七条只对下载成立）：
+ * 硬约束（前六条对四条路由都成立；第七条只对下载成立；第八条只对撤销成立）：
  * 1. **主体与结论都来自服务端**：`ownerUserId` 取 `AuthorizationSubject.userId`（由
  *    `SESSION_SUBJECT_RESOLVER` 从服务端会话存储解析），`id` / `artifactId` 是服务端 UUID，
  *    `status` 只由状态机写入（入口恒为 `pending`），`createdAt` / `updatedAt` 取服务端时钟；
@@ -109,6 +121,22 @@ import { EXPORT_ENTRY_STATUS, assertExportTransition } from './exports.state-mac
  *    - 下载留痕只写**脱敏三元组**（服务端生成的 requestId、导出 ID 的单向摘要、结果码），
  *      不写内容、产物位置、有效期、归属、请求侧输入或 PII；留痕失败即 500
  *      （不做「没有留痕的成功下载」）。
+ * 8. **撤销只取回交付能力，不删除任何东西**（`POST /me/exports/:exportId/revoke`）：
+ *    - 归属只来自**会话主体**并下推进存储（`findByIdForOwner`）；客户端提交的
+ *      `userId` / `ownerId` / `artifactId` / `path` / `status` / `revokedAt` 一律 400
+ *      （查询串闭集与请求体空闭集），自定义头从不进入判定；
+ *    - 可撤销判定是**纯函数**且只用**单次**服务端时钟读数：已撤销 ⇒ 幂等成功；
+ *      `failed` 结论 / 已过期 ⇒ 与「不存在 / 跨主体」收敛到**同一个** 404 出口；
+ *    - 写库是**条件更新**：`WHERE id + 归属 + 可撤销前驱集合 + revoked_at IS NULL`，
+ *      `SET` **只**写 `revoked_at` / `updated_at` —— 不覆盖 `created_at` / `expires_at` /
+ *      `artifact_id` / `status`（`failed` 终态写不中），也不删行、不清理产物；
+ *    - **撤销优先于完成**：`save`（状态机推进）的 `SET` 列表里没有 `revoked_at`，
+ *      因此并发完成既不会清空撤销事实、也不会被撤销的条件谓词挡住；下载边界按
+ *      「已撤销 ⇒ 统一拒绝」判定，撤销事实**胜出**，一次并发完成不能把已取回的交付能力放开；
+ *    - 撤销留痕只写**脱敏四元组**（服务端 requestId、导出 ID 单向摘要、**请求主体单向摘要**、
+ *      结果码 `success` / `duplicate` / `unavailable`），**不写 body**、不写 PII / 路径 /
+ *      storage key / 产物句柄 / secret；留痕失败即 500（但已落库的撤销时刻不回滚 ——
+ *      单调事实 + 幂等入口使客户端重试自然收敛到 `duplicate`）。
  *
  * 授权口径（已知偏差，与审计/通知/统计切片的处理同构，属后续版本项）：权限目录是**闭集**
  * （docs/P2-权限目录与状态机.md §1「未列出即拒绝」），其中 `export:{resource}:create` 的默认范围
@@ -124,11 +152,14 @@ import { EXPORT_ENTRY_STATUS, assertExportTransition } from './exports.state-mac
  * 两段语义独立（入口 = 本人导出入口；资源 = 该资源的本人读取），重复判定不改变结果。
  *
  * 尚不包含（明确留给后续切片）：真实文件生成与字段级脱敏、**过期产物的清理 / 回收**
- * （本切片只判定「过期即拒绝下载」，不做删除、不做撤销）、有效期续期或撤销入口、
+ * （本切片只判定「过期即拒绝下载」，并允许「未过期且未撤销」的导出被本人撤销；
+ * 撤销**不做**物理删除与产物清理 —— 异步清理属后续切片，能力边界登记在
+ * `EXPORT_REVOCATION_CLEANUP_BOUNDARY`）、有效期续期入口、
  * 管理端 `POST /admin/exports` 与按资源/范围的导出、**列表的筛选**（分页已在本切片落地：
  * 键集分页 + 不透明签名游标）、幂等键与元数据落库、下载限流与审计的持久化查询面。
  * 下载切片已落地的是**交付边界**本身（归属、状态、授权、硬上限、响应头、留痕脱敏），
- * 它复用内存基线产物存储的**最小读能力**，不伪造生产文件下载。
+ * 撤销切片已落地的是**取回边界**本身（归属、可撤销判定、条件更新、幂等、留痕脱敏），
+ * 它们复用内存基线产物存储的**最小读能力**，不伪造生产文件下载。
  *
  * ## 列表分页的安全边界（本切片新增）
  * - **游标是不透明签名串**：载荷只有版本号与两个排序键分量（该主体在公开视图里已经收到的
@@ -150,6 +181,7 @@ export class ExportsService {
     @Inject(EXPORT_REPOSITORY) private readonly repository: ExportRepository,
     @Inject(EXPORT_ARTIFACT_STORE) private readonly artifacts: ExportArtifactStore,
     @Inject(EXPORT_DOWNLOAD_AUDIT) private readonly downloadAudit: ExportDownloadAuditSink,
+    @Inject(EXPORT_REVOCATION_AUDIT) private readonly revocationAudit: ExportRevocationAuditSink,
     @Inject(EXPORT_CURSOR_CODEC) private readonly cursors: ExportCursorCodec,
   ) {}
 
@@ -395,7 +427,16 @@ export class ExportsService {
       return this.failDownload(requestId, exportIdDigest, '存储记录归属与会话主体不一致');
     }
 
-    // 8. 只有 `completed` 且带服务端产物句柄才可下载；pending / failed 收敛到同一拒绝
+    // 8. **已撤销优先**（本切片新增）：只要记录带服务端撤销时刻，就一律不可下载 —— 收敛到
+    //    **同一个**统一安全拒绝。它刻意排在状态判定**之前**，因为撤销与状态机正交：
+    //    「并发撤销 / 完成」可以让记录同时是 `completed` 且已撤销，此时撤销事实必须**胜出**
+    //    （否则一次并发完成就能把刚被取回的交付能力重新放开）。判定只读服务端存储里的
+    //    `revokedAt`，客户端提交的任何取值都不参与（`?revoked=…` 在查询串闭集处就已经 400）。
+    if (parsed.value.revokedAt !== undefined) {
+      return this.rejectDownload(requestId, exportIdDigest);
+    }
+
+    // 9. 只有 `completed` 且带服务端产物句柄才可下载；pending / failed 收敛到同一拒绝
     if (parsed.value.status !== ExportStatus.Completed) {
       return this.rejectDownload(requestId, exportIdDigest);
     }
@@ -404,7 +445,7 @@ export class ExportsService {
       return this.rejectDownload(requestId, exportIdDigest);
     }
 
-    // 9. **服务端有效期门禁**（唯一判定点，纯函数，见 `isExportDownloadExpired`）：
+    // 10. **服务端有效期门禁**（唯一判定点，纯函数，见 `isExportDownloadExpired`）：
     //    - 时钟：只读一次服务端时钟（`Date.now()`，UTC 瞬时点），客户端提交的任何时间类取值
     //      都不参与判定（`?expiresAt=` 在查询串闭集处就已经 400）；
     //    - 比较：绝对时刻比较（存储值由 `exportExpiresAtFrom` 产出为 UTC ISO `Z` 形态），
@@ -420,10 +461,10 @@ export class ExportsService {
       return this.rejectDownload(requestId, exportIdDigest);
     }
 
-    // 10. 资源级授权：权限点由记录里的服务端资源映射，客户端无法影响
+    // 11. 资源级授权：权限点由记录里的服务端资源映射，客户端无法影响
     this.authorizeResource(subject, parsed.value.resource);
 
-    // 11. 产物读取：故障 fail-closed；缺失收敛到统一拒绝
+    // 12. 产物读取：故障 fail-closed；缺失收敛到统一拒绝
     let content: ExportArtifactContent | undefined;
     try {
       content = await this.artifacts.read(artifactId);
@@ -447,7 +488,7 @@ export class ExportsService {
       return this.failDownload(requestId, exportIdDigest, '产物超过下载硬上限');
     }
 
-    // 12. 响应头取值由服务端常量派生，再过一次头注入门禁（CRLF / 路径 / 引号 ⇒ fail-closed）
+    // 13. 响应头取值由服务端常量派生，再过一次头注入门禁（CRLF / 路径 / 引号 ⇒ fail-closed）
     let fileName: string;
     try {
       fileName = buildExportDownloadFilename(parsedId.data);
@@ -457,10 +498,163 @@ export class ExportsService {
       return this.failDownload(requestId, exportIdDigest, `响应头不合法(${errorName(error)})`);
     }
 
-    // 13. 留痕成功后才交付内容：审计不可用时绝不返回「看起来成功但没有留痕」的下载
+    // 14. 留痕成功后才交付内容：审计不可用时绝不返回「看起来成功但没有留痕」的下载
     await this.recordDownloadAudit(requestId, exportIdDigest, ExportDownloadAuditResult.Success);
 
     return { bytes, fileName, contentType: EXPORT_DOWNLOAD_CONTENT_TYPE };
+  }
+
+  /**
+   * **本人撤销自己的导出请求**（`POST /me/exports/:exportId/revoke`）。
+   *
+   * 判定顺序（被测试固定）：
+   * 1. 入口授权（服务端常量，`profile:self:read` + `SELF`）→ 拒绝即 403，此时**仓储、产物存储与
+   *    两条审计出口一次都不会被调用**（未授权主体既不落库、也不留痕）；
+   * 2. 查询串闭集：任何查询参数一律 400（`?userId=`/`?ownerUserId=`/`?artifactId=`/`?path=`/
+   *    `?status=`/`?revokedAt=`…），且**不回显取值**；自定义头从不进入判定（控制器只读
+   *    `authorization`）；
+   * 3. 请求体闭集：**空集** —— 任何字段都 400（服务端独占字段与未声明字段可区分），
+   *    因此归属、结论、撤销时刻、产物句柄与路径都不可能由客户端声明；
+   * 4. 路径参数形态：非 UUID 与「不存在」走**同一个拒绝出口**（不进任何存储）；
+   * 5. 取数：`findByIdForOwner(exportId, subject.userId)` —— 归属来自**会话主体**并下推进存储，
+   *    因此「他人的导出」与「不存在的导出」不可区分（都是 `undefined` → 同一个 404）；
+   * 6. 读取契约 + 归属复核（纵深防御）→ 违规即 fail-closed 500；
+   * 7. 可撤销判定（纯函数 `classifyExportRevocation`，**单次服务端时钟读数**）：
+   *    - 已撤销 ⇒ **幂等成功**（`duplicate` 留痕，返回当前视图，**不**再写库）；
+   *    - `failed` 结论 / 已过期 ⇒ **统一安全拒绝**（`unavailable` 留痕，404 同一条文案）；
+   * 8. 条件写入：`revokeForOwner(exportId, subject.userId, revokedAt)` —— `WHERE` 钉住
+   *    归属、可撤销前驱集合与 `revoked_at IS NULL`，`SET` **只**写 `revoked_at` / `updated_at`；
+   *    0 行时由仓储自己的归属范围内诊断给出 `already-revoked` / `not-revocable` / `undefined`
+   *    （并发撤销与并发完成都在这里收敛成**同一组**结论，绝不覆盖既有事实）；
+   * 9. 三种结论分别留痕（`success` / `duplicate` / `unavailable`）后返回或拒绝；
+   *    **留痕失败即 500**，但撤销时刻已经落库（单调事实不回滚）—— 客户端重试会因幂等
+   *    落到 `duplicate` 分支，这正是「单调事实 + 幂等入口」要的行为。
+   *
+   * **不做的事**（本切片的能力边界）：不物理删除记录（端口上没有删除方法）、不同步清理产物
+   * （撤销路径对 `ExportArtifactStore` 的调用次数恒为 0，见
+   * `EXPORT_REVOCATION_CLEANUP_BOUNDARY`）、不改写 `status` / `artifactId` / `expiresAt` /
+   * `createdAt`、不新增权限点（复用 `profile:self:read` 的自我读取门控）。
+   *
+   * 返回的载荷是既有 `ExportRequestView` 闭集（**没有新增字段**）：已撤销时其 `status` 呈现为
+   * `revoked`（由 `revokedAt` 派生），撤销时刻、产物句柄与归属都不外发。
+   */
+  async revokeMyExportRequest(
+    subject: AuthorizationSubject,
+    exportId: unknown,
+    query: unknown,
+    body: unknown,
+  ): Promise<ExportRequestView> {
+    // 1. 入口授权先于任何输入校验与任何端口调用
+    this.authorizeEntry(subject);
+
+    // 2. 查询串闭集：撤销端点同样不接受任何查询参数
+    assertDeclaredExportQueryFields(query);
+
+    // 3. 请求体闭集：空集（归属 / 结论 / 撤销时刻 / 产物位置都不是「被忽略的输入」）
+    assertDeclaredExportRevocationRequestFields(body);
+
+    // 4. 留痕用关联 ID 与两个摘要都由**服务端**生成：客户端可提交的 `x-request-id` 不进入审计，
+    //    主体也**不落原值**（只落单向摘要）
+    const requestId = randomUUID();
+    const exportIdDigest = digestExportId(typeof exportId === 'string' ? exportId : '');
+    const requesterDigest = digestRequesterId(subject.userId);
+
+    // 5. 路径参数形态：非 UUID 与「不存在」共用同一拒绝出口（不泄露存在性）
+    const parsedId = exportRevokeIdSchema.safeParse(exportId);
+    if (!parsedId.success) {
+      return this.rejectRevocation(requestId, exportIdDigest, requesterDigest);
+    }
+
+    // 6. 取数：归属下推进仓储；他人记录与不存在返回同一个 undefined
+    let record: ExportRequest | undefined;
+    try {
+      record = await this.repository.findByIdForOwner(parsedId.data, subject.userId);
+    } catch (error) {
+      return this.failRevocation(
+        requestId,
+        exportIdDigest,
+        requesterDigest,
+        `取数故障(${errorName(error)})`,
+      );
+    }
+    if (record === undefined) {
+      return this.rejectRevocation(requestId, exportIdDigest, requesterDigest);
+    }
+
+    // 7. 读取契约与归属复核（纵深防御：仓储未按主体过滤 / 数据被外部改写 → 500）
+    const parsed = parseStoredExportRequest(record);
+    if (!parsed.ok) {
+      return this.failRevocation(
+        requestId,
+        exportIdDigest,
+        requesterDigest,
+        '存储记录违反读取契约',
+      );
+    }
+    if (readExportOwnerId(parsed.value) !== subject.userId) {
+      return this.failRevocation(
+        requestId,
+        exportIdDigest,
+        requesterDigest,
+        '存储记录归属与会话主体不一致',
+      );
+    }
+
+    // 8. 服务端时钟只读**一次**：判定用的「当前时刻」与写入用的撤销时刻取自同一次读取，
+    //    因此「已过期不可撤销」的边界不会因为两次时钟读取的漂移产生噪音。
+    const nowMs = Date.now();
+    const verdict = classifyExportRevocation(parsed.value, nowMs);
+
+    if (verdict === ExportRevocationVerdict.AlreadyRevoked) {
+      // 幂等成功：不写库、不改写既有撤销时刻，只如实留痕 `duplicate` 并返回当前视图
+      await this.recordRevocationAudit(
+        requestId,
+        exportIdDigest,
+        requesterDigest,
+        ExportRevocationAuditResult.Duplicate,
+      );
+      return this.toOwnedView(parsed.value, subject.userId);
+    }
+    if (verdict === ExportRevocationVerdict.Unavailable) {
+      // 不可撤销（failed 结论 / 已过期）：与「不存在 / 跨主体」收敛到同一个 404 出口
+      return this.rejectRevocation(requestId, exportIdDigest, requesterDigest);
+    }
+
+    // 9. 条件写入。仓储故障（执行器异常 / 行契约损坏）是基础设施故障 ⇒ fail-closed 500，
+    //    绝不被伪装成「不可撤销」的统一 404。
+    const revokedAt = new Date(nowMs).toISOString();
+    let outcome: ExportRevocationResult | undefined;
+    try {
+      outcome = await this.repository.revokeForOwner(parsedId.data, subject.userId, revokedAt);
+    } catch (error) {
+      return this.failRevocation(
+        requestId,
+        exportIdDigest,
+        requesterDigest,
+        `撤销写入故障(${errorName(error)})`,
+      );
+    }
+    if (outcome === undefined) {
+      // 记录在「预读」与「条件写入」之间不可见：只有「不存在 / 属于他人」会给出 undefined，
+      // 两种情形都与统一拒绝同形（不泄露存在性）。
+      return this.rejectRevocation(requestId, exportIdDigest, requesterDigest);
+    }
+
+    // 10. 条件写入的**结论**决定留痕结果码与对外出口：并发撤销 ⇒ duplicate（幂等成功），
+    //     结论不可撤销 ⇒ unavailable（统一拒绝）。两者都不改写既有事实。
+    const result =
+      outcome.outcome === ExportRevocationOutcome.Revoked
+        ? ExportRevocationAuditResult.Success
+        : outcome.outcome === ExportRevocationOutcome.AlreadyRevoked
+          ? ExportRevocationAuditResult.Duplicate
+          : ExportRevocationAuditResult.Unavailable;
+
+    if (result === ExportRevocationAuditResult.Unavailable) {
+      return this.rejectRevocation(requestId, exportIdDigest, requesterDigest);
+    }
+
+    await this.recordRevocationAudit(requestId, exportIdDigest, requesterDigest, result);
+    return this.toOwnedView(outcome.record, subject.userId);
   }
 
   /**
@@ -507,6 +701,75 @@ export class ExportsService {
       await this.downloadAudit.record({ requestId, exportIdDigest, result });
     } catch (error) {
       this.logger.error(`[exports] 下载审计写入失败: ${errorName(error)}`);
+      throw new InternalServerErrorException(EXPORT_REQUEST_INTEGRITY_MESSAGE);
+    }
+  }
+
+  /**
+   * **撤销的统一安全拒绝**出口：不存在 / 跨主体 / `failed` 结论 / 已过期 / 非法路径参数
+   * 全部收敛到这里，状态码、错误码与文案完全一致，因此调用方无法据此区分
+   * 「有没有这条导出、它是什么结论、它是否已经过期」。
+   *
+   * 留痕结果码固定为 `unavailable`（撤销**没有**发生）：它同样不区分原因，因此审计本身
+   * 也不变成存在性预言机。
+   */
+  private async rejectRevocation(
+    requestId: string,
+    exportIdDigest: string,
+    requesterDigest: string,
+  ): Promise<never> {
+    await this.recordRevocationAudit(
+      requestId,
+      exportIdDigest,
+      requesterDigest,
+      ExportRevocationAuditResult.Unavailable,
+    );
+    throw new NotFoundException(EXPORT_REVOCATION_UNAVAILABLE_MESSAGE);
+  }
+
+  /**
+   * 撤销的 fail-closed 出口：取数故障、存储记录违约、归属不一致、撤销写入故障。
+   * 对外只给统一内部错误（不泄露原因），日志只写**原因标签与错误名**，
+   * 绝不写取值（归属标识、记录 ID、撤销时刻、原始错误文本都可能出现在取值里）。
+   *
+   * 留痕同样记 `unavailable`：撤销没有发生这一事实是真的，而结果码闭集刻意只有三个
+   * （成功 / 重复 / 不可用），因此基础设施故障与业务拒绝**共享**同一个「未生效」结果码 ——
+   * 与下载切片的 `failed` 不同，这里的闭集是用户明确要求的三个取值。
+   */
+  private async failRevocation(
+    requestId: string,
+    exportIdDigest: string,
+    requesterDigest: string,
+    reason: string,
+  ): Promise<never> {
+    this.logger.error(`[exports] 撤销 fail-closed：${reason}`);
+    await this.recordRevocationAudit(
+      requestId,
+      exportIdDigest,
+      requesterDigest,
+      ExportRevocationAuditResult.Unavailable,
+    );
+    throw new InternalServerErrorException(EXPORT_REQUEST_INTEGRITY_MESSAGE);
+  }
+
+  /**
+   * 撤销留痕：只写**脱敏四元组**（服务端 requestId、导出 ID 单向摘要、请求主体单向摘要、
+   * 结果码）。**不写** request body、PII、路径、storage key、产物句柄与任何 secret ——
+   * 端口类型与严格契约（`exportRevocationAuditEntrySchema`）在结构上就装不下它们。
+   *
+   * 审计失败（存储故障或条目违约）一律 fail-closed 为 500：审计不可用时不得让撤销「静默成功」。
+   * 日志只写错误名，不写审计错误原文（原文可能含内部路径与连接信息）。
+   */
+  private async recordRevocationAudit(
+    requestId: string,
+    exportIdDigest: string,
+    requesterDigest: string,
+    result: ExportRevocationAuditResult,
+  ): Promise<void> {
+    try {
+      await this.revocationAudit.record({ requestId, exportIdDigest, requesterDigest, result });
+    } catch (error) {
+      this.logger.error(`[exports] 撤销审计写入失败: ${errorName(error)}`);
       throw new InternalServerErrorException(EXPORT_REQUEST_INTEGRITY_MESSAGE);
     }
   }

@@ -39,16 +39,19 @@ import {
  *
  * ## 断言的硬性质（离线 spec 无法证明、必须在真库上闭环的）
  * 1. **schema 由仓库真实迁移建立**：`export_jobs` 由迁移 `0013` 建出、服务端有效期列 `expires_at`
- *    由迁移 `0015` 补出，列清单**恰好**是 adapter 的 9 个输出列（一个内部列都没有，且
- *    `expires_at` 是 `timestamptz` + **可空**）；主键是 `id`；`(requester_id, created_at, id)`
- *    取数索引、状态闭集 / 归属非空 UUID / 产物与状态自洽 / 「有效期必须晚于创建时间」的 CHECK 齐备；
+ *    由迁移 `0015` 补出、服务端撤销列 `revoked_at` 由迁移 `0016` 补出，列清单**恰好**是 adapter
+ *    的 10 个输出列（一个内部列都没有，且 `expires_at` / `revoked_at` 都是 `timestamptz` +
+ *    **可空**）；主键是 `id`；`(requester_id, created_at, id)` 取数索引、状态闭集 / 归属非空 UUID /
+ *    产物与状态自洽 / 「有效期必须晚于创建时间」/ 「撤销只落在可撤销结论上」/「撤销时刻不早于
+ *    创建时刻」的 CHECK 齐备；
  * 2. **读写闭环**：`create`（入口恒为 `pending`，服务端有效期随创建落库）→ `save`（推进到
  *    `completed` 并落服务端短引用，**不改写有效期**）→ `listByOwnerId` 逐字段往返，
  *    且返回对象**只有**端口契约的字段（没有任何位置 / 凭据 / 签名）；
  * 3. **服务端有效期的存储语义**：`NULL` 往返为「字段缺省」（下载边界据此 fail-closed），
  *    非空值按 `timestamptz` 与 UTC ISO 无损互转；`expires_at <= created_at` 被存储层 CHECK 拒绝；
- * 4. **迁移可逆**：`0015` 的回滚 DDL（`DROP COLUMN IF EXISTS expires_at`）从迁移文件本身取出，
- *    在真实事务里执行并核对，随后整体回滚（演练不改变真实 schema）；
+ * 4. **迁移可逆**：`0015` 的回滚 DDL（`DROP COLUMN IF EXISTS expires_at`）与 `0016` 的回滚 DDL
+ *    （`DROP COLUMN IF EXISTS revoked_at`）都从迁移文件本身取出，在真实事务里执行并核对，
+ *    随后整体回滚（演练不改变真实 schema）；
  * 5. **归属隔离**：库里同时存在多个主体时只返回请求主体的记录；跨主体写回**一行都写不中**
  *    （`NOT_FOUND`，不外泄「该 ID 属于他人」），他人记录既不出库也不回流；
  * 6. **主键冲突**：同 ID 第二次 `create` 抛 `CONFLICT`，不静默覆盖既有导出请求；
@@ -66,6 +69,11 @@ import {
  *    行数恰好等于 `limit` 时 `hasNext = false`；他人名下的行既不出库也不影响本主体的
  *    `hasNext`；下推语句含归属谓词与边界谓词、**没有 `OFFSET`**，键值只出现在参数里；
  *    非法窗口 / 非法边界在真库上**一个 SQL 都不下发**。
+ * 12. **他人撤销（`revokeForOwner`）**：条件更新只写 `revoked_at` / `updated_at`（结论与产物
+ *    句柄原样保留，记录**不被删除**）；重复撤销幂等（既有撤销时刻逐字节不变）；`failed` 不可撤销
+ *    （一行都没写中）；跨主体得到 `undefined`（与「不存在」不可区分）且一行都没写中；
+ *    **并发撤销 / 完成**下撤销事实胜出（`save` 不得清空 `revoked_at`）；
+ *    绕过应用层也写不坏（`failed` 行带 `revoked_at` 与「撤销早于创建」都被存储层 23514 拒绝）。
  *
  * ## 为什么需要清理行
  * 与只追加的审计表不同，本表是可变的业务表，因此本套件在 `afterAll` 里按**本次运行写入的主键
@@ -273,7 +281,7 @@ integrationDescribe(
       }
     });
 
-    it('export_jobs 由迁移 0013 + 0015 建立：列清单恰好是 adapter 的 9 列，且一个内部列都没有', async () => {
+    it('export_jobs 由迁移 0013 + 0015 + 0016 建立：列清单恰好是 adapter 的 10 列，且一个内部列都没有', async () => {
       const exists = await query<{ exists: boolean }>(
         'SELECT to_regclass($1::text) IS NOT NULL AS exists',
         [`public.${POSTGRES_EXPORT_TABLE}`],
@@ -303,6 +311,13 @@ integrationDescribe(
       expect(expiry).toBeDefined();
       expect(expiry?.data_type).toBe('timestamp with time zone');
       expect(expiry?.is_nullable).toBe('YES');
+
+      // 服务端撤销列由迁移 0016 补出：同样是 `timestamptz`（绝对时刻）且**可空**
+      // —— `NULL` = 未被撤销，它不是「忘了加 NOT NULL」。
+      const revocation = columns.find((row) => row.column_name === 'revoked_at');
+      expect(revocation).toBeDefined();
+      expect(revocation?.data_type).toBe('timestamp with time zone');
+      expect(revocation?.is_nullable).toBe('YES');
 
       const primaryKey = await query<{ column_name: string }>(
         `SELECT a.attname AS column_name
@@ -340,6 +355,8 @@ integrationDescribe(
         'export_jobs_requester_id_not_nil',
         'export_jobs_artifact_id_not_nil',
         'export_jobs_expires_at_after_created_at',
+        'export_jobs_revoked_at_matches_status',
+        'export_jobs_revoked_at_after_created_at',
       ]) {
         expect(constraintNames).toContain(expected);
       }
@@ -349,6 +366,24 @@ integrationDescribe(
       // NULL 必须放行（fail-closed 的合法存储形态），因此约束定义里必须有 IS NULL 分支
       expect(expiryCheck?.definition).toMatch(/expires_at IS NULL/iu);
       expect(expiryCheck?.definition).toMatch(/expires_at > created_at/iu);
+
+      // 撤销的两条 CHECK 必须真的存在，且语义与 adapter 的可撤销前驱集合一致：
+      // 撤销只落在 pending / completed 上（failed 不可撤销），且不得早于创建时刻
+      const revocationCheck = constraints.find(
+        (row) => row.conname === 'export_jobs_revoked_at_matches_status',
+      );
+      expect(revocationCheck?.definition).toMatch(/revoked_at IS NULL/iu);
+      expect(revocationCheck?.definition).toMatch(/pending/iu);
+      expect(revocationCheck?.definition).toMatch(/completed/iu);
+      expect(revocationCheck?.definition).not.toMatch(/failed/iu);
+      const revocationOrderCheck = constraints.find(
+        (row) => row.conname === 'export_jobs_revoked_at_after_created_at',
+      );
+      expect(revocationOrderCheck?.definition).toMatch(/revoked_at IS NULL/iu);
+      expect(revocationOrderCheck?.definition).toMatch(/revoked_at >= created_at/iu);
+      // 状态闭集**没有**被 0016 改写（撤销不是第四个 status 取值）
+      const statusCheck = constraints.find((row) => row.conname === 'export_jobs_status_check');
+      expect(statusCheck?.definition).not.toMatch(/revoked/iu);
     }, 60_000);
 
     it('读写闭环：create（入口 pending）→ save（推进 completed + 服务端短引用）→ 按主体取数逐字段往返', async () => {
@@ -545,6 +580,236 @@ integrationDescribe(
       ).rejects.toThrow(ROLLBACK_SENTINEL);
       // 事务已回滚：真实 schema 仍然有该列（演练不产生持久影响）
       expect(await columnExists(connection as SqlConnection)).toBe(true);
+    }, 60_000);
+
+    it('迁移 0016 可逆：回滚 DDL 能真的把 revoked_at 卸掉（在事务里演练，不动真实 schema）', async () => {
+      // 与 0015 的回滚演练同构：回滚 DDL 从**迁移文件本身**取出（不在测试里另抄一份），
+      // 在一次真实事务里执行并核对，然后整体 ROLLBACK —— 演练完 schema 逐列不变。
+      const migrationPath = resolveMigrationsDirectory();
+      const source = readFileSync(join(migrationPath, '0016_export_jobs_revocation.sql'), 'utf8');
+
+      const rollbackMatch =
+        /ALTER\s+TABLE\s+export_jobs\s+DROP\s+COLUMN\s+IF\s+EXISTS\s+revoked_at/iu.exec(source);
+      expect(rollbackMatch?.[0]).toBeDefined();
+
+      const columnExists = async (executor: SqlExecutor): Promise<boolean> => {
+        const rows = await executor.query<{ present: boolean }>(
+          `SELECT EXISTS (
+             SELECT 1 FROM information_schema.columns
+              WHERE table_schema = 'public' AND table_name = $1 AND column_name = 'revoked_at'
+           ) AS present`,
+          [POSTGRES_EXPORT_TABLE],
+        );
+        return rows.rows[0]?.present === true;
+      };
+
+      const ROLLBACK_SENTINEL = 'RM_EXPORT_0016_ROLLBACK_DRILL';
+      await expect(
+        (connection as SqlConnection).transaction(async (executor) => {
+          expect(await columnExists(executor)).toBe(true);
+          await executor.query(rollbackMatch?.[0] ?? '');
+          expect(await columnExists(executor)).toBe(false);
+          // 撤销列被卸掉之后，列清单校验会立刻失败 ⇒ 说明这一列确实是 adapter 依赖的真实列
+          const columns = await executor.query<{ column_name: string }>(
+            `SELECT column_name FROM information_schema.columns
+              WHERE table_schema = 'public' AND table_name = $1`,
+            [POSTGRES_EXPORT_TABLE],
+          );
+          expect(columns.rows.map((row) => row.column_name)).not.toContain('revoked_at');
+          throw new Error(ROLLBACK_SENTINEL);
+        }),
+      ).rejects.toThrow(ROLLBACK_SENTINEL);
+      // 事务已回滚：真实 schema 仍然有该列（演练不产生持久影响）
+      expect(await columnExists(connection as SqlConnection)).toBe(true);
+    }, 60_000);
+
+    it('撤销闭环：条件更新只写 revoked_at，重复撤销幂等，failed 不可撤销，且不删除记录', async () => {
+      const owner = newOwner();
+      const pendingId = await seedRow(owner);
+      const failedId = await seedRow(owner, { status: ExportStatus.Failed });
+      const completedId = randomUUID();
+      createdIds.add(completedId);
+      // 走真实 create → save 路径：completed 行因此带**服务端有效期**与产物句柄，
+      // 便于断言「撤销不覆盖它们」
+      const completedEntry = await repository().create(recordFor(completedId, owner));
+      await repository().save({
+        ...completedEntry,
+        status: ExportStatus.Completed,
+        artifactId: randomUUID(),
+      });
+      // 撤销时刻由**服务端时钟**派生（晚于上面那些行的 `created_at = now()`）：
+      // 迁移 0016 的 CHECK 要求 `revoked_at >= created_at`，硬编码的过去时刻会被存储层拒绝；
+      // 加 1 秒是为了避开 `now()` 的微秒精度与 ISO 毫秒形态之间的亚毫秒竞态。
+      const revokedAt = new Date(Date.now() + 1000).toISOString();
+      const laterRevokedAt = new Date(Date.now() + 3_600_000).toISOString();
+
+      // 1) pending 可撤销：status **不被改写**、撤销时刻落库、updated_at 与撤销时刻一致
+      const pendingRevision = await repository().revokeForOwner(pendingId, owner, revokedAt);
+      expect(pendingRevision?.outcome).toBe('revoked');
+      expect(pendingRevision?.record.status).toBe(ExportStatus.Pending);
+      expect(pendingRevision?.record.revokedAt).toBe(revokedAt);
+      expect(pendingRevision?.record.updatedAt).toBe(revokedAt);
+      const pendingRow = await query<{ status: string; revoked_at: Date; updated_at: Date }>(
+        'SELECT status, revoked_at, updated_at FROM export_jobs WHERE id = $1::uuid',
+        [pendingId],
+      );
+      expect(pendingRow[0]?.status).toBe(ExportStatus.Pending);
+      expect(pendingRow[0]?.revoked_at.toISOString()).toBe(revokedAt);
+      expect(pendingRow[0]?.updated_at.toISOString()).toBe(revokedAt);
+
+      // 2) 重复撤销：幂等（不报错、**不改写**既有撤销时刻），且只产生一次写
+      const repeat = await repository().revokeForOwner(pendingId, owner, laterRevokedAt);
+      expect(repeat?.outcome).toBe('already-revoked');
+      expect(repeat?.record.revokedAt).toBe(revokedAt);
+
+      // 3) failed 不可撤销：一行都没被写入，撤销时刻仍为 NULL
+      const failedRevision = await repository().revokeForOwner(failedId, owner, revokedAt);
+      expect(failedRevision?.outcome).toBe('not-revocable');
+      expect(failedRevision?.record.revokedAt).toBeUndefined();
+      const failedRow = await query<{ revoked_at: Date | null }>(
+        'SELECT revoked_at FROM export_jobs WHERE id = $1::uuid',
+        [failedId],
+      );
+      expect(failedRow[0]?.revoked_at).toBeNull();
+
+      // 4) 跨主体不可撤销：他人拿该 ID 得到 undefined（与「不存在」不可区分），且一行都没写中
+      const other = newOwner();
+      await expect(
+        repository().revokeForOwner(completedId, other, revokedAt),
+      ).resolves.toBeUndefined();
+      const completedRow = await query<{ status: string; revoked_at: Date | null }>(
+        'SELECT status, revoked_at FROM export_jobs WHERE id = $1::uuid',
+        [completedId],
+      );
+      expect(completedRow[0]?.status).toBe(ExportStatus.Completed);
+      expect(completedRow[0]?.revoked_at).toBeNull();
+
+      // 5) completed 可撤销，且**不删除记录**、产物句柄与有效期原样保留
+      const completedRevision = await repository().revokeForOwner(completedId, owner, revokedAt);
+      expect(completedRevision?.outcome).toBe('revoked');
+      expect(completedRevision?.record.status).toBe(ExportStatus.Completed);
+      expect(completedRevision?.record.artifactId).toBeDefined();
+      expect(completedRevision?.record.expiresAt).toBe(EXPIRES_AT);
+      const stillThere = await repository().findByIdForOwner(completedId, owner);
+      expect(stillThere?.revokedAt).toBe(revokedAt);
+    }, 60_000);
+
+    it('并发撤销 / 完成：状态机写回不得清空撤销事实（revoked_at 优先使下载失效）', async () => {
+      const owner = newOwner();
+      const id = await seedRow(owner);
+      // 撤销时刻由**服务端时钟**派生（晚于该行的 `created_at = now()`，满足 0016 的 CHECK；
+      // 加 1 秒避开 `now()` 微秒精度与 ISO 毫秒形态之间的亚毫秒竞态）
+      const revokedAt = new Date(Date.now() + 1000).toISOString();
+
+      // 撤销先落地（此时结论仍是 pending）
+      const revision = await repository().revokeForOwner(id, owner, revokedAt);
+      expect(revision?.outcome).toBe('revoked');
+
+      // 随后到达的「完成」写回：`save` 的 SET 列表里没有 revoked_at，因此撤销事实必须被保留
+      const pending = await repository().findByIdForOwner(id, owner);
+      expect(pending?.revokedAt).toBe(revokedAt);
+      const artifactId = randomUUID();
+      const completed = await repository().save({
+        ...(pending as ExportRequest),
+        status: ExportStatus.Completed,
+        artifactId,
+        updatedAt: '2026-10-10T05:31:00.000Z',
+      });
+      expect(completed.status).toBe(ExportStatus.Completed);
+      expect(completed.artifactId).toBe(artifactId);
+      // 撤销事实胜出：记录同时是 completed 且已撤销（下载边界按已撤销统一拒绝）
+      expect(completed.revokedAt).toBe(revokedAt);
+      const row = await query<{ status: string; revoked_at: Date }>(
+        'SELECT status, revoked_at FROM export_jobs WHERE id = $1::uuid',
+        [id],
+      );
+      expect(row[0]?.status).toBe(ExportStatus.Completed);
+      expect(row[0]?.revoked_at.toISOString()).toBe(revokedAt);
+
+      // 反向顺序：撤销到达时结论已是 completed —— 仍然撤销成功（两种前驱都在闭集内）
+      const laterId = await seedRow(owner, {
+        status: ExportStatus.Completed,
+        artifactId: randomUUID(),
+      });
+      const later = await repository().revokeForOwner(
+        laterId,
+        owner,
+        new Date(Date.now() + 1000).toISOString(),
+      );
+      expect(later?.outcome).toBe('revoked');
+    }, 60_000);
+
+    it('绕过应用层也写不坏撤销事实：failed 行不得带 revoked_at，撤销时刻不得早于创建时刻', async () => {
+      const owner = newOwner();
+      const baseCreatedAt = new Date('2026-10-10T00:00:00.000Z');
+      const expectConstraintViolation = async (parameters: readonly unknown[]): Promise<string> => {
+        try {
+          await (connection as SqlConnection).query(
+            `INSERT INTO export_jobs
+               (id, requester_id, resource, fields, status, artifact_id, revoked_at, created_at, updated_at)
+             VALUES ($1::uuid, $2::uuid, $3, $4::text[], $5, $6::uuid, $7::timestamptz, $8::timestamptz, $9::timestamptz)`,
+            parameters,
+          );
+        } catch (error) {
+          expect(error).toBeInstanceOf(PostgresExecutorError);
+          return (error as PostgresExecutorError).issues[0]?.code ?? '';
+        }
+        throw new Error('存储层没有拒绝违规写入：CHECK 失效');
+      };
+      const newId = (): string => {
+        const value = randomUUID();
+        createdIds.add(value);
+        return value;
+      };
+      const parametersFor = (
+        id: string,
+        status: ExportStatus,
+        artifactId: string | null,
+        revokedAt: Date | null,
+        createdAt: Date,
+      ): readonly unknown[] => [
+        id,
+        owner,
+        ExportResource.Profile,
+        [...FIELDS],
+        status,
+        artifactId,
+        revokedAt === null ? null : revokedAt.toISOString(),
+        createdAt.toISOString(),
+        createdAt.toISOString(),
+      ];
+
+      // failed 行带 revoked_at：不可撤销结论被存储层拒绝
+      expect(
+        await expectConstraintViolation(
+          parametersFor(newId(), ExportStatus.Failed, null, baseCreatedAt, baseCreatedAt),
+        ),
+      ).toBe('23514');
+      // 撤销时刻早于创建时刻：写坏的数据被拒绝
+      expect(
+        await expectConstraintViolation(
+          parametersFor(
+            newId(),
+            ExportStatus.Pending,
+            null,
+            new Date(baseCreatedAt.getTime() - 3_600_000),
+            baseCreatedAt,
+          ),
+        ),
+      ).toBe('23514');
+      // 反向对照：pending + 合法撤销时刻（相等也放行）是合法写入
+      const validId = newId();
+      await (connection as SqlConnection).query(
+        `INSERT INTO export_jobs
+           (id, requester_id, resource, fields, status, artifact_id, revoked_at, created_at, updated_at)
+         VALUES ($1::uuid, $2::uuid, $3, $4::text[], $5, $6::uuid, $7::timestamptz, $8::timestamptz, $9::timestamptz)`,
+        parametersFor(validId, ExportStatus.Pending, null, baseCreatedAt, baseCreatedAt),
+      );
+      const validRow = await query<{ revoked_at: Date }>(
+        'SELECT revoked_at FROM export_jobs WHERE id = $1::uuid',
+        [validId],
+      );
+      expect(validRow[0]?.revoked_at.toISOString()).toBe(baseCreatedAt.toISOString());
     }, 60_000);
 
     it('归属隔离：多个主体同表时只返回请求主体的记录；跨主体写回一行都写不中，他人记录不出库', async () => {

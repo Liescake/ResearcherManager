@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { loadEnv } from '../../config/env';
 import type {
   PersistenceCapabilities,
   SqlExecutor,
@@ -21,6 +22,7 @@ import {
   EXPORT_STATUS_VALUES,
   EXPORT_TRANSITION_REJECTED,
   ExportResource,
+  ExportRevocationOutcome,
   ExportStatus,
   isExportTransitionRejection,
 } from './exports.port';
@@ -30,7 +32,11 @@ import type {
   ExportRepositoryCapabilities,
   ExportRequest,
 } from './exports.port';
-import { EXPORT_ENTRY_STATUS, canTransitionExport } from './exports.state-machine';
+import {
+  EXPORT_ENTRY_STATUS,
+  EXPORT_REVOCABLE_STATUSES,
+  canTransitionExport,
+} from './exports.state-machine';
 import {
   POSTGRES_EXPORT_COLUMN_FIELDS,
   POSTGRES_EXPORT_COLUMNS,
@@ -43,6 +49,7 @@ import {
   POSTGRES_EXPORT_PII_COLUMNS,
   POSTGRES_EXPORT_REPOSITORY_CAPABILITIES,
   POSTGRES_EXPORT_REPOSITORY_VERIFICATION_STEPS,
+  POSTGRES_EXPORT_REVOKE_COLUMNS,
   POSTGRES_EXPORT_TABLE,
   POSTGRES_EXPORT_TRUNCATION_FIELD,
   POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS,
@@ -52,6 +59,7 @@ import {
   assertExportViewExclusion,
   assertPostgresExportPageWindow,
   assertPostgresExportRepositoryCapabilities,
+  assertPostgresExportRevocationTimestamp,
   createLazyPostgresExportRepository,
   exportStatusPredecessors,
   findExportInternalColumnOverlaps,
@@ -190,6 +198,12 @@ const LATER_AT = '2026-01-03T04:05:06.000Z';
  * 固定组成部分（协议上可缺省，缺省 = 存储 `NULL` = 下载边界 fail-closed）。
  */
 const EXPIRES_AT = '2026-01-02T04:04:05.000Z';
+/**
+ * 服务端撤销时刻样本（UTC 绝对时刻，**晚于** `CREATED_AT` 且**早于** `EXPIRES_AT`）：
+ * 与迁移 `0016` 的 `revoked_at >= created_at` 不变式一致。缺省 = 存储 `NULL` = 未被撤销，
+ * 因此它是「已撤销记录」夹具的显式组成部分（协议上可缺省）。
+ */
+const REVOKED_AT = '2026-01-02T03:30:00.000Z';
 /** 注入载荷：只允许出现在参数里，绝不允许出现在 SQL 文本或错误信息里 */
 const INJECTION = "x'); DROP TABLE export_jobs; --";
 /** 伪造的产物路径（含疑似身份证号）：绝不允许入库到领域对象或外发 */
@@ -228,6 +242,17 @@ const FAILED_JOB: ExportRequest = {
   updatedAt: LATER_AT,
 };
 
+/**
+ * **已撤销**样本：与状态机正交 —— `status` 仍是 `completed`（撤销不改写结论），
+ * 只多出一个服务端撤销时刻；`updated_at` 随撤销写入而改写。
+ * 它是「撤销优先于完成」这条判定的存储事实来源。
+ */
+const REVOKED_JOB: ExportRequest = {
+  ...COMPLETED_JOB,
+  revokedAt: REVOKED_AT,
+  updatedAt: REVOKED_AT,
+};
+
 /** 他人名下的作业样本：本人列表 / 写回路径里绝不能出现 */
 const OTHER_OWNER_JOB: ExportRequest = {
   ...PENDING_JOB,
@@ -249,6 +274,7 @@ function rowFromJob(
     artifact_id: job.artifactId === undefined ? null : job.artifactId,
     // 领域字段缺省 ⇒ 存储 NULL（不是省略键：PG 对 SELECT 列表中的列一定返回键）
     expires_at: job.expiresAt === undefined ? null : new Date(job.expiresAt),
+    revoked_at: job.revokedAt === undefined ? null : new Date(job.revokedAt),
     created_at: new Date(job.createdAt),
     updated_at: new Date(job.updatedAt),
     ...overrides,
@@ -372,9 +398,17 @@ function readApiFile(relative: string): string {
   return readFileSync(resolve(process.cwd(), relative), 'utf8');
 }
 
-/** 共享读取契约声明的**全部**领域字段（由契约本身推导，而不是在测试里另抄一份清单） */
+/**
+ * 共享读取契约声明的**全部**领域字段（由契约本身推导，而不是在测试里另抄一份清单）。
+ *
+ * 样本必须把**全部可选字段都填满**（`expiresAt` 与 `revokedAt` 都是可选的），否则
+ * 「列清单与读取契约字段构成双射」这条断言会少算一列 —— 这正是它要拦住的漂移。
+ */
 function readContractFields(): readonly string[] {
-  const parsed = parseStoredExportRequest(COMPLETED_JOB);
+  const parsed = parseStoredExportRequest({
+    ...REVOKED_JOB,
+    updatedAt: LATER_AT,
+  });
   if (!parsed.ok) {
     throw new Error('样本记录未通过共享读取契约');
   }
@@ -540,6 +574,7 @@ describe('PostgreSQL 导出仓储：能力声明与交付边界', () => {
       'resource',
       'fields',
       'expires_at',
+      'revoked_at',
       'created_at',
     ]);
     // 可变列 ∪ 不可变列 === 列清单，且两者不相交
@@ -550,30 +585,53 @@ describe('PostgreSQL 导出仓储：能力声明与交付边界', () => {
     expect(
       [...POSTGRES_EXPORT_MUTABLE_COLUMNS, ...POSTGRES_EXPORT_IMMUTABLE_COLUMNS].sort(),
     ).toEqual([...POSTGRES_EXPORT_COLUMNS].sort());
-    // 写回不得触碰身份 / 归属 / 导出范围 / 有效期
+    // 写回不得触碰身份 / 归属 / 导出范围 / 有效期 / **撤销时刻**
     for (const forbidden of [
       'id',
       'requester_id',
       'resource',
       'fields',
       'expires_at',
+      'revoked_at',
       'created_at',
     ]) {
       expect(POSTGRES_EXPORT_MUTABLE_COLUMNS).not.toContain(forbidden);
     }
+    // 撤销写入只允许触碰两列：撤销时刻与服务端时钟（不得触碰结论 / 句柄 / 有效期 / 身份）
+    expect([...POSTGRES_EXPORT_REVOKE_COLUMNS]).toEqual(['revoked_at', 'updated_at']);
+    for (const forbidden of [
+      'id',
+      'requester_id',
+      'resource',
+      'fields',
+      'status',
+      'artifact_id',
+      'expires_at',
+      'created_at',
+    ]) {
+      expect(POSTGRES_EXPORT_REVOKE_COLUMNS).not.toContain(forbidden);
+    }
+    // 撤销列与状态机写回的可变列**刻意分开**：`revoked_at` 绝不出现在 `save` 的 SET 列表里，
+    // 否则一次并发的 `pending -> completed` 写回就能把撤销事实清空
+    expect(POSTGRES_EXPORT_MUTABLE_COLUMNS).not.toContain('revoked_at');
+    expect(
+      [...new Set([...POSTGRES_EXPORT_MUTABLE_COLUMNS, ...POSTGRES_EXPORT_REVOKE_COLUMNS])].sort(),
+    ).toEqual(['artifact_id', 'revoked_at', 'status', 'updated_at']);
   });
 
-  it('PII 与公开输出裁剪列覆盖归属、产物句柄、服务端有效期与全部内部列，且不含公开视图字段', () => {
+  it('PII 与公开输出裁剪列覆盖归属、产物句柄、服务端有效期、撤销时刻与全部内部列，且不含公开视图字段', () => {
     expect([...POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS]).toEqual([
       'requester_id',
       'artifact_id',
       'expires_at',
+      'revoked_at',
       ...POSTGRES_EXPORT_INTERNAL_COLUMNS,
     ]);
     for (const column of [
       'requester_id',
       'artifact_id',
       'expires_at',
+      'revoked_at',
       ...POSTGRES_EXPORT_INTERNAL_COLUMNS,
     ]) {
       expect(POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS).toContain(column);
@@ -581,9 +639,12 @@ describe('PostgreSQL 导出仓储：能力声明与交付边界', () => {
     // 有效期是本切片新引入的「不进公开视图」的列：它必须在裁剪清单里，
     // 否则「顺手把 expiresAt 加进公开视图」就不会被模块加载期自检拦下
     expect(POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS).toContain('expires_at');
+    // 撤销时刻同理：公开视图只把 status 呈现为 `revoked`，**不外发**撤销时刻本身
+    expect(POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS).toContain('revoked_at');
     for (const column of [
       'requester_id',
       'expires_at',
+      'revoked_at',
       'file_name',
       'file_path',
       'download_url',
@@ -601,7 +662,12 @@ describe('PostgreSQL 导出仓储：能力声明与交付边界', () => {
       expect(POSTGRES_EXPORT_PII_COLUMNS).toContain(column);
     }
     // 高敏声明必须覆盖**全部**内部列（fail-closed：凡不进入公开视图的列一律按高敏处理）
-    for (const column of ['requester_id', 'expires_at', ...POSTGRES_EXPORT_INTERNAL_COLUMNS]) {
+    for (const column of [
+      'requester_id',
+      'expires_at',
+      'revoked_at',
+      ...POSTGRES_EXPORT_INTERNAL_COLUMNS,
+    ]) {
       expect(POSTGRES_EXPORT_PII_COLUMNS).toContain(column);
     }
     // 高敏集合与公开视图字段零交集（公开字段绝不能被登记为高敏）
@@ -635,17 +701,19 @@ describe('PostgreSQL 导出仓储：能力声明与交付边界', () => {
     );
     expect(migration).toMatch(/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+export_jobs\s*\(/u);
     // 迁移的列清单必须覆盖 adapter 的**每一个**输出列（少了任何一列，读取路径立刻 fail-closed）。
-    // 唯一例外是服务端有效期 `expires_at`：0013 已应用且校验和钉住、不可改写，因此它由
-    // **后续迁移 0015** 补出（迁移不可改写 ⇒ 加列必须新增迁移，而不是回头改 0013）。
+    // 两个例外是服务端有效期 `expires_at` 与服务端撤销时刻 `revoked_at`：0013 已应用且校验和
+    // 钉住、不可改写，因此它们分别由**后续迁移 0015 / 0016** 补出
+    // （迁移不可改写 ⇒ 加列必须新增迁移，而不是回头改 0013）。
     for (const column of POSTGRES_EXPORT_COLUMNS) {
-      if (column === 'expires_at') continue;
+      if (column === 'expires_at' || column === 'revoked_at') continue;
       expect(migration).toMatch(
         new RegExp(`^\\s+${column}\\s+(?:uuid|varchar|text|timestamptz)`, 'mu'),
       );
     }
-    // 0013 里 `expires_at` 只允许出现在「刻意不建」的说明注释里，不得是真实列定义
+    // 0013 里 `expires_at` / `revoked_at` 只允许出现在「刻意不建」的说明注释里，不得是真实列定义
     expect(migration).not.toMatch(/^\s+expires_at\s+(?:uuid|varchar|text|timestamptz)/mu);
-    // 0015 必须真的把该列加出来（不是只在注释里声明），且列类型是 timestamptz（绝对时刻）
+    expect(migration).not.toMatch(/^\s+revoked_at\s+(?:uuid|varchar|text|timestamptz)/mu);
+    // 0015 必须真的把有效期列加出来（不是只在注释里声明），且列类型是 timestamptz（绝对时刻）
     const expiryMigration = readFileSync(
       join(REPO_ROOT, 'db', 'migrations', '0015_export_jobs_expiry.sql'),
       'utf8',
@@ -653,6 +721,24 @@ describe('PostgreSQL 导出仓储：能力声明与交付边界', () => {
     expect(expiryMigration).toMatch(/ALTER\s+TABLE\s+export_jobs\b/iu);
     expect(expiryMigration).toMatch(/expires_at\s+timestamptz/iu);
     expect(expiryMigration).not.toMatch(/CREATE\s+TABLE\b/iu);
+    expect(expiryMigration).not.toMatch(/^\s+revoked_at\s+(?:uuid|varchar|text|timestamptz)/mu);
+    // 0016 必须真的把撤销列加出来（不是只在注释里声明），且列类型是 timestamptz（绝对时刻）；
+    // 一条迁移只做一件事：加列 + 约束，不建表、不建索引
+    const revocationMigration = readFileSync(
+      join(REPO_ROOT, 'db', 'migrations', '0016_export_jobs_revocation.sql'),
+      'utf8',
+    );
+    expect(revocationMigration).toMatch(/ALTER\s+TABLE\s+export_jobs\b/iu);
+    expect(revocationMigration).toMatch(/revoked_at\s+timestamptz/iu);
+    expect(revocationMigration).not.toMatch(/CREATE\s+TABLE\b/iu);
+    expect(revocationMigration).not.toMatch(/CREATE\s+(?:UNIQUE\s+)?INDEX\b/iu);
+    // 该列必须**可空且无 DEFAULT**（NULL = 未被撤销；撤销时刻只能由服务端写入）
+    const addRevokedColumn = /ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+revoked_at[^;]*/iu.exec(
+      revocationMigration,
+    )?.[0];
+    expect(addRevokedColumn).toBeDefined();
+    expect(addRevokedColumn).not.toMatch(/\bNOT\s+NULL\b/iu);
+    expect(addRevokedColumn).not.toMatch(/\bDEFAULT\b/iu);
     // 存储侧内部列（产物位置 / 文件路径 / 下载与签名地址 / 存储 key / 文件体 / 原始错误 / 簿记）
     // 一律不得被声明成真实列——它们只允许出现在「刻意不建」的说明注释里
     for (const column of POSTGRES_EXPORT_INTERNAL_COLUMNS) {
@@ -660,6 +746,9 @@ describe('PostgreSQL 导出仓储：能力声明与交付边界', () => {
         new RegExp(`^\\s+${column}\\s+(?:uuid|varchar|text|timestamptz)`, 'mu'),
       );
       expect(expiryMigration).not.toMatch(
+        new RegExp(`^\\s+${column}\\s+(?:uuid|varchar|text|timestamptz)`, 'mu'),
+      );
+      expect(revocationMigration).not.toMatch(
         new RegExp(`^\\s+${column}\\s+(?:uuid|varchar|text|timestamptz)`, 'mu'),
       );
     }
@@ -850,7 +939,7 @@ describe('PostgreSQL 导出仓储：参数化 SQL 与固定标识符', () => {
       expect(sql).not.toContain(value);
     }
     // 参数顺序由列清单派生：id, requester_id, resource, fields, status, artifact_id, expires_at,
-    // created_at, updated_at
+    // revoked_at, created_at, updated_at（入口记录的撤销时刻恒为 NULL = 未被撤销）
     expect(call?.parameters).toEqual([
       JOB_ID,
       OWNER,
@@ -859,12 +948,14 @@ describe('PostgreSQL 导出仓储：参数化 SQL 与固定标识符', () => {
       'pending',
       null,
       EXPIRES_AT,
+      null,
       CREATED_AT,
       CREATED_AT,
     ]);
     expect(parameterAt(call, 'requester_id')).toBe(OWNER);
     expect(parameterAt(call, 'artifact_id')).toBeNull();
     expect(parameterAt(call, 'expires_at')).toBe(EXPIRES_AT);
+    expect(parameterAt(call, 'revoked_at')).toBeNull();
     expect(parameterAt(call, 'created_at')).toBe(CREATED_AT);
   });
 
@@ -901,7 +992,8 @@ describe('PostgreSQL 导出仓储：参数化 SQL 与固定标识符', () => {
       for (const internal of POSTGRES_EXPORT_INTERNAL_COLUMNS) {
         expect(containsWord(call.sql, internal)).toBe(false);
       }
-      // 归属、产物句柄与服务端有效期是列清单内的裁剪列：可以出现在 SQL 里，但绝不能进入公开视图
+      // 归属、产物句柄、服务端有效期与撤销时刻是列清单内的裁剪列：
+      // 可以出现在 SQL 里，但绝不能进入公开视图
       for (const excluded of POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS) {
         if (
           POSTGRES_EXPORT_COLUMNS.includes(excluded as (typeof POSTGRES_EXPORT_COLUMNS)[number])
@@ -915,7 +1007,7 @@ describe('PostgreSQL 导出仓储：参数化 SQL 与固定标识符', () => {
       POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS.filter((column) =>
         POSTGRES_EXPORT_COLUMNS.includes(column as (typeof POSTGRES_EXPORT_COLUMNS)[number]),
       ),
-    ).toEqual(['requester_id', 'artifact_id', 'expires_at']);
+    ).toEqual(['requester_id', 'artifact_id', 'expires_at', 'revoked_at']);
   });
 
   it('表名与列名都是裸小写标识符（杜绝用标识符夹带 SQL 片段）', () => {
@@ -991,7 +1083,16 @@ describe('PostgreSQL 导出仓储：参数化 SQL 与固定标识符', () => {
 
     const updateSql = callAt(executor, 1)?.sql ?? '';
     const setClause = updateSql.slice(updateSql.indexOf('SET'), updateSql.indexOf('WHERE'));
-    for (const forbidden of ['id', 'requester_id', 'resource', 'fields', 'created_at']) {
+    for (const forbidden of [
+      'id',
+      'requester_id',
+      'resource',
+      'fields',
+      'created_at',
+      'expires_at',
+      // 状态机写回**不得**触碰撤销时刻：它只能由 revokeForOwner 写入，且只增不减
+      'revoked_at',
+    ]) {
       expect(containsWord(setClause, forbidden)).toBe(false);
     }
     // WHERE 必须同时钉住主键、归属与合法前驱谓词
@@ -2068,7 +2169,7 @@ describe('PostgreSQL 导出仓储：单条取数的归属隔离（下载切片�
     const call = callAt(executor, 0);
     const sql = call?.sql ?? '';
     expect(sql).toContain(
-      'SELECT id, requester_id, resource, fields, status, artifact_id, expires_at, created_at, updated_at',
+      'SELECT id, requester_id, resource, fields, status, artifact_id, expires_at, revoked_at, created_at, updated_at',
     );
     expect(sql).not.toContain('*');
     expect(sql).toContain('WHERE id = $1::uuid AND requester_id = $2::uuid');
@@ -2439,5 +2540,308 @@ describe('PostgreSQL 导出仓储：键集分页窗口', () => {
     // 真正下发的语句里连这个词都没有，由上面两条 SQL 用例逐条断言。
     expect(adapterSource).not.toMatch(/\bOFFSET\s+(?:\$|\d)/iu);
     expect(adapterSource).not.toMatch(/\bFETCH\s+(?:FIRST|NEXT)\b/iu);
+  });
+});
+
+/**
+ * 撤销切片（`revokeForOwner`）在**真实 adapter 代码路径**上的离线验收。
+ *
+ * 固定的硬性质（不连数据库、不引驱动）：
+ * - **条件更新**：`SET` 只有 `revoked_at` / `updated_at`，`WHERE` 钉住 `id + 归属 +
+ *   可撤销前驱集合 + revoked_at IS NULL`；所有值只进参数、SQL 文本零引号零分号；
+ * - **不改写既有事实**：不触碰 `status` / `artifact_id` / `created_at` / `expires_at`，
+ *   不删行（端口上也没有删除方法）；
+ * - **结论闭集**：命中 1 行 ⇒ `revoked`；0 行时由**归属范围内**的诊断取数分类为
+ *   `already-revoked`（幂等）/ `not-revocable`（`failed`）/ `undefined`（不存在或属于他人，
+ *   两者不可区分）；多行 ⇒ 结果集违约；
+ * - **fail-closed**：非法记录 ID / 主体 / 撤销时刻在**进 SQL 之前**拒绝（零 SQL）；
+ *   执行器异常收敛为不含原始文本的 `EXECUTOR_FAILURE`；回流被改写（撤销时刻被换、
+ *   结论不在可撤销集合内、他人归属）一律抛错。
+ */
+describe('PostgreSQL 导出仓储：本人撤销（条件更新与结论闭集）', () => {
+  const REVOKED_AT = '2026-01-02T05:00:00.000Z';
+  /** 已撤销的样本：`status` 仍是 completed（撤销与状态机正交），多出撤销时刻 */
+  const ALREADY_REVOKED_JOB: ExportRequest = {
+    ...COMPLETED_JOB,
+    revokedAt: REVOKED_AT,
+    updatedAt: REVOKED_AT,
+  };
+
+  it('撤销语句是条件更新：SET 只有 revoked_at / updated_at，WHERE 钉住归属 + 可撤销前驱 + revoked_at IS NULL', async () => {
+    const target = { ...PENDING_JOB, revokedAt: REVOKED_AT, updatedAt: REVOKED_AT };
+    const { repository, executor } = repoWith({ rows: [rowFromJob(target)], rowCount: 1 });
+
+    const result = await repository.revokeForOwner(JOB_ID, OWNER, REVOKED_AT);
+    expect(result?.outcome).toBe(ExportRevocationOutcome.Revoked);
+    expect(result?.record.revokedAt).toBe(REVOKED_AT);
+    // 命中即止：不追加任何诊断查询
+    expect(executor.calls).toHaveLength(1);
+
+    const call = callAt(executor, 0);
+    const sql = call?.sql ?? '';
+    expectParameterizedSql(sql);
+    expect(sql).toMatch(/\bUPDATE\b/u);
+    const setClause = sql.slice(sql.indexOf('SET'), sql.indexOf('WHERE'));
+    expect(setClause).toContain('revoked_at = $3::timestamptz');
+    expect(setClause).toContain('updated_at = $4::timestamptz');
+    // 撤销**不覆盖**身份、导出范围、结论、产物句柄、创建时间与有效期
+    for (const forbidden of [
+      'id',
+      'requester_id',
+      'resource',
+      'fields',
+      'status',
+      'artifact_id',
+      'expires_at',
+      'created_at',
+    ]) {
+      expect(containsWord(setClause, forbidden)).toBe(false);
+    }
+    // WHERE：归属与主键双重参数化 + 可撤销前驱谓词 + 单调性谓词
+    expect(sql).toContain('WHERE id = $1::uuid AND requester_id = $2::uuid');
+    expect(sql).toContain('status::text = ANY($5::text[])');
+    expect(sql).toContain('revoked_at IS NULL');
+    expect(sql).toContain(`RETURNING ${[...POSTGRES_EXPORT_COLUMNS].join(', ')}`);
+    expect(sql).not.toContain('*');
+    // 参数与占位符一一对应：撤销时刻写两次（revoked_at / updated_at 各占一个序号，同一次时钟读数）
+    expect(call?.parameters).toEqual([
+      JOB_ID,
+      OWNER,
+      REVOKED_AT,
+      REVOKED_AT,
+      [...EXPORT_REVOCABLE_STATUSES],
+    ]);
+    expect(placeholderIndexes(sql)).toHaveLength(call?.parameters?.length ?? 0);
+    expect(expectWriteAndReadOnlySql(executor)).toHaveLength(1);
+    // 归属、主键与撤销时刻都只出现在参数里
+    for (const value of [OWNER, JOB_ID, REVOKED_AT]) {
+      expect(sql).not.toContain(value);
+    }
+  });
+
+  it('0 行 + 诊断行已带撤销时刻 ⇒ already-revoked（幂等，不改写既有撤销时刻）', async () => {
+    const { repository, executor } = repoWith(
+      { rows: [], rowCount: 0 },
+      { rows: [rowFromJob(ALREADY_REVOKED_JOB)], rowCount: 1 },
+    );
+
+    const result = await repository.revokeForOwner(JOB_ID, OWNER, LATER_AT);
+    expect(result?.outcome).toBe(ExportRevocationOutcome.AlreadyRevoked);
+    expect(result?.record.revokedAt).toBe(REVOKED_AT);
+    // 诊断查询同样是「主键 + 归属」双重限定，且不跨归属探测
+    const diagnosis = callAt(executor, 1);
+    expect(diagnosis?.sql).toContain('WHERE id = $1::uuid AND requester_id = $2::uuid');
+    expect(diagnosis?.parameters).toEqual([JOB_ID, OWNER]);
+  });
+
+  it('0 行 + 诊断行是 failed ⇒ not-revocable（不可撤销结论，一行都没被写入）', async () => {
+    const { repository, executor } = repoWith(
+      { rows: [], rowCount: 0 },
+      { rows: [rowFromJob(FAILED_JOB)], rowCount: 1 },
+    );
+
+    const result = await repository.revokeForOwner(OTHER_JOB_ID, OWNER, REVOKED_AT);
+    expect(result?.outcome).toBe(ExportRevocationOutcome.NotRevocable);
+    expect(result?.record.status).toBe(ExportStatus.Failed);
+    expect(result?.record.revokedAt).toBeUndefined();
+    // 只有「条件写入 + 一次诊断」两条语句，没有任何第二次写入
+    expect(
+      executor.calls.map((entry) => entry.sql.match(/\b(?:INSERT|UPDATE|SELECT)\b/u)?.[0]),
+    ).toEqual(['UPDATE', 'SELECT']);
+  });
+
+  it('0 行 + 诊断无行 ⇒ undefined（不存在与「属于他人」不可区分，也不泄露存在性）', async () => {
+    const { repository, executor } = repoWith({ rows: [], rowCount: 0 }, { rows: [], rowCount: 0 });
+    await expect(repository.revokeForOwner(JOB_ID, OWNER, REVOKED_AT)).resolves.toBeUndefined();
+    expect(executor.calls).toHaveLength(2);
+    for (const call of executor.calls) {
+      expect(call.parameters?.[1]).toBe(OWNER);
+    }
+  });
+
+  it('条件写入或诊断返回多行 ⇒ RESULT_SET_VIOLATION（主键唯一性被破坏不得静默取第一条）', async () => {
+    const writeMulti = repoWith({
+      rows: [rowFromJob(PENDING_JOB), rowFromJob(PENDING_JOB)],
+      rowCount: 2,
+    });
+    expect(
+      (
+        await captureRepoError(() =>
+          writeMulti.repository.revokeForOwner(JOB_ID, OWNER, REVOKED_AT),
+        )
+      ).code,
+    ).toBe('RESULT_SET_VIOLATION');
+
+    const diagnosisMulti = repoWith(
+      { rows: [], rowCount: 0 },
+      { rows: [rowFromJob(FAILED_JOB), rowFromJob(FAILED_JOB)], rowCount: 2 },
+    );
+    expect(
+      (
+        await captureRepoError(() =>
+          diagnosisMulti.repository.revokeForOwner(JOB_ID, OWNER, REVOKED_AT),
+        )
+      ).code,
+    ).toBe('RESULT_SET_VIOLATION');
+  });
+
+  it('非法记录 ID / 主体 / 撤销时刻在进 SQL 之前 fail-closed（零 SQL、零建连）', async () => {
+    const cases: ReadonlyArray<readonly [string, () => Promise<unknown>]> = [
+      ['INVALID_ID', () => repoWith().repository.revokeForOwner(INJECTION, OWNER, REVOKED_AT)],
+      ['INVALID_ID', () => repoWith().repository.revokeForOwner(NIL_UUID, OWNER, REVOKED_AT)],
+      [
+        'INVALID_ID',
+        () => repoWith().repository.revokeForOwner(HEX_JOB_ID_UPPER, OWNER, REVOKED_AT),
+      ],
+      [
+        'INVALID_SUBJECT',
+        () => repoWith().repository.revokeForOwner(JOB_ID, 'u-student-1', REVOKED_AT),
+      ],
+      [
+        'INVALID_SUBJECT',
+        () => repoWith().repository.revokeForOwner(JOB_ID, HEX_OWNER_UPPER, REVOKED_AT),
+      ],
+      [
+        'INVALID_RECORD',
+        () => repoWith().repository.revokeForOwner(JOB_ID, OWNER, '2026/01/02 05:00'),
+      ],
+      [
+        'INVALID_RECORD',
+        () => repoWith().repository.revokeForOwner(JOB_ID, OWNER, '2026-01-02T05:00:00+08:00'),
+      ],
+    ];
+
+    for (const [code, run] of cases) {
+      const error = await captureRepoError(run);
+      expect(error.code).toBe(code);
+      expectNoValueLeak(error);
+    }
+    // 零 SQL：上面每一次调用都新建了一个执行器，这里再显式核对一次典型入口
+    const { repository, executor } = repoWith();
+    await captureRepoError(() => repository.revokeForOwner('not-a-uuid', OWNER, REVOKED_AT));
+    await captureRepoError(() => repository.revokeForOwner(JOB_ID, 'u-student-1', REVOKED_AT));
+    await captureRepoError(() => repository.revokeForOwner(JOB_ID, OWNER, 'yesterday'));
+    expect(executor.calls).toHaveLength(0);
+  });
+
+  it('执行器异常 ⇒ EXECUTOR_FAILURE（不携带原始错误文本、SQL 与连接信息）', async () => {
+    const executor = new ThrowingExecutor(new Error('connect ECONNREFUSED user=postgres'));
+    const error = await captureRepoError(() =>
+      new PostgresExportRepository(executor).revokeForOwner(JOB_ID, OWNER, REVOKED_AT),
+    );
+    expect(error.code).toBe('EXECUTOR_FAILURE');
+    expect(error.message).not.toContain('ECONNREFUSED');
+    expect(JSON.stringify(error.issues)).not.toContain('postgres');
+    expectNoValueLeak(error);
+  });
+
+  it('回流被改写时 fail-closed：撤销时刻被换 / 结论不在可撤销集合内 / 他人归属', async () => {
+    const rewrittenTime = repoWith({
+      rows: [rowFromJob({ ...PENDING_JOB, revokedAt: LATER_AT, updatedAt: LATER_AT })],
+      rowCount: 1,
+    });
+    expect(
+      (
+        await captureRepoError(() =>
+          rewrittenTime.repository.revokeForOwner(JOB_ID, OWNER, REVOKED_AT),
+        )
+      ).code,
+    ).toBe('IDENTITY_MISMATCH');
+
+    // 结论不在可撤销集合内（failed）：撤销不得改写结论
+    const rewrittenStatus = repoWith({ rows: [rowFromJob(FAILED_JOB)], rowCount: 1 });
+    expect(
+      (
+        await captureRepoError(() =>
+          rewrittenStatus.repository.revokeForOwner(JOB_ID, OWNER, REVOKED_AT),
+        )
+      ).code,
+    ).toBe('IDENTITY_MISMATCH');
+
+    // 他人归属回流：纵深防御（仓储过滤不作为安全边界）
+    const otherOwner = repoWith({
+      rows: [rowFromJob({ ...PENDING_JOB, revokedAt: REVOKED_AT, updatedAt: REVOKED_AT })],
+      rowCount: 1,
+    });
+    expect(
+      (
+        await captureRepoError(() =>
+          otherOwner.repository.revokeForOwner(JOB_ID, OTHER_OWNER, REVOKED_AT),
+        )
+      ).code,
+    ).toBe('OWNER_VIOLATION');
+
+    // 行契约损坏（未知列）同样 fail-closed
+    const brokenRow = repoWith({
+      rows: [
+        rowFromJob(
+          { ...PENDING_JOB, revokedAt: REVOKED_AT, updatedAt: REVOKED_AT },
+          { file_path: FORGED_PATH },
+        ),
+      ],
+      rowCount: 1,
+    });
+    expect(
+      (await captureRepoError(() => brokenRow.repository.revokeForOwner(JOB_ID, OWNER, REVOKED_AT)))
+        .code,
+    ).toBe('INVALID_ROW');
+    // 时间戳自检：合法形态原样返回，非法形态抛错（供延迟建连包装在解析执行器之前调用）
+    expect(assertPostgresExportRevocationTimestamp(REVOKED_AT)).toBe(REVOKED_AT);
+    expect(() => assertPostgresExportRevocationTimestamp('2026-01-02')).toThrow(
+      PostgresExportRepositoryError,
+    );
+  });
+
+  it('延迟建连包装：撤销的入参都在解析执行器之前判定，非法输入不触发任何连接', async () => {
+    let resolves = 0;
+    const lazy: AsyncExportRepository = createLazyPostgresExportRepository(() => {
+      resolves += 1;
+      return Promise.resolve(undefined as unknown as SqlExecutor);
+    });
+
+    await expect(lazy.revokeForOwner('not-a-uuid', OWNER, REVOKED_AT)).rejects.toMatchObject({
+      code: 'INVALID_ID',
+    });
+    await expect(lazy.revokeForOwner(JOB_ID, 'u-student-1', REVOKED_AT)).rejects.toMatchObject({
+      code: 'INVALID_SUBJECT',
+    });
+    await expect(lazy.revokeForOwner(JOB_ID, OWNER, 'yesterday')).rejects.toMatchObject({
+      code: 'INVALID_RECORD',
+    });
+    expect(resolves).toBe(0);
+
+    // 合法入参：解析执行器并走到 adapter（此处执行器为 undefined，构造即 fail-closed）
+    await expect(lazy.revokeForOwner(JOB_ID, OWNER, REVOKED_AT)).rejects.toMatchObject({
+      code: 'EXECUTOR_UNAVAILABLE',
+    });
+    expect(resolves).toBe(1);
+  });
+
+  it('端口与内存基线都提供撤销入口、都不提供删除入口；撤销列与状态机写回列刻意分开', () => {
+    const portSource = readFileSync(PORT_PATH, 'utf8');
+    expect(portSource).toContain('revokeForOwner(');
+    expect(portSource).toContain('export const ExportRevocationOutcome');
+    expect(portSource).toContain('export const EXPORT_REVOCATION_CLEANUP_BOUNDARY');
+    expect(portSource).not.toMatch(/\b(?:delete|remove|archive|purge|truncate)\s*\(/u);
+
+    const inMemorySource = readFileSync(IN_MEMORY_PATH, 'utf8');
+    expect(inMemorySource).toContain('async revokeForOwner(');
+    expect(inMemorySource).toContain('revokedAt');
+    // 内存基线同样没有删除 / 归档入口（它读取 `NODE_ENV` 只是为了拒绝在生产环境构造）
+    const inMemory = new InMemoryExportRepository(
+      loadEnv({ NODE_ENV: 'test' }),
+    ) as unknown as Record<string, unknown>;
+    for (const method of ['delete', 'remove', 'archive', 'purge', 'truncate', 'upsert']) {
+      expect(inMemory[method]).toBeUndefined();
+    }
+
+    // 撤销列与状态机写回的可变列刻意分开：`save` 的 SET 列表里没有 revoked_at
+    expect([...POSTGRES_EXPORT_REVOKE_COLUMNS]).toEqual(['revoked_at', 'updated_at']);
+    expect(POSTGRES_EXPORT_MUTABLE_COLUMNS).not.toContain('revoked_at');
+    // 撤销时刻是不可变列 + 裁剪列：`save` 不得写它，公开视图不得含它
+    expect(POSTGRES_EXPORT_IMMUTABLE_COLUMNS).toContain('revoked_at');
+    expect(POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS).toContain('revoked_at');
+    expect(POSTGRES_EXPORT_PII_COLUMNS).toContain('revoked_at');
+    expect(EXPORT_REQUEST_VIEW_FIELDS).not.toContain('revokedAt');
   });
 });

@@ -12,6 +12,7 @@ import {
   EXPORT_RESOURCE_VALUES,
   EXPORT_STATUS_VALUES,
   EXPORT_TRANSITION_REJECTED,
+  ExportRevocationOutcome,
   assertExportKeyset,
   isExportPageLimit,
   type AsyncExportRepository,
@@ -20,9 +21,14 @@ import {
   type ExportPageWindow,
   type ExportRepositoryCapabilities,
   type ExportRequest,
+  type ExportRevocationResult,
   type ExportStatus,
 } from './exports.port';
-import { EXPORT_ENTRY_STATUS, EXPORT_STATUS_TRANSITIONS } from './exports.state-machine';
+import {
+  EXPORT_ENTRY_STATUS,
+  EXPORT_REVOCABLE_STATUSES,
+  EXPORT_STATUS_TRANSITIONS,
+} from './exports.state-machine';
 
 /**
  * 导出请求（`export_jobs`）的 **PostgreSQL 仓储 adapter（已接入运行时）**。
@@ -135,9 +141,12 @@ export const POSTGRES_EXPORT_TABLE = 'export_jobs';
  * 刻意不写 `SELECT *`：存储层新增列（文件名 / 路径 / 下载地址 / 存储 key / 对象 key / 产物句柄别名 /
  * 文件体 / 内部资源内容 / 筛选条件 / 原始错误文本 / 下载簿记）不会因为本文件没更新就自动
  * 流进领域对象；配合行契约的 `.strict()`，未登记列会被显式拒绝而不是被静默带出。
- * `expires_at` 是**本清单内**的列（9 列）：它是下载边界唯一需要的**服务端有效期**，
- * 因此必须被显式投影出来；它仍然不进入公开视图（见 `POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS`），
- * 所以「有效期是可读的服务端事实」与「有效期不外发」是两件事，分别由本清单与裁剪清单各管一段。
+ * `expires_at` 与 `revoked_at` 都是**本清单内**的列（共 10 列）：前者是下载边界唯一需要的
+ * **服务端有效期**（迁移 `0015` 补出），后者是下载失效与列表呈现唯一需要的**服务端撤销时刻**
+ * （迁移 `0016` 补出），因此两者都必须被显式投影出来；它们仍然不进入公开视图
+ * （见 `POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS`），
+ * 所以「有效期 / 撤销时刻是可读的服务端事实」与「它们不外发」是两件事，
+ * 分别由本清单与裁剪清单各管一段。
  *
  * 列名以 docs/P2-ER图.md 的 `export_jobs(id, requester_id, resource, filters, fields, status,
  * expires_at, downloaded_at)` 为准：归属列是 **`requester_id`**，而端口把同一概念命名为
@@ -153,6 +162,7 @@ export const POSTGRES_EXPORT_COLUMNS = [
   'status',
   'artifact_id',
   'expires_at',
+  'revoked_at',
   'created_at',
   'updated_at',
 ] as const;
@@ -166,6 +176,7 @@ export const POSTGRES_EXPORT_COLUMN_FIELDS = Object.freeze({
   status: 'status',
   artifact_id: 'artifactId',
   expires_at: 'expiresAt',
+  revoked_at: 'revokedAt',
   created_at: 'createdAt',
   updated_at: 'updatedAt',
 } as const satisfies Record<(typeof POSTGRES_EXPORT_COLUMNS)[number], keyof ExportRequest>);
@@ -187,6 +198,7 @@ export const POSTGRES_EXPORT_FIELD_COLUMNS = Object.freeze({
   status: 'status',
   artifactId: 'artifact_id',
   expiresAt: 'expires_at',
+  revokedAt: 'revoked_at',
   createdAt: 'created_at',
   updatedAt: 'updated_at',
 } as const satisfies Record<keyof ExportRequest, (typeof POSTGRES_EXPORT_COLUMNS)[number]>);
@@ -262,6 +274,7 @@ export type PostgresExportInternalColumn = (typeof POSTGRES_EXPORT_INTERNAL_COLU
 export const POSTGRES_EXPORT_PII_COLUMNS: readonly string[] = Object.freeze([
   'requester_id',
   'expires_at',
+  'revoked_at',
   ...POSTGRES_EXPORT_INTERNAL_COLUMNS,
 ]);
 
@@ -280,6 +293,7 @@ export const POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS: readonly string[] = Object.f
   'requester_id',
   'artifact_id',
   'expires_at',
+  'revoked_at',
   ...POSTGRES_EXPORT_INTERNAL_COLUMNS,
 ] as const);
 
@@ -299,6 +313,23 @@ export const POSTGRES_EXPORT_MUTABLE_COLUMNS = [
   'updated_at',
 ] as const satisfies readonly (typeof POSTGRES_EXPORT_COLUMNS)[number][];
 
+/**
+ * **撤销写入**（`revokeForOwner`）允许变更的列：**恰好两列**。
+ *
+ * `revoked_at` 是撤销事实本身，`updated_at` 是服务端时钟；刻意**不含** `status` /
+ * `artifact_id` / `created_at` / `expires_at` / `resource` / `fields` / `id` / `requester_id`：
+ * 撤销不是状态机转移，也不删除产物、不改写交付范围与有效期 —— 它只把「这条导出已被本人取回」
+ * 记在独立列上。因此「撤销顺手改写结论 / 句柄 / 有效期」在存储层没有可用的改写路径。
+ *
+ * 与 `POSTGRES_EXPORT_MUTABLE_COLUMNS`（状态机写回的 `save`）**刻意分开**：
+ * `revoked_at` **不得**出现在 `save` 的 `SET` 列表里，否则一次并发的 `pending -> completed`
+ * 写回就能把撤销事实清空（那正是「并发撤销 / 完成」下撤销必须胜出的反面）。
+ */
+export const POSTGRES_EXPORT_REVOKE_COLUMNS = [
+  'revoked_at',
+  'updated_at',
+] as const satisfies readonly (typeof POSTGRES_EXPORT_COLUMNS)[number][];
+
 /** 不可变列：写回后必须与请求记录逐字节一致（`id`/`requester_id` 另有专属错误码） */
 export const POSTGRES_EXPORT_IMMUTABLE_COLUMNS = [
   'id',
@@ -306,6 +337,7 @@ export const POSTGRES_EXPORT_IMMUTABLE_COLUMNS = [
   'resource',
   'fields',
   'expires_at',
+  'revoked_at',
   'created_at',
 ] as const satisfies readonly (typeof POSTGRES_EXPORT_COLUMNS)[number][];
 
@@ -560,6 +592,7 @@ const COLUMN_PARAMETER_CASTS: Partial<Record<(typeof POSTGRES_EXPORT_COLUMNS)[nu
   requester_id: '::uuid',
   artifact_id: '::uuid',
   expires_at: '::timestamptz',
+  revoked_at: '::timestamptz',
   created_at: '::timestamptz',
   updated_at: '::timestamptz',
 };
@@ -710,6 +743,35 @@ const SELECT_STATUS_FOR_OWNER_SQL = `SELECT status
   FROM ${TABLE_IDENTIFIER}
   WHERE id = $1::uuid AND requester_id = $2::uuid`;
 
+/** 撤销语句的 `SET` 片段：由 `POSTGRES_EXPORT_REVOKE_COLUMNS` 派生（**恰好两列**） */
+const UPDATE_REVOKE_SET_LIST = POSTGRES_EXPORT_REVOKE_COLUMNS.map(
+  (column, index) => `${column} = $${index + 3}${COLUMN_PARAMETER_CASTS[column] ?? ''}`,
+).join(', ');
+
+/** 可撤销前驱集合的占位符序号：`$1`/`$2` 是 WHERE 的 id/归属，其后是撤销 SET 的两列 */
+const UPDATE_REVOKE_PREDECESSOR_PARAMETER = POSTGRES_EXPORT_REVOKE_COLUMNS.length + 3;
+
+/**
+ * **本人撤销**语句：与状态机写回（`UPDATE_SQL`）并列的第二条条件 `UPDATE`。
+ *
+ * `WHERE` 同时钉住四件事：
+ * - `id = $1::uuid` 与 `requester_id = $2::uuid` ⇒ 拿他人的记录 ID 一行都写不中（与「不存在」
+ *   返回同一个空结果集，不可区分）；
+ * - `status::text = ANY($n::text[])` ⇒ 只有**可撤销结论**（`EXPORT_REVOCABLE_STATUSES`：
+ *   `pending` / `completed`）能被写中；`failed` 结论一行都写不中（**不可撤销**），
+ *   这条谓词与迁移 0016 的 CHECK `export_jobs_revoked_at_matches_status` 同语义；
+ * - `revoked_at IS NULL` ⇒ **已撤销的记录写不中**（重复撤销幂等，**不改写**既有撤销时刻 ——
+ *   撤销是单调事实，NULL → 时刻只能发生一次）。
+ *
+ * `SET` **只有** `revoked_at` / `updated_at`：不改写 `status` / `artifact_id` / `created_at` /
+ * `expires_at` / `resource` / `fields`（不删除产物、不推进状态机、不续期）。
+ * `RETURNING` 让写入结果能被严格行契约与逐列复核（而不是「写完就当成功」）。
+ */
+const UPDATE_REVOKE_SQL = `UPDATE ${TABLE_IDENTIFIER}
+  SET ${UPDATE_REVOKE_SET_LIST}
+  WHERE id = $1::uuid AND requester_id = $2::uuid AND status::text = ANY($${UPDATE_REVOKE_PREDECESSOR_PARAMETER}::text[]) AND revoked_at IS NULL
+  RETURNING ${COLUMN_LIST}`;
+
 /**
  * 时间列契约：只接受驱动返回的 `Date` 或 **ISO 8601 datetime 字符串**。
  *
@@ -746,6 +808,7 @@ const postgresExportRowSchema = z
     status: z.enum(EXPORT_STATUS_VALUES),
     artifact_id: storageUuidSchema.nullable(),
     expires_at: postgresExportTimestampSchema.nullable(),
+    revoked_at: postgresExportTimestampSchema.nullable(),
     created_at: postgresExportTimestampSchema,
     updated_at: postgresExportTimestampSchema,
   })
@@ -833,6 +896,11 @@ function mapRow(row: unknown): ExportRequest {
     ...(dbRow.expires_at === null
       ? {}
       : { expiresAt: toIsoTimestamp(dbRow.expires_at, 'expires_at') }),
+    // 服务端撤销时刻：`NULL` 同样映射为**字段缺省**（= 未被撤销），因此「有没有被撤销」在
+    // 领域层是一个明确的二值事实（下载边界与列表派生状态都据此判定）。
+    ...(dbRow.revoked_at === null
+      ? {}
+      : { revokedAt: toIsoTimestamp(dbRow.revoked_at, 'revoked_at') }),
     createdAt: toIsoTimestamp(dbRow.created_at, 'created_at'),
     updatedAt: toIsoTimestamp(dbRow.updated_at, 'updated_at'),
   };
@@ -953,6 +1021,77 @@ export function assertPostgresExportRecordId(id: unknown): string {
 }
 
 /**
+ * 撤销时刻的存储域自检：必须是 **UTC ISO 8601**（`Z` 结尾）形态。
+ *
+ * 该值只由 service 用服务端时钟派生（`new Date(Date.now()).toISOString()`），因此形态非法
+ * 属于服务端缺陷；它会被绑定进 `$3::timestamptz`，一旦形态不合规，绑定就退化为
+ * 「让数据库去做字符串转换」，而不是在**进 SQL 之前** fail-closed。
+ * 错误只带字段标签，不回显取值（时间戳本身不进错误消息）。
+ */
+export function assertPostgresExportRevocationTimestamp(revokedAt: unknown): string {
+  if (typeof revokedAt !== 'string' || !z.string().datetime().safeParse(revokedAt).success) {
+    throw new PostgresExportRepositoryError(
+      'INVALID_RECORD',
+      '撤销时刻必须是 UTC ISO 8601 形态（服务端缺陷），不得进入 SQL',
+      ['revokedAt'],
+    );
+  }
+  return revokedAt;
+}
+
+/**
+ * 撤销写入的**逐列复核**（`RETURNING` 行回到领域层之前）。
+ *
+ * 条件写入的 `WHERE` 已经保证「只有本人、可撤销结论、未撤销过的行」会被写中，因此这里的复核
+ * 针对的是**纵深风险**（SQL 被改写、触发器、驱动串行错位）：
+ * - 主键与归属必须等于请求入参（`IDENTITY_MISMATCH` / `OWNER_VIOLATION`）；
+ * - 撤销时刻与服务端时钟写入的 `updated_at` 必须逐字节等于请求值（不得被存储侧改写）；
+ * - `status` 必须仍落在**可撤销前驱集合**内（撤销不得改写结论；越界即 `IDENTITY_MISMATCH`）；
+ * - `revokedAt` 必须存在（否则这次「撤销」什么也没写）。
+ * 复核失败一律 fail-closed 抛错，且错误只带列名，不带任何取值。
+ */
+function assertRevocationRoundTrip(
+  requested: { readonly id: string; readonly ownerUserId: string; readonly revokedAt: string },
+  stored: ExportRequest,
+): void {
+  if (stored.id !== requested.id) {
+    throw new PostgresExportRepositoryError(
+      'IDENTITY_MISMATCH',
+      '撤销返回记录的主键与请求不一致（他人记录不得作为撤销结果回流）',
+      ['id'],
+    );
+  }
+  if (stored.ownerUserId !== requested.ownerUserId) {
+    throw new PostgresExportRepositoryError(
+      'OWNER_VIOLATION',
+      '撤销返回记录的归属与请求不一致（他人归属不得回流）',
+      ['requester_id'],
+    );
+  }
+  if (stored.revokedAt !== requested.revokedAt) {
+    throw new PostgresExportRepositoryError(
+      'IDENTITY_MISMATCH',
+      '撤销返回记录的 revoked_at 与请求写入的撤销时刻不一致（撤销时刻不得被改写）',
+      ['revoked_at'],
+    );
+  }
+  if (stored.updatedAt !== requested.revokedAt) {
+    throw new PostgresExportRepositoryError(
+      'IDENTITY_MISMATCH',
+      '撤销返回记录的 updated_at 与请求写入的服务端时钟不一致（写入结果不得被改写）',
+      ['updated_at'],
+    );
+  }
+  if (!EXPORT_REVOCABLE_STATUSES.includes(stored.status)) {
+    throw new PostgresExportRepositoryError(
+      'IDENTITY_MISMATCH',
+      '撤销返回记录的 status 不在可撤销前驱集合内（撤销不得改写结论）',
+      ['status'],
+    );
+  }
+}
+
+/**
  * 分页**键集边界**的存储域自检：主键必须落在存储 ID 域（`uuid`）、时间分量必须是 UTC ISO 8601。
  *
  * 游标本身已由签名保护（客户端改不动），这里仍然判一次是纵深防御：边界值会被绑定进
@@ -1061,10 +1200,12 @@ function assertWritableRecord(record: unknown): ExportRequest {
 }
 
 /**
- * 入口状态门禁（`create` 专用）：**入口恒为 `pending`**。
+ * 入口状态门禁（`create` 专用）：**入口恒为 `pending`**，且**入口不得携带撤销事实**。
  *
  * 允许「创建即终态」会让调用方绕过状态机与产物生成（记录声称 `completed` 却没有产物、
  * 或声称 `failed` 却没有尝试过），因此这里 fail-closed，而不是把结论当成入口事实接受。
+ * 同理，`revokedAt` 只允许由 `revokeForOwner` 在记录**已存在**之后写入：
+ * 创建时就带撤销时刻意味着「一出生就已被取回」，那同样是一条没有发生过的事实。
  */
 function assertEntryRecord(record: ExportRequest): ExportRequest {
   if (record.status !== EXPORT_ENTRY_STATUS) {
@@ -1072,6 +1213,13 @@ function assertEntryRecord(record: ExportRequest): ExportRequest {
       'INVALID_RECORD',
       '创建路径只接受入口状态 pending：终态结论不得作为入口事实写入',
       ['status(entry_state_required)'],
+    );
+  }
+  if (record.revokedAt !== undefined) {
+    throw new PostgresExportRepositoryError(
+      'INVALID_RECORD',
+      '创建路径不接受撤销时刻：撤销只能由 revokeForOwner 在记录存在之后写入',
+      ['revokedAt(entry_forbidden)'],
     );
   }
   return record;
@@ -1157,6 +1305,7 @@ function writeParameters(record: ExportRequest): readonly unknown[] {
     status: record.status,
     artifactId: record.artifactId ?? null,
     expiresAt: record.expiresAt ?? null,
+    revokedAt: record.revokedAt ?? null,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
   };
@@ -1237,6 +1386,20 @@ function assertWriteRoundTrip(requested: ExportRequest, stored: ExportRequest): 
       'IDENTITY_MISMATCH',
       '返回记录的 fields 与请求写入的字段白名单不一致（导出范围不得被改写）',
       ['fields'],
+    );
+  }
+
+  // **撤销事实是单调的**：它不参与上面对 `save` 写入值的逐列比较，因为撤销可能与状态机推进
+  // 并发发生（一次并发的本人撤销会在 `save` 的 `SET` 之外把 `revoked_at` 置上；`save` 的
+  // SET 列表里没有该列，因此它**绝不会**被这次写回清空 —— 这正是「并发撤销 / 完成时撤销胜出」
+  // 的实现形态）。唯一被禁止的是**撤销事实被清空或改写**：请求里已经带着撤销时刻时，
+  // 存储返回值必须逐字节相等；请求里没有撤销时刻时，返回值带上撤销时刻是合法且期望的结果
+  // （并发的撤销刚刚发生），调用方据此在公开视图里呈现 `revoked`。
+  if (requested.revokedAt !== undefined && stored.revokedAt !== requested.revokedAt) {
+    throw new PostgresExportRepositoryError(
+      'IDENTITY_MISMATCH',
+      '返回记录的 revoked_at 与请求写入的撤销时刻不一致（撤销事实不得被清空或改写）',
+      ['revoked_at'],
     );
   }
 }
@@ -1523,6 +1686,101 @@ export class PostgresExportRepository implements AsyncExportRepository {
     }
     return records[0];
   }
+
+  /**
+   * **本人撤销**（`POST /me/exports/:exportId/revoke` 的唯一写入入口）。
+   *
+   * 判定顺序（与内存基线逐条一致，且被测试固定）：
+   * 1. 能力与执行器自检；
+   * 2. 记录 ID、主体与撤销时刻都在**进入 SQL 之前**判定：非 UUID 主键 `INVALID_ID`、
+   *    非 UUID 主体 `INVALID_SUBJECT`、非 UTC ISO 撤销时刻 `INVALID_RECORD` ——
+   *    拒绝路径**一个 SQL 都不执行**；
+   * 3. `UPDATE_REVOKE_SQL`：条件写入，`WHERE` 钉住 `id + 归属 + 可撤销前驱集合 + revoked_at IS NULL`，
+   *    `SET` 只有 `revoked_at` / `updated_at`（不写结论、不动产物句柄、不改有效期、不删行）；
+   * 4. 命中 1 行 ⇒ 严格行契约 + 撤销逐列复核 ⇒ `revoked`；
+   * 5. 0 行 ⇒ 一次**归属范围内**的诊断取数（`SELECT_BY_ID_FOR_OWNER_SQL`，`LIMIT 2`）分类：
+   *    - 0 行 ⇒ `undefined`（记录不存在**或属于他人**：两者不可区分，不泄露存在性）；
+   *    - 行已带撤销时刻 ⇒ `already-revoked`（幂等；**既有撤销时刻逐字节不变**）；
+   *    - 行未带撤销时刻 ⇒ `not-revocable`（结论是 `failed`：不可撤销，**没有任何写入**）；
+   *    - 多行 ⇒ `RESULT_SET_VIOLATION`（主键唯一性被破坏，不得静默取第一条）。
+   *
+   * 与 `save` 的并发关系：`save` 的 `SET` 列表里**没有** `revoked_at`，因此并发完成写回
+   * 既不会清空撤销事实，也不会被本方法的条件谓词挡住（`pending` 与 `completed` 都是合法前驱）；
+   * 反过来，并发撤销之后 `save`（`pending -> completed`）仍然可以写回，记录因此同时是
+   * `completed` 与已撤销 —— 下载边界按「已撤销优先」统一拒绝，撤销事实**胜出**。
+   */
+  async revokeForOwner(
+    id: string,
+    ownerUserId: string,
+    revokedAt: string,
+  ): Promise<ExportRevocationResult | undefined> {
+    const executor = this.usableExecutor();
+    const recordId = assertPostgresExportRecordId(id);
+    const ownerId = assertPostgresExportSubject(ownerUserId);
+    const revoked = assertPostgresExportRevocationTimestamp(revokedAt);
+
+    const rows = await runQuery(executor, UPDATE_REVOKE_SQL, [
+      recordId,
+      ownerId,
+      revoked,
+      // `updated_at` 与 `revoked_at` 取**同一个**服务端时钟读数（同一次读取派生两个占位符），
+      // 因此「撤销时刻」与「记录更新时间」不会因为两次时钟读取的漂移而不一致。
+      revoked,
+      [...EXPORT_REVOCABLE_STATUSES],
+    ]);
+
+    if (rows.length === 0) {
+      return this.classifyUnwrittenRevocation(executor, recordId, ownerId);
+    }
+    if (rows.length > 1) {
+      throw new PostgresExportRepositoryError(
+        'RESULT_SET_VIOLATION',
+        '撤销语句返回了多行：主键唯一性被破坏',
+        ['id'],
+      );
+    }
+
+    const record = mapRow(rows[0]);
+    assertRevocationRoundTrip({ id: recordId, ownerUserId: ownerId, revokedAt: revoked }, record);
+    return { outcome: ExportRevocationOutcome.Revoked, record };
+  }
+
+  /**
+   * 撤销条件写入 0 行时的分类：**归属范围内**按主键取数（`LIMIT 2`），据此给出
+   * `undefined`（不存在 / 属于他人）/ `already-revoked`（已撤销，幂等）/ `not-revocable`
+   * （不可撤销结论）。
+   *
+   * 该查询与 `findByIdForOwner` 共用同一条语句与同一份行映射，因此「他人记录不出库」
+   * 与「不存在与属于他人不可区分」两条性质在这里同样成立：本方法**不会**因为
+   * 「记录存在但不属于本主体」而给出任何与「不存在」不同的结果。
+   */
+  private async classifyUnwrittenRevocation(
+    executor: SqlExecutor,
+    recordId: string,
+    ownerId: string,
+  ): Promise<ExportRevocationResult | undefined> {
+    const rows = await runQuery(executor, SELECT_BY_ID_FOR_OWNER_SQL, [recordId, ownerId]);
+    const records = this.mapScopedRows(rows, ownerId);
+
+    if (records.length === 0) {
+      // 「不存在」与「属于他人」在这里**不可区分**：这是端口契约要求的安全属性
+      return undefined;
+    }
+    if (records.length > 1) {
+      throw new PostgresExportRepositoryError(
+        'RESULT_SET_VIOLATION',
+        '撤销诊断取数返回了多行：主键唯一性被破坏',
+        ['id'],
+      );
+    }
+    const record = records[0];
+    if (record === undefined) {
+      return undefined;
+    }
+    return record.revokedAt === undefined
+      ? { outcome: ExportRevocationOutcome.NotRevocable, record }
+      : { outcome: ExportRevocationOutcome.AlreadyRevoked, record };
+  }
 }
 
 /**
@@ -1585,6 +1843,21 @@ export function createLazyPostgresExportRepository(
       const recordId = assertPostgresExportRecordId(id);
       assertPostgresExportSubject(ownerUserId);
       return new PostgresExportRepository(await executor()).findByIdForOwner(recordId, ownerUserId);
+    },
+    async revokeForOwner(
+      id: string,
+      ownerUserId: string,
+      revokedAt: string,
+    ): Promise<ExportRevocationResult | undefined> {
+      // 记录 ID、归属与撤销时刻都先判、再建连：非法输入既不进 SQL，也不触发任何数据库连接
+      const recordId = assertPostgresExportRecordId(id);
+      const ownerId = assertPostgresExportSubject(ownerUserId);
+      const revoked = assertPostgresExportRevocationTimestamp(revokedAt);
+      return new PostgresExportRepository(await executor()).revokeForOwner(
+        recordId,
+        ownerId,
+        revoked,
+      );
     },
   };
 }

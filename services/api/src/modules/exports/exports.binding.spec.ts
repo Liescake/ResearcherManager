@@ -28,6 +28,7 @@ import {
   ExportStatus,
   type ExportRequest,
 } from './exports.port';
+import { EXPORT_REVOCABLE_STATUSES } from './exports.state-machine';
 
 /**
  * 导出切片的**换绑分流点**（`createExportRepository`）：把「导出请求的 PostgreSQL adapter 接入
@@ -92,6 +93,8 @@ function rowFor(
     artifact_id: null,
     // 服务端有效期：本夹具默认**没有**（存储 NULL），对应「字段缺省 ⇒ 下载边界 fail-closed」
     expires_at: null,
+    // 服务端撤销时刻：本夹具默认**未被撤销**（存储 NULL），对应「字段缺省 ⇒ 未被取回」
+    revoked_at: null,
     created_at: TIMESTAMP,
     updated_at: TIMESTAMP,
     ...overrides,
@@ -205,7 +208,7 @@ describe('导出仓储的持久化分流（createExportRepository）', () => {
     // 服务端有效期 `expires_at` **在**清单内（下载边界必须读它做过期判定），
     // 但它不进入公开视图（见 adapter 的 POSTGRES_EXPORT_VIEW_EXCLUDED_COLUMNS）。
     expect(sql).toContain(
-      'SELECT id, requester_id, resource, fields, status, artifact_id, expires_at, created_at, updated_at',
+      'SELECT id, requester_id, resource, fields, status, artifact_id, expires_at, revoked_at, created_at, updated_at',
     );
     expect(sql).not.toContain('*');
     // 归属下推进 SQL，且是占位符绑定；没有任何内部列（位置 / 凭据 / 原始错误）被选中
@@ -270,6 +273,69 @@ describe('导出仓储的持久化分流（createExportRepository）', () => {
     expect(sql).not.toContain('*');
     expect(sql).not.toContain(expiresAt);
     expect(withExpiry.parameters()[0]).toEqual([OWNER, POSTGRES_EXPORT_TRUNCATION_FIELD]);
+  });
+
+  it('撤销经换绑点原样承载：撤销时刻只进参数、条件谓词钉住归属与可撤销前驱，且不触达其它列', async () => {
+    const revokedAt = '2026-10-11T01:00:00.000Z';
+    const harness = countingFactory([
+      rowFor(OWNER, {
+        status: ExportStatus.Completed,
+        artifact_id: ARTIFACT_ID,
+        revoked_at: new Date(revokedAt),
+        updated_at: new Date(revokedAt),
+      }),
+    ]);
+    const repository = createExportRepository(
+      loadEnv({ NODE_ENV: 'test', DATABASE_URL: LOOPBACK_URL }),
+      harness.factory,
+    );
+
+    const result = await repository.revokeForOwner(REQUEST_ID, OWNER, revokedAt);
+    expect(result?.outcome).toBe('revoked');
+    expect(result?.record.revokedAt).toBe(revokedAt);
+
+    const [sql] = harness.sql();
+    expect(sql).toBeDefined();
+    // 条件更新：SET 只有撤销时刻与服务端时钟；WHERE 钉住主键 + 归属 + 可撤销前驱 + 单调性
+    expect(sql).toContain('revoked_at = $3::timestamptz');
+    expect(sql).toContain('updated_at = $4::timestamptz');
+    expect(sql).toContain('WHERE id = $1::uuid AND requester_id = $2::uuid');
+    expect(sql).toContain('status::text = ANY($5::text[])');
+    expect(sql).toContain('revoked_at IS NULL');
+    expect(sql).not.toContain('*');
+    // 撤销不改写结论 / 产物句柄 / 有效期 / 创建时间
+    expect(sql).not.toMatch(/\b(?:DELETE|TRUNCATE|ALTER|DROP)\b/u);
+    // 值只出现在参数里（撤销时刻写两次：revoked_at / updated_at 各占一个占位符）
+    expect(sql).not.toContain(revokedAt);
+    expect(sql).not.toContain(OWNER);
+    expect(harness.parameters()[0]).toEqual([
+      REQUEST_ID,
+      OWNER,
+      revokedAt,
+      revokedAt,
+      [...EXPORT_REVOCABLE_STATUSES],
+    ]);
+  });
+
+  it('撤销的非法入参（记录 ID / 主体 / 撤销时刻）在换绑点先判、不建连、不下发 SQL', async () => {
+    const harness = countingFactory([rowFor(OWNER)]);
+    const repository = createExportRepository(
+      loadEnv({ NODE_ENV: 'test', DATABASE_URL: LOOPBACK_URL }),
+      harness.factory,
+    );
+
+    await expect(
+      repository.revokeForOwner('not-a-uuid', OWNER, '2026-10-11T01:00:00.000Z'),
+    ).rejects.toMatchObject({ code: 'INVALID_ID' });
+    await expect(
+      repository.revokeForOwner(REQUEST_ID, SESSION_STYLE_SUBJECT, '2026-10-11T01:00:00.000Z'),
+    ).rejects.toMatchObject({ code: 'INVALID_SUBJECT' });
+    await expect(
+      repository.revokeForOwner(REQUEST_ID, OWNER, '2026/10/11 01:00'),
+    ).rejects.toMatchObject({ code: 'INVALID_RECORD' });
+
+    expect(harness.connects()).toBe(0);
+    expect(harness.sql()).toEqual([]);
   });
 
   it('存储 ID 域先判、再建连：非 UUID 会话主体在进入 SQL 之前就被拒绝', async () => {
