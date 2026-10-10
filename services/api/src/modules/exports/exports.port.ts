@@ -145,6 +145,11 @@ export interface ExportRepository {
    * 按 id 覆盖写入（状态机推进用），`WHERE` 同时钉住 `id` 与归属。
    * id 不存在、归属不符或非法状态转移都必须报错且**不产生任何写入**；
    * 不得退化成插入，也不得静默换主。
+   *
+   * 非法状态转移（并发推进 / 记录已到终态）必须抛出带有**端口级并发冲突标记**
+   * `EXPORT_TRANSITION_REJECTED` 的错误（`isExportTransitionRejection` 可判定），
+   * 由 service 映射为 409 `STATE_TRANSITION_INVALID`；其余失败码
+   * （`NOT_FOUND` / `OWNER_VIOLATION` / 行契约与执行器故障）仍是服务端缺陷，必须维持 fail-closed。
    */
   save(request: ExportRequest): Promise<ExportRequest>;
   /**
@@ -198,8 +203,9 @@ export const EXPORT_REPOSITORY_STORAGE_ID_DOMAIN = 'uuid';
  *    `EXPORT_ENTRY_STATUS`）；`save` 只接受 `pending -> completed | failed` 的合法转移，
  *    非法转移**不产生任何写入**，并由 service 的状态机门禁映射为 409
  *    `STATE_TRANSITION_INVALID`（`assertExportTransition` → `StateTransitionError`；
- *    adapter 侧的条件写入是同一条规则的**存储层镜像**）。终态不可再转移，
- *    重复处理同一请求绝不静默改写历史结论；
+ *    adapter 侧的条件写入是同一条规则的**存储层镜像**，未命中时抛出的错误带端口级标记
+ *    `EXPORT_TRANSITION_REJECTED`，由 service 映射为**同一个** 409 出口）。
+ *    终态不可再转移，重复处理同一请求绝不静默改写历史结论；
  * 2. **归属只来自服务端**：`ownerUserId` 由 service 从服务端会话主体写入，adapter 不生成、
  *    不覆盖归属，并逐条复核「返回记录的归属 === 请求主体 / 请求记录的归属」，不一致即判服务端缺陷；
  * 3. **存储 ID 域**：主体与记录内的 `id` / `artifactId` 必须落在
@@ -216,6 +222,44 @@ export const EXPORT_REPOSITORY_STORAGE_ID_DOMAIN = 'uuid';
  *    `exports.contract.ts` 的 `toExportRequestView` 逐字段裁剪（恰好 `EXPORT_REQUEST_VIEW_FIELDS`）。
  */
 export type AsyncExportRepository = ExportRepository;
+
+/**
+ * **端口级的并发 / 非法状态写回拒绝标记**（`save` 的条件写入未命中）。
+ *
+ * 触发条件：目标状态有合法前驱，但存储里的当前状态不在该前驱集合内 —— 典型场景是并发重复推进
+ * （第一个请求已把记录推进到终态，第二个请求的状态谓词不再命中），或历史结论被外部改写。
+ * 这是**客户端可见冲突**（应映射为 409 `STATE_TRANSITION_INVALID`），不是服务端缺陷。
+ *
+ * 为什么必须由端口规定这个标记：内存基线不做条件写入，只有数据库 adapter 会在存储层真的遇到竞态；
+ * 若两个实现各自抛普通 `Error`，service 就只能靠错误消息猜类型，409 映射会随实现漂移。
+ * 本标记是**结构化**的（唯一事实来源是这里的字面量，`isExportTransitionRejection` 只读 `code`，
+ * 不解析消息、不匹配错误名），因此 PostgreSQL adapter 的
+ * `PostgresExportRepositoryError('TRANSITION_REJECTED', …)` 天然满足它；而
+ * `NOT_FOUND` / `OWNER_VIOLATION` / `IDENTITY_MISMATCH` / `INVALID_RECORD` / `INVALID_ROW` /
+ * `EXECUTOR_FAILURE` 这些**服务端缺陷或基础设施故障**不满足它，仍按 500 fail-closed，
+ * 不会被这张映射吞成 409。
+ */
+export const EXPORT_TRANSITION_REJECTED = 'TRANSITION_REJECTED' as const;
+
+/** 端口级并发冲突标记的载体形态：`code` 精确等于 `EXPORT_TRANSITION_REJECTED` */
+export interface ExportTransitionRejection {
+  readonly code: typeof EXPORT_TRANSITION_REJECTED;
+}
+
+/**
+ * 判定端口抛出的错误是否代表「并发 / 非法状态导致的写回拒绝」。
+ *
+ * 只检查结构化的 `code` 字段：不匹配错误名、不解析消息（消息可能被实现替换为本地化文案，
+ * 且可能被注入载荷污染），因此实现细节、SQL 文本、归属与文件路径都不可能影响判定结果。
+ */
+export function isExportTransitionRejection(
+  error: unknown,
+): error is Error & ExportTransitionRejection {
+  return (
+    error instanceof Error &&
+    (error as { readonly code?: unknown }).code === EXPORT_TRANSITION_REJECTED
+  );
+}
 
 /**
  * DI 令牌：导出请求仓储（真实实现应委托 `export_jobs` 表）。

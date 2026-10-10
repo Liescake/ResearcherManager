@@ -11,6 +11,7 @@ import {
   EXPORT_REPOSITORY_BACKEND_POSTGRES,
   EXPORT_RESOURCE_VALUES,
   EXPORT_STATUS_VALUES,
+  EXPORT_TRANSITION_REJECTED,
   type AsyncExportRepository,
   type ExportRepositoryCapabilities,
   type ExportRequest,
@@ -63,6 +64,9 @@ import { EXPORT_ENTRY_STATUS, EXPORT_STATUS_TRANSITIONS } from './exports.state-
  *    拒绝路径一个 SQL 都不执行）；目标状态有前驱但存储行不在其中（重复处理 / 并发推进 / 已被改写）
  *    时条件写入命中 0 行，由一次**归属范围内**的诊断查询分类为 `NOT_FOUND` 或
  *    `TRANSITION_REJECTED`，两者都**不产生任何写入**、也不改写既有终态。
+ *    两处 `TRANSITION_REJECTED` 都使用端口常量 `EXPORT_TRANSITION_REJECTED`，
+ *    因此 service 的写回边界按端口标记把它稳定映射为 409 `STATE_TRANSITION_INVALID`
+ *    （并发重复推进对客户端是可见冲突，不是 500）。
  *
  * ## 安全边界（本文件的七条硬约束）
  * 1. **参数化 SQL + 固定标识符**：所有值一律走 `$1…$n` 占位符绑定；进入 SQL 文本的只有模块
@@ -311,21 +315,21 @@ export const POSTGRES_EXPORT_REPOSITORY_CAPABILITIES: ExportRepositoryCapabiliti
  *   建表迁移、`id` 主键冲突、按 `requester_id` 取数与全序、条件写入 0 行、归属不出库；
  * - 公开视图裁剪对**真实查询**复核（`SELECT` 列表恰好是公开列，内部列一列都不在结果里）；
  * - 执行器异常收敛为不含原始文本的 `EXECUTOR_FAILURE`，并由统一错误出口映射为 500
- *   `INTERNAL_ERROR`（原始文本只由驱动层记录）。
+ *   `INTERNAL_ERROR`（原始文本只由驱动层记录）；
+ * - `save` 的 `TRANSITION_REJECTED` 由 service 的写回边界按**端口标记**
+ *   `EXPORT_TRANSITION_REJECTED` 稳定映射为 409 `STATE_TRANSITION_INVALID`
+ *   （与状态机门禁同一个出口；`NOT_FOUND` / `OWNER_VIOLATION` / 行契约与执行器故障仍是 500，
+ *   由 `exports.controller.spec.ts` 的写回边界用例固定）。
  *
- * 仍然未完成的三项（因此 `productionReady` 恒为 false）：
+ * 仍然未完成的两项（因此 `productionReady` 恒为 false）：
  * 1. 会话主体 `ownerUserId` 收敛为 UUID：当前会话基线是 `u-student-1` 这类安全 ID，
  *    不满足存储 ID 域，数据库路径对它 fail-closed（`INVALID_SUBJECT`，且在解析执行器之前）；
- * 2. `save` 的 `TRANSITION_REJECTED` 在 service 层映射为 409 `STATE_TRANSITION_INVALID`：
- *    正常路径由 service 的状态机门禁先判（已映射 409），但**并发竞态**下 adapter 的条件写入
- *    0 行会抛 `TRANSITION_REJECTED`，目前会经统一出口冒泡为 500 —— 这一条尚未闭合；
- * 3. 取得**封存声明 + 已登记验证证据**后，才允许把 `productionReady` 改为 true
+ * 2. 取得**封存声明 + 已登记验证证据**后，才允许把 `productionReady` 改为 true
  *    （`assertPostgresExportRepositoryCapabilities` 会拒绝「未验证就声称生产可用」；
  *    封存与证据由依赖就绪契约判定，不是本 adapter 能自行声称的）。
  */
 export const POSTGRES_EXPORT_REPOSITORY_VERIFICATION_STEPS = [
   'session-subject-owner-ids-converged-to-uuid',
-  'state-transition-rejection-mapped-to-409',
   'production-ready-capability-flipped-with-evidence',
 ] as const;
 
@@ -1147,8 +1151,8 @@ export class PostgresExportRepository implements AsyncExportRepository {
    *    `artifact_id` / `updated_at`）：不一致分别判 `IDENTITY_MISMATCH` / `OWNER_VIOLATION`。
    *
    * `TRANSITION_REJECTED` 在服务端是**客户端可见冲突**（重复处理同一请求 / 并发推进）而不是缺陷：
-   * 切换到数据库的那一片切片必须把它映射为 409 `STATE_TRANSITION_INVALID`
-   * （已登记在验证清单第 8 项）。
+   * 两处拒绝都使用端口常量 `EXPORT_TRANSITION_REJECTED`，service 的写回边界因此把它稳定映射为
+   * 409 `STATE_TRANSITION_INVALID`（与状态机门禁同一个出口），而不是 500。
    */
   async save(request: ExportRequest): Promise<ExportRequest> {
     const executor = this.usableExecutor();
@@ -1157,7 +1161,7 @@ export class PostgresExportRepository implements AsyncExportRepository {
     if (predecessors.length === 0) {
       // 目标状态没有合法前驱（入口状态 pending）：非法转换，拒绝路径不产生任何 SQL
       throw new PostgresExportRepositoryError(
-        'TRANSITION_REJECTED',
+        EXPORT_TRANSITION_REJECTED,
         '非法状态转移：目标状态没有任何合法前驱（导出请求的入口状态不可回写为结论），写入被拒绝且不产生任何更改',
         ['status'],
       );
@@ -1209,7 +1213,7 @@ export class PostgresExportRepository implements AsyncExportRepository {
       throw invalidRow(parsedStatus.error, 'status');
     }
     return new PostgresExportRepositoryError(
-      'TRANSITION_REJECTED',
+      EXPORT_TRANSITION_REJECTED,
       '非法状态转移：当前存储状态不是目标状态的合法前驱（记录已到终态，或已被并发推进），写入被拒绝且不产生任何更改',
       ['status'],
     );

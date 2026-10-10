@@ -20,6 +20,7 @@ import { ApiExceptionFilter } from '../../common/api-exception.filter';
 import { ApiResponseInterceptor } from '../../common/api-response.interceptor';
 import { ConfigModule } from '../../config/config.module';
 import { loadEnv } from '../../config/env';
+import type { SqlExecutor } from '../../db/ports/sql-executor.port';
 import { AccessControlModule } from '../access-control/access-control.module';
 import { AuthModule } from '../auth/auth.module';
 import { InMemorySessionStore } from '../auth/session-store.in-memory';
@@ -56,10 +57,16 @@ import {
   EXPORT_REPOSITORY,
   EXPORT_RESOURCE_VALUES,
   EXPORT_STATUS_VALUES,
+  EXPORT_TRANSITION_REJECTED,
   ExportResource,
   ExportStatus,
+  isExportTransitionRejection,
 } from './exports.port';
 import type { ExportRequest } from './exports.port';
+import {
+  PostgresExportRepository,
+  PostgresExportRepositoryError,
+} from './exports.postgres-repository';
 import {
   EXPORT_ENTRY_PERMISSION,
   EXPORT_RESOURCE_READ_PERMISSIONS,
@@ -95,11 +102,13 @@ import {
  *   `x-path`…）不进入判定、归属、状态与输出；
  * - 状态机：成功 `pending -> completed`；产物生成失败或产物存储返回非法句柄 → `failed` 终态
  *   （201，不是 500）；仓储返回非 `pending` 记录 → 409 `STATE_TRANSITION_INVALID`
- *   且不产生任何产物副作用；写回未如实持久化 → 500；
+ *   且不产生任何产物副作用；数据库 adapter 的条件写入被并发拒绝
+ *   （端口标记 `EXPORT_TRANSITION_REJECTED`）→ **同一个** 409，不是 500；写回未如实持久化 → 500；
  * - PII 与 fail-closed 500：存储记录字段里出现证件号/密钥/路径、多出字段、归属不一致、
  *   状态与产物不自洽、未知枚举一律 500，响应与日志只含字段路径、不含取值；
  * - 存储异常：仓储取数/写入抛异常 → 500，不含错误名、堆栈与原文，也不返回
- *   「看起来成功但没有记录」的响应；
+ *   「看起来成功但没有记录」的响应；**唯一例外**是上面那条端口标记的并发冲突（409，
+ *   且拒绝判定只读结构化 `code`，不解析消息，因此 SQL / 归属 / 路径 / PII 都不影响判定）；
  * - 装配边界：`ExportsModule` 的控制器/服务/令牌绑定、两个内存基线的能力声明与生产拒绝构造、
  *   白名单与权限点映射的 parity、完整 `AppModule` 下既有路由回归。
  *
@@ -209,6 +218,49 @@ function fixtureExportRequest(overrides: Partial<ExportRequest> = {}): ExportReq
     updatedAt: '2026-01-06T00:00:05.000Z',
   };
   return { ...base, ...overrides };
+}
+
+/**
+ * 极简 SQL 替身：按调用顺序返回预设结果，**不连数据库**。
+ *
+ * 用它把**真实 adapter** 的写回路径跑到「条件写入命中 0 行 + 诊断有行」这一格，
+ * 于是测试里那个并发拒绝错误是由生产代码产出的（不是手搓一个带同名字段的对象），
+ * 「adapter 拒绝 → service / controller 契约」这条链因此是端到端的。
+ */
+function conditionalWriteMissExecutor(): SqlExecutor {
+  const responses: ReadonlyArray<{ rows: readonly unknown[]; rowCount: number }> = [
+    { rows: [], rowCount: 0 },
+    { rows: [{ status: ExportStatus.Completed }], rowCount: 1 },
+  ];
+  let index = 0;
+  return {
+    capabilities: { backend: 'postgres-test-double', persistent: true, productionReady: false },
+    query: <Row = Record<string, unknown>>() => {
+      const next = responses[Math.min(index, responses.length - 1)] ?? { rows: [], rowCount: 0 };
+      index += 1;
+      return Promise.resolve(next as { rows: readonly Row[]; rowCount: number });
+    },
+  };
+}
+
+/** 在真实 adapter 代码路径上拿到一次「并发推进被条件写入拒绝」的错误 */
+async function adapterTransitionRejection(): Promise<PostgresExportRepositoryError> {
+  const record = fixtureExportRequest({
+    id: '77777777-7777-4777-8777-777777777777',
+    // 存储 ID 域要求规范小写形 UUID（会话基线 `u-student-1` 不满足，属另一条已登记前置）
+    ownerUserId: '11111111-1111-4111-8111-111111111111',
+    status: ExportStatus.Failed,
+    artifactId: undefined,
+  });
+
+  let captured: unknown;
+  try {
+    await new PostgresExportRepository(conditionalWriteMissExecutor()).save(record);
+  } catch (error) {
+    captured = error;
+  }
+  expect(captured).toBeInstanceOf(PostgresExportRepositoryError);
+  return captured as PostgresExportRepositoryError;
 }
 
 /** 夹具内容固定，便于断言顺序、状态闭集与「他人内容不出现」 */
@@ -1451,6 +1503,113 @@ describe('导出切片：状态机（pending → completed / failed）', () => {
     // 状态机门禁先于产物副作用与落库
     expect(store).not.toHaveBeenCalled();
     expect(save).not.toHaveBeenCalled();
+  });
+
+  it('adapter 条件写入被并发拒绝 → 409 STATE_TRANSITION_INVALID（不是 500），且不外泄 SQL/归属/路径/PII', async () => {
+    vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const app = await startExportsApp({ seed: false });
+
+    // 真实的 adapter 拒绝对象：端口标记必须可判定（service 只按结构化 code 映射）
+    const rejection = await adapterTransitionRejection();
+    expect(rejection.code).toBe(EXPORT_TRANSITION_REJECTED);
+    expect(isExportTransitionRejection(rejection)).toBe(true);
+
+    vi.spyOn(app.repository, 'save').mockImplementation(() => {
+      throw rejection;
+    });
+
+    const res = await call(app.baseUrl, 'POST', '/me/exports', {
+      headers: bearer(SESSION_STUDENT_1),
+      body: { resource: ExportResource.Profile },
+    });
+
+    expect(res.status).toBe(409);
+    expect(res.body.data).toBeNull();
+    expect(res.body.error?.code).toBe('STATE_TRANSITION_INVALID');
+    // 对外是状态机的安全文案（与状态机门禁路径同一个出口），不是 adapter 的错误消息
+    expect(res.body.error?.message).toBe('export request 不允许从 pending 转移到 completed');
+
+    const content = contentText(res);
+    for (const leaked of [
+      rejection.message,
+      'PostgresExportRepositoryError',
+      EXPORT_TRANSITION_REJECTED,
+      'export_jobs',
+      'requester_id',
+      'UPDATE',
+      'SELECT',
+      STUDENT_1,
+      STUDENT_2,
+      FORGED_PATH,
+      FORGED_FILE_URL,
+      FORGED_STORAGE_KEY,
+      PII_ID_CARD,
+      PII_SECRET,
+      OTHER_PHONE,
+    ]) {
+      expect(content, leaked).not.toContain(leaked);
+    }
+    expectNoStorageLeak(content);
+
+    // 入口记录仍是 pending：结论未落库，不得谎报为 completed / failed
+    expect((await app.repository.listByOwnerId(STUDENT_1)).map((record) => record.status)).toEqual([
+      ExportStatus.Pending,
+    ]);
+  });
+
+  it('存储层其它失败码（NOT_FOUND / OWNER_VIOLATION / EXECUTOR_FAILURE）继续 500：409 映射不是整体降级', async () => {
+    vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+
+    const failures = [
+      new PostgresExportRepositoryError(
+        'NOT_FOUND',
+        `导出请求不存在（或不属于该主体）: owner=${STUDENT_1} path=${FORGED_PATH}`,
+        ['id'],
+      ),
+      new PostgresExportRepositoryError(
+        'OWNER_VIOLATION',
+        `写回记录的归属与请求主体不一致: requester_id=${STUDENT_1}`,
+        ['requester_id'],
+      ),
+      new PostgresExportRepositoryError(
+        'EXECUTOR_FAILURE',
+        `connect ECONNREFUSED 10.0.0.9:5432 ${FORGED_STORAGE_KEY} s3://internal-bucket`,
+        ['executor'],
+      ),
+    ];
+
+    for (const failure of failures) {
+      expect(isExportTransitionRejection(failure), failure.code).toBe(false);
+
+      const app = await startExportsApp({ seed: false });
+      vi.spyOn(app.repository, 'save').mockImplementation(() => {
+        throw failure;
+      });
+
+      const res = await call(app.baseUrl, 'POST', '/me/exports', {
+        headers: bearer(SESSION_STUDENT_1),
+        body: { resource: ExportResource.Profile },
+      });
+
+      expect(res.status, failure.code).toBe(500);
+      expect(res.body.data).toBeNull();
+      expect(res.body.error?.code).toBe('INTERNAL_ERROR');
+      expect(res.body.error?.message).toBe(INTERNAL_ERROR_MESSAGE);
+
+      const content = contentText(res);
+      for (const leaked of [
+        failure.message,
+        failure.code,
+        'PostgresExportRepositoryError',
+        STUDENT_1,
+        FORGED_PATH,
+        FORGED_STORAGE_KEY,
+        'requester_id',
+        'export_jobs',
+      ]) {
+        expect(content, `${failure.code}:${leaked}`).not.toContain(leaked);
+      }
+    }
   });
 
   it('仓储写回未如实持久化结论（状态未推进 / 句柄被替换或丢失）→ 500 完整性失败', async () => {

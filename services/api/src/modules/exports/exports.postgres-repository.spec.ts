@@ -18,8 +18,10 @@ import {
   EXPORT_REPOSITORY_STORAGE_ID_DOMAIN,
   EXPORT_RESOURCE_VALUES,
   EXPORT_STATUS_VALUES,
+  EXPORT_TRANSITION_REJECTED,
   ExportResource,
   ExportStatus,
+  isExportTransitionRejection,
 } from './exports.port';
 import type {
   AsyncExportRepository,
@@ -453,15 +455,14 @@ describe('PostgreSQL 导出仓储：能力声明与交付边界', () => {
   });
 
   it('验证清单只剩真正未闭合的前置：已闭环的必须从待办移除，且证据在仓库里', () => {
-    // 仍未闭合的三项（因此 productionReady 恒为 false）
+    // 仍未闭合的两项（因此 productionReady 恒为 false）
     for (const step of [
       'session-subject-owner-ids-converged-to-uuid',
-      'state-transition-rejection-mapped-to-409',
       'production-ready-capability-flipped-with-evidence',
     ]) {
       expect(POSTGRES_EXPORT_REPOSITORY_VERIFICATION_STEPS).toContain(step);
     }
-    expect(POSTGRES_EXPORT_REPOSITORY_VERIFICATION_STEPS).toHaveLength(3);
+    expect(POSTGRES_EXPORT_REPOSITORY_VERIFICATION_STEPS).toHaveLength(2);
     // 本切片已经闭环的前置**必须**从「待办」里移除：清单停留在旧状态就是一条假声明
     for (const delivered of [
       'driver-dependency-evaluated',
@@ -472,6 +473,7 @@ describe('PostgreSQL 导出仓储：能力声明与交付边界', () => {
       'export-repository-port-migrated-to-async',
       'executor-failure-mapped-to-500-without-raw-text',
       'public-view-exclusion-verified-against-real-queries',
+      'state-transition-rejection-mapped-to-409',
     ]) {
       expect(POSTGRES_EXPORT_REPOSITORY_VERIFICATION_STEPS).not.toContain(delivered);
     }
@@ -1291,6 +1293,9 @@ describe('PostgreSQL 导出仓储：subject owner 隔离与状态机', () => {
     const { repository, executor } = repoWith({ rows: [rowFromJob(PENDING_JOB)], rowCount: 1 });
     const error = await captureRepoError(() => repository.save(PENDING_JOB));
     expect(error.code).toBe('TRANSITION_REJECTED');
+    // 拒绝带**端口级并发冲突标记**：service 按它映射 409，不靠错误消息猜类型
+    expect(error.code).toBe(EXPORT_TRANSITION_REJECTED);
+    expect(isExportTransitionRejection(error)).toBe(true);
     expectIssueOn(error, 'status');
     expect(executor.calls).toHaveLength(0);
     expectNoValueLeak(error);
@@ -1320,11 +1325,50 @@ describe('PostgreSQL 导出仓储：subject owner 隔离与状态机', () => {
     );
     const error = await captureRepoError(() => repository.save(FAILED_JOB));
     expect(error.code).toBe('TRANSITION_REJECTED');
+    expect(isExportTransitionRejection(error)).toBe(true);
     expectIssueOn(error, 'status');
     expect(executor.calls).toHaveLength(2);
     const writes = executor.calls.filter((call) => /\b(?:INSERT|UPDATE)\b/u.test(call.sql));
     expect(writes).toHaveLength(1);
     expectNoValueLeak(error);
+  });
+
+  it('端口级并发冲突标记只认 TRANSITION_REJECTED：服务端缺陷与执行器故障不得被误判为 409', async () => {
+    // 正例：adapter 的两条拒绝路径都满足端口标记
+    expect(EXPORT_TRANSITION_REJECTED).toBe('TRANSITION_REJECTED');
+    const rejected = await captureRepoError(() =>
+      repoWith({ rows: [], rowCount: 0 }).repository.save(PENDING_JOB),
+    );
+    expect(isExportTransitionRejection(rejected)).toBe(true);
+
+    // 反例：其它失败码仍是服务端缺陷 / 基础设施故障，必须继续 fail-closed（由 service 边界抛 500）
+    const others = [
+      await captureRepoError(() =>
+        repoWith({ rows: [], rowCount: 0 }, { rows: [], rowCount: 0 }).repository.save(
+          COMPLETED_JOB,
+        ),
+      ),
+      await captureRepoError(() =>
+        repoWith({
+          rows: [rowFromJob(COMPLETED_JOB, { requester_id: OTHER_OWNER })],
+          rowCount: 1,
+        }).repository.save(COMPLETED_JOB),
+      ),
+      await captureRepoError(() =>
+        new PostgresExportRepository(new ThrowingExecutor(new Error('boom'))).save(COMPLETED_JOB),
+      ),
+    ];
+    for (const other of others) {
+      expect(other).toBeInstanceOf(PostgresExportRepositoryError);
+      expect(isExportTransitionRejection(other)).toBe(false);
+    }
+    // 非错误值与非 Error 抛出物同样不满足标记（判定不靠错误名、不解析消息）
+    for (const value of [{ code: 'TRANSITION_REJECTED' }, null, undefined, 'TRANSITION_REJECTED']) {
+      expect(isExportTransitionRejection(value)).toBe(false);
+    }
+    // 伪造同名字段的消息文本不能把普通异常变成 409
+    const plain = new Error('非法状态转移 TRANSITION_REJECTED');
+    expect(isExportTransitionRejection(plain)).toBe(false);
   });
 
   it('诊断查询返回多行 / 未知状态 / 额外列 → fail-closed', async () => {

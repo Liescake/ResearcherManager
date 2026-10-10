@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { Inject, Injectable, InternalServerErrorException, Logger } from '@nestjs/common';
-import { DataScope, PermissionPoint } from '@rm/shared';
+import { DataScope, PermissionPoint, StateTransitionError } from '@rm/shared';
 import type { AuthorizationSubject } from '@rm/shared';
 import { AuthorizationGuard } from '../access-control/authorization-guard';
 import {
@@ -21,6 +21,7 @@ import {
   EXPORT_REPOSITORY,
   ExportResource,
   ExportStatus,
+  isExportTransitionRejection,
 } from './exports.port';
 import type { ExportArtifactStore, ExportRepository, ExportRequest } from './exports.port';
 import { EXPORT_ENTRY_STATUS, assertExportTransition } from './exports.state-machine';
@@ -47,10 +48,14 @@ import { EXPORT_ENTRY_STATUS, assertExportTransition } from './exports.state-mac
  * 4. **状态机收敛且不可回退**：入口 `pending` → `completed` / `failed`；
  *    产物生成失败或产物存储返回非法句柄都收敛为 `failed` 终态（这是「导出没做出来」的业务事实，
  *    不把用户卡在 500 上）；仓储返回非 `pending` 记录（重复处理/数据被改写）由状态机拦截为
- *    409 `STATE_TRANSITION_INVALID`，绝不覆盖既有结论。
+ *    409 `STATE_TRANSITION_INVALID`，绝不覆盖既有结论。数据库 adapter 的条件写入是这条规则的
+ *    **存储层镜像**：并发下未命中时抛出的错误带端口标记 `EXPORT_TRANSITION_REJECTED`，
+ *    由本服务的写回边界映射为**同一个** 409（`StateTransitionError`），并发重复推进同样是 409。
  * 5. **落库失败 fail-closed**：请求事实无法落库（`create` / `save` 抛异常）或写回记录未如实
  *    持久化本次结论时，返回 500 且不泄露内部细节——绝不返回「看起来成功但没有记录」的响应，
- *    也不把仓储的内部错误信息外发。
+ *    也不把仓储的内部错误信息外发。**唯一的例外**是上面那条客户端可见冲突（端口标记
+ *    `EXPORT_TRANSITION_REJECTED` → 409）：它按结构化 `code` 判定，错误消息里的 SQL、归属、
+ *    文件路径与 PII 既不参与判定也不进入响应。
  * 6. **出口再校验一次**：存储记录必须满足读取契约（枚举闭集、字段白名单子集与去重、
  *    状态与产物句柄自洽、ISO 时间、字段闭集），违规或归属与会话主体不一致一律 500，
  *    且日志只写字段路径、不写取值；对外视图再过一遍 `.strict()` 白名单，多出字段即 500。
@@ -111,7 +116,8 @@ export class ExportsService {
    * 判定顺序（被测试固定）：无有效会话 → 401（认证边界，见 controller）；入口授权拒绝 → 403；
    * 查询串带参数 / 请求体带服务端字段或未声明字段 → 400；资源不在白名单 → 400；
    * 资源级授权拒绝 → 403；字段不在该资源白名单内 → 400；入口写回被替换 → 500；仓储失败 → 500；
-   * 产物生成失败 → 201 + `failed` 终态；仓储返回非 `pending` → 409。
+   * 产物生成失败 → 201 + `failed` 终态；仓储返回非 `pending` 或写回被存储层条件谓词拒绝
+   * （并发重复推进）→ 409 `STATE_TRANSITION_INVALID`。
    * 未授权请求在两个端口上都没有调用记录。
    */
   async createMyExportRequest(
@@ -169,14 +175,28 @@ export class ExportsService {
 
     const outcome = this.materialize(created);
 
-    const saved = await this.repository.save({
-      ...created,
-      status: outcome.status,
-      ...(outcome.artifactId !== undefined ? { artifactId: outcome.artifactId } : {}),
-      updatedAt: new Date().toISOString(),
-    });
+    // 10. 写回结论。**唯一的错误边界**：端口在条件写入未命中（并发重复推进 / 记录已到终态）时
+    //     按端口标记 `EXPORT_TRANSITION_REJECTED` 抛错，这是客户端可见冲突，必须映射为与状态机
+    //     门禁**同一个** 409 `STATE_TRANSITION_INVALID`，而不是冒泡成 500。判定只读结构化 `code`，
+    //     不解析消息、不匹配错误名：错误消息里的 SQL / 归属 / 路径 / PII 既不参与判定也不外发。
+    //     其余失败（未知 id / 归属不符 / 行契约损坏 / 执行器故障）仍是服务端缺陷，原样向上抛，
+    //     由统一出口 fail-closed 为 500。
+    let saved: ExportRequest;
+    try {
+      saved = await this.repository.save({
+        ...created,
+        status: outcome.status,
+        ...(outcome.artifactId !== undefined ? { artifactId: outcome.artifactId } : {}),
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (error) {
+      if (isExportTransitionRejection(error)) {
+        throw new StateTransitionError('export request', created.status, outcome.status);
+      }
+      throw error;
+    }
 
-    // 10. 写回复核：仓储必须如实持久化本次结论（状态与产物句柄）
+    // 11. 写回复核：仓储必须如实持久化本次结论（状态与产物句柄）
     this.assertRecordedOutcome(saved, outcome);
 
     return this.toOwnedView(saved, subject.userId);
