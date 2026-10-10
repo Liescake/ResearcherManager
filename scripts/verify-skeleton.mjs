@@ -12,7 +12,7 @@
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -114,15 +114,12 @@ const PUBLIC_ENV_TEMPLATE_KEYS = [
   'AI_MATCHING_ENABLED',
 ];
 
-const failures = [];
-const warnings = [];
-
-function readJson(relativePath) {
+function readJson(relativePath, state) {
   const absolutePath = join(repoRoot, relativePath);
   try {
     return JSON.parse(readFileSync(absolutePath, 'utf8'));
   } catch (error) {
-    failures.push(`无法解析 ${relativePath}: ${error.message}`);
+    state.failures.push(`无法解析 ${relativePath}: ${error.message}`);
     return null;
   }
 }
@@ -180,171 +177,218 @@ function isWorkspaceMember(entries, directory) {
  * - 可选本地切片缺少 package.json → 只提示（公开检出未提交 miniapp 属预期）；
  * - 包存在时，两类包都按同一套规则校验，可选切片不会豁免真实错误。
  */
-function verifyPackageMetadata({ dir, name }, { optional = false } = {}) {
+function verifyPackageMetadata({ dir, name }, state, { optional = false } = {}) {
   const relativePath = `${dir}/package.json`;
   if (!existsSync(join(repoRoot, relativePath))) {
     if (optional) {
-      warnings.push(
+      state.warnings.push(
         `缺少可选本地切片文件（本轮不提交 apps/miniapp，公开检出缺失属预期）: ${relativePath}`,
       );
     } else {
-      failures.push(`缺少文件: ${relativePath}`);
+      state.failures.push(`缺少文件: ${relativePath}`);
     }
     return;
   }
-  const packageJson = readJson(relativePath);
+  const packageJson = readJson(relativePath, state);
   if (!packageJson) {
     return;
   }
   if (packageJson.name !== name) {
-    failures.push(`${dir}/package.json 的 name 应为 ${name}，实际为 ${packageJson.name}`);
+    state.failures.push(`${dir}/package.json 的 name 应为 ${name}，实际为 ${packageJson.name}`);
   }
   if (packageJson.private !== true) {
-    failures.push(`${dir}/package.json 必须为 private`);
+    state.failures.push(`${dir}/package.json 必须为 private`);
   }
   if (!packageJson.scripts?.typecheck) {
-    failures.push(`${dir}/package.json 缺少 typecheck 脚本`);
+    state.failures.push(`${dir}/package.json 缺少 typecheck 脚本`);
   }
-  if (!isWorkspaceMember(workspaceEntries, dir)) {
-    warnings.push(`${dir} 未纳入 workspace（其目录与 package.json 仍被本自检校验）`);
-  }
-}
-
-for (const directory of REQUIRED_DIRECTORIES) {
-  if (!existsSync(join(repoRoot, directory))) {
-    failures.push(`缺少目录: ${directory}/`);
+  if (!isWorkspaceMember(state.workspaceEntries, dir)) {
+    state.warnings.push(`${dir} 未纳入 workspace（其目录与 package.json 仍被本自检校验）`);
   }
 }
 
-for (const directory of OPTIONAL_LOCAL_DIRECTORIES) {
-  if (!existsSync(join(repoRoot, directory))) {
-    warnings.push(
-      `缺少可选本地切片目录（本轮不提交 apps/miniapp，公开检出缺失属预期）: ${directory}/`,
+function findLegacyPermissionTokens(text, token) {
+  const escaped = token.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+  const boundary = '[A-Za-z0-9_:-]';
+  return [...text.matchAll(new RegExp(`(?<!${boundary})${escaped}(?!${boundary})`, 'gu'))];
+}
+
+function containsForbiddenLegacyPermissionUsage(line, token) {
+  const matches = findLegacyPermissionTokens(line, token);
+  if (matches.length === 0) return false;
+  const explicitProhibition =
+    /(?:已废弃|废弃|禁止|不得|不接受|不允许|不应|不可|拒绝|禁用|deprecated|forbidden|never)[^\n`“”"']{0,24}/iu;
+  return matches.some(({ index }) => {
+    const before = line.slice(0, index);
+    const after = line.slice(index + token.length);
+    const isQuotedReference =
+      (before.endsWith('`') && after.startsWith('`')) ||
+      (before.endsWith('"') && after.startsWith('"')) ||
+      (before.endsWith('“') && after.startsWith('”')) ||
+      (before.endsWith("'") && after.startsWith("'"));
+    const isProhibitedReference =
+      explicitProhibition.test(before.slice(-32)) || explicitProhibition.test(after.slice(0, 32));
+    return !(isProhibitedReference && isQuotedReference);
+  });
+}
+
+function runVerification({ log = true } = {}) {
+  const state = { failures: [], warnings: [], workspaceEntries: [] };
+  for (const directory of REQUIRED_DIRECTORIES) {
+    if (!existsSync(join(repoRoot, directory))) {
+      state.failures.push(`缺少目录: ${directory}/`);
+    }
+  }
+
+  for (const directory of OPTIONAL_LOCAL_DIRECTORIES) {
+    if (!existsSync(join(repoRoot, directory))) {
+      state.warnings.push(
+        `缺少可选本地切片目录（本轮不提交 apps/miniapp，公开检出缺失属预期）: ${directory}/`,
+      );
+    }
+  }
+
+  for (const directory of LOCAL_ONLY_DIRECTORIES) {
+    if (!existsSync(join(repoRoot, directory))) {
+      state.warnings.push(`缺少内部文档目录（公开检出正常，已跳过相关扫描）: ${directory}/`);
+    }
+  }
+
+  for (const file of REQUIRED_FILES) {
+    if (!existsSync(join(repoRoot, file))) {
+      state.failures.push(`缺少文件: ${file}`);
+    }
+  }
+
+  for (const file of OPTIONAL_LOCAL_FILES) {
+    if (!existsSync(join(repoRoot, file))) {
+      state.warnings.push(
+        `缺少可选本地切片文件（本轮不提交 apps/miniapp，公开检出缺失属预期）: ${file}`,
+      );
+    }
+  }
+
+  const rootPackage = readJson('package.json', state);
+  if (rootPackage) {
+    for (const script of REQUIRED_ROOT_SCRIPTS) {
+      if (!rootPackage.scripts?.[script]) {
+        state.failures.push(`根 package.json 缺少脚本: ${script}`);
+      }
+    }
+    if (rootPackage.private !== true) {
+      state.failures.push('根 package.json 必须为 private，避免误发布到 npm');
+    }
+  }
+
+  const workspaceYaml = existsSync(join(repoRoot, 'pnpm-workspace.yaml'))
+    ? readFileSync(join(repoRoot, 'pnpm-workspace.yaml'), 'utf8')
+    : '';
+  state.workspaceEntries = parseWorkspaceEntries(workspaceYaml);
+  for (const entry of REQUIRED_WORKSPACE_ENTRIES) {
+    if (!isWorkspaceMember(state.workspaceEntries, entry)) {
+      state.failures.push(`pnpm-workspace.yaml 缺少工作区声明: ${entry}`);
+    }
+  }
+
+  for (const workspacePackage of WORKSPACE_PACKAGES) {
+    verifyPackageMetadata(workspacePackage, state);
+  }
+
+  for (const localPackage of OPTIONAL_LOCAL_PACKAGES) {
+    verifyPackageMetadata(localPackage, state, { optional: true });
+  }
+
+  const apiMain = join(repoRoot, 'services/api/src/main.ts');
+  if (existsSync(apiMain) && !readFileSync(apiMain, 'utf8').includes('API_PREFIX')) {
+    state.warnings.push('services/api/src/main.ts 未使用统一 API_PREFIX 常量');
+  }
+
+  const envExample = join(repoRoot, PUBLIC_ENV_TEMPLATE);
+  if (!existsSync(envExample)) {
+    state.failures.push(
+      `缺少公开环境模板: ${PUBLIC_ENV_TEMPLATE}（属公开安全基线，请单独提交该模板，不要降级为可选）`,
+    );
+  } else {
+    const content = readFileSync(envExample, 'utf8');
+    for (const key of PUBLIC_ENV_TEMPLATE_KEYS) {
+      if (!content.includes(`${key}=`)) {
+        state.warnings.push(`${PUBLIC_ENV_TEMPLATE} 缺少变量说明: ${key}`);
+      }
+    }
+  }
+
+  const localOnlyDocs = ['需求.txt', '要求.txt', 'AI开发计划表.md', '计划表待确认问题清单.md'];
+  const legacyPermissionTokens = [
+    'audit:delete',
+    'export:*',
+    'membership:self:apply',
+    'membership:group:review',
+  ];
+
+  for (const relativePath of [
+    'docs/P1-权限矩阵.md',
+    'docs/P2-权限目录与状态机.md',
+    'docs/P2-API契约基线.md',
+  ]) {
+    const absolutePath = join(repoRoot, relativePath);
+    if (!existsSync(absolutePath)) {
+      state.warnings.push(`无法执行已废弃权限字符串扫描（内部文档不在工作区）: ${relativePath}`);
+      continue;
+    }
+    const content = readFileSync(absolutePath, 'utf8');
+    for (const line of content.split(/\r?\n/u)) {
+      for (const token of legacyPermissionTokens) {
+        if (containsForbiddenLegacyPermissionUsage(line, token)) {
+          state.failures.push(`${relativePath} 包含已废弃权限字符串: ${token}`);
+        }
+      }
+    }
+  }
+  for (const doc of localOnlyDocs) {
+    if (!existsSync(join(repoRoot, doc))) {
+      state.warnings.push(`本地文档不存在（可能已被移出工作区）: ${doc}`);
+    }
+  }
+
+  if (log) {
+    console.log('工程骨架自检');
+    console.log(`- 仓库根目录: ${repoRoot}`);
+    console.log(`- 必需目录: ${REQUIRED_DIRECTORIES.length} 项`);
+    console.log(
+      `- 可选本地切片目录: ${OPTIONAL_LOCAL_DIRECTORIES.join(', ')}（缺失只提示，不判失败）`,
+    );
+    console.log(`- 必需文件: ${REQUIRED_FILES.length} 项`);
+    console.log(`- 可选本地切片文件: ${OPTIONAL_LOCAL_FILES.length} 项（缺失只提示，不判失败）`);
+    console.log(`- 必需工作区包: ${WORKSPACE_PACKAGES.map((item) => item.name).join(', ')}`);
+    console.log(
+      `- 可选本地切片包（不纳入 workspace）: ${OPTIONAL_LOCAL_PACKAGES.map((item) => item.name).join(', ')}`,
     );
   }
-}
 
-for (const directory of LOCAL_ONLY_DIRECTORIES) {
-  if (!existsSync(join(repoRoot, directory))) {
-    warnings.push(`缺少内部文档目录（公开检出正常，已跳过相关扫描）: ${directory}/`);
-  }
-}
-
-for (const file of REQUIRED_FILES) {
-  if (!existsSync(join(repoRoot, file))) {
-    failures.push(`缺少文件: ${file}`);
-  }
-}
-
-for (const file of OPTIONAL_LOCAL_FILES) {
-  if (!existsSync(join(repoRoot, file))) {
-    warnings.push(`缺少可选本地切片文件（本轮不提交 apps/miniapp，公开检出缺失属预期）: ${file}`);
-  }
-}
-
-const rootPackage = readJson('package.json');
-if (rootPackage) {
-  for (const script of REQUIRED_ROOT_SCRIPTS) {
-    if (!rootPackage.scripts?.[script]) {
-      failures.push(`根 package.json 缺少脚本: ${script}`);
+  if (log && state.warnings.length > 0) {
+    console.log(`\n提示 (${state.warnings.length})`);
+    for (const warning of state.warnings) {
+      console.log(`  ~ ${warning}`);
     }
   }
-  if (rootPackage.private !== true) {
-    failures.push('根 package.json 必须为 private，避免误发布到 npm');
-  }
-}
 
-const workspaceYaml = existsSync(join(repoRoot, 'pnpm-workspace.yaml'))
-  ? readFileSync(join(repoRoot, 'pnpm-workspace.yaml'), 'utf8')
-  : '';
-const workspaceEntries = parseWorkspaceEntries(workspaceYaml);
-for (const entry of REQUIRED_WORKSPACE_ENTRIES) {
-  if (!isWorkspaceMember(workspaceEntries, entry)) {
-    failures.push(`pnpm-workspace.yaml 缺少工作区声明: ${entry}`);
-  }
-}
-
-for (const workspacePackage of WORKSPACE_PACKAGES) {
-  verifyPackageMetadata(workspacePackage);
-}
-
-for (const localPackage of OPTIONAL_LOCAL_PACKAGES) {
-  verifyPackageMetadata(localPackage, { optional: true });
-}
-
-const apiMain = join(repoRoot, 'services/api/src/main.ts');
-if (existsSync(apiMain) && !readFileSync(apiMain, 'utf8').includes('API_PREFIX')) {
-  warnings.push('services/api/src/main.ts 未使用统一 API_PREFIX 常量');
-}
-
-const envExample = join(repoRoot, PUBLIC_ENV_TEMPLATE);
-if (!existsSync(envExample)) {
-  failures.push(
-    `缺少公开环境模板: ${PUBLIC_ENV_TEMPLATE}（属公开安全基线，请单独提交该模板，不要降级为可选）`,
-  );
-} else {
-  const content = readFileSync(envExample, 'utf8');
-  for (const key of PUBLIC_ENV_TEMPLATE_KEYS) {
-    if (!content.includes(`${key}=`)) {
-      warnings.push(`${PUBLIC_ENV_TEMPLATE} 缺少变量说明: ${key}`);
+  if (state.failures.length > 0) {
+    if (log) {
+      console.error(`\n失败 (${state.failures.length})`);
+      for (const failure of state.failures) {
+        console.error(`  x ${failure}`);
+      }
     }
+  } else if (log) {
+    console.log('\n结果: 通过');
   }
+
+  return { failures: [...state.failures], warnings: [...state.warnings] };
 }
 
-const localOnlyDocs = ['需求.txt', '要求.txt', 'AI开发计划表.md', '计划表待确认问题清单.md'];
-const legacyPermissionTokens = [
-  'audit:delete',
-  'export:*',
-  'membership:self:apply',
-  'membership:group:review',
-];
-for (const relativePath of [
-  'docs/P1-权限矩阵.md',
-  'docs/P2-权限目录与状态机.md',
-  'docs/P2-API契约基线.md',
-]) {
-  const absolutePath = join(repoRoot, relativePath);
-  if (!existsSync(absolutePath)) {
-    warnings.push(`无法执行已废弃权限字符串扫描（内部文档不在工作区）: ${relativePath}`);
-    continue;
-  }
-  const content = readFileSync(absolutePath, 'utf8');
-  for (const token of legacyPermissionTokens) {
-    if (content.includes(token)) {
-      failures.push(`${relativePath} 包含已废弃权限字符串: ${token}`);
-    }
-  }
-}
-for (const doc of localOnlyDocs) {
-  if (!existsSync(join(repoRoot, doc))) {
-    warnings.push(`本地文档不存在（可能已被移出工作区）: ${doc}`);
-  }
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const result = runVerification();
+  process.exitCode = result.failures.length > 0 ? 1 : 0;
 }
 
-console.log('工程骨架自检');
-console.log(`- 仓库根目录: ${repoRoot}`);
-console.log(`- 必需目录: ${REQUIRED_DIRECTORIES.length} 项`);
-console.log(`- 可选本地切片目录: ${OPTIONAL_LOCAL_DIRECTORIES.join(', ')}（缺失只提示，不判失败）`);
-console.log(`- 必需文件: ${REQUIRED_FILES.length} 项`);
-console.log(`- 可选本地切片文件: ${OPTIONAL_LOCAL_FILES.length} 项（缺失只提示，不判失败）`);
-console.log(`- 必需工作区包: ${WORKSPACE_PACKAGES.map((item) => item.name).join(', ')}`);
-console.log(
-  `- 可选本地切片包（不纳入 workspace）: ${OPTIONAL_LOCAL_PACKAGES.map((item) => item.name).join(', ')}`,
-);
-
-if (warnings.length > 0) {
-  console.log(`\n提示 (${warnings.length})`);
-  for (const warning of warnings) {
-    console.log(`  ~ ${warning}`);
-  }
-}
-
-if (failures.length > 0) {
-  console.error(`\n失败 (${failures.length})`);
-  for (const failure of failures) {
-    console.error(`  x ${failure}`);
-  }
-  process.exitCode = 1;
-} else {
-  console.log('\n结果: 通过');
-}
+export { containsForbiddenLegacyPermissionUsage, findLegacyPermissionTokens, runVerification };
