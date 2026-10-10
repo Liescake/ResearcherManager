@@ -171,6 +171,12 @@ docker compose -f docker-compose.prod.yml --env-file .env.docker.prod up -d
   证书链与主机名；
 - `DATABASE_SSL_MODE: verify-full` **写死在编排里**，不能用环境变量降级成 `disable`/`require`；
 - 所有机密与取证事实用 `${VAR:?}` 声明为**必填**，缺失时解析阶段就失败；
+- **优雅停止窗口显式声明**：`api` 与 `postgres` 都写 `stop_grace_period: 30s`。Compose 的缺省
+  停止窗口只有 10s（即 Docker 默认的 SIGTERM→SIGKILL 宽限期），对 postgres 的 smart shutdown
+  （等连接退出、收尾 checkpoint 与 WAL）和 api 的在途请求收尾都偏短；超时即 SIGKILL，属非优雅
+  终止，编排层表现为 `down`/重建时卡在停止阶段（shutdown BLOCK）。该值必须是**带单位的严格时长**
+  且解析后**恰好** 30 秒（`30s` / `30000ms` / `0.5m` 等等价写法都接受），裸数字 `30` 与
+  `${VAR}` 插值一律判失败——前者在 Compose 里的含义无法从文件确定，后者会让窗口在运行时漂移；
 - 证书目录以 `RM_TLS_DIR` 只读挂载到 `/etc/rm-tls`，镜像与仓库里**没有**证书内容。
 
 ### 4.1 生产凭据与取证事实（缺一即拒绝启动）
@@ -259,7 +265,10 @@ docker compose --env-file .env.docker.example config >/dev/null && echo OK
 的探针、两档编排的服务/网络/卷/依赖顺序/健康检查、凭据无内置默认值、生产档 `verify-full` 与
 证书只读挂载、`pg_hba.conf` 拒绝明文、模板里机密字段仍是占位符、忽略规则正确排除证书与真实 `.env`；
 生产档 `api` 的宿主端口还会**逐项**核对长语法的 `host_ip`（必须精确等于 `127.0.0.1`，通配 / 空 /
-缺失一律失败）与 `target` / `published` / `protocol` 三项显式声明，短语法直接判失败。
+缺失一律失败）与 `target` / `published` / `protocol` 三项显式声明，短语法直接判失败。容器加固与
+停机基线同样逐条复核：`read_only` / `cap_drop: [ALL]` / `no-new-privileges` / 显式非 root `user` /
+`restart`，以及两个服务的 `stop_grace_period`——缺失、解析后过短（如 15s）、过长、非数值或不明确
+配置（裸数字、`${VAR}` 插值、未知或大写单位）都会失败，对应的合成反例在 `--self-test` 里。
 
 **如实声明**：本仓库的构建环境**没有可用的 Docker 守护进程**，因此本文档描述的容器**运行**行为
 （真正 `up` 起来、`healthy`、连通性）没有在本次交付中做端到端验证；已完成的验证是

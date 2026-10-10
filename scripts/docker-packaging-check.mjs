@@ -16,6 +16,9 @@
  *     （api 没有可写路径，因此不许声明 tmpfs；postgres 只许**恰好** /run/postgresql 与 /tmp：
  *     缺失、额外路径、重复项、以及带 mount 覆盖的等价写法（如 `/tmp:ro`）一律判失败，且
  *     持久数据卷与证书目录绝不能被 tmpfs 覆盖或只读化）；
+ *   - 生产档两个服务必须显式声明 `stop_grace_period`，且**解析后恰好 30 秒**：缺失（会静默
+ *     回落到 Compose 缺省的 10s）、过短（如 15s，容器被提前 SIGKILL）、过长，以及非数值/
+ *     不明确配置（裸数字 `30`、`${VAR}` 插值、未知或大写单位、空格分隔）一律判失败；
  *   - 生产档 api 的宿主端口**只许绑回环且恰好一条**：`ports` 必须用长语法逐项显式声明
  *     `host_ip` / `target` / `published` / `protocol`，且 `host_ip` 精确等于 `127.0.0.1`；
  *     短语法、`0.0.0.0`、`::` 这类通配地址、空 host、缺省 host_ip 与非 3000/tcp 一律判失败
@@ -586,6 +589,110 @@ function checkCompose(fileName, mode) {
   }
 }
 
+/**
+ * 生产档两个服务统一的优雅停止窗口（秒）。
+ * Compose 的 `stop_grace_period` 缺省只有 10s（Docker 默认的 SIGTERM→SIGKILL 宽限期），
+ * 对 postgres 的 smart shutdown 与 api 的请求收尾都偏短；超时即 SIGKILL，属非优雅终止，
+ * 表现为编排层卡在停止阶段（shutdown BLOCK）。因此生产档必须显式声明且**恰好** 30 秒。
+ */
+export const PROD_STOP_GRACE_PERIOD_SECONDS = 30;
+
+/**
+ * 时长单位 → `[分子, 分母]`（秒）。写成有理数是为了用**除法**换算，避免 `30000 * 0.001`
+ * 这类乘法在浮点下产生 30.000000000000004 的误差（`30000 / 1000` 则精确等于 30）。
+ */
+const DURATION_UNITS = Object.freeze({
+  ns: [1, 1e9],
+  us: [1, 1e6],
+  µs: [1, 1e6],
+  ms: [1, 1e3],
+  s: [1, 1],
+  m: [60, 1],
+  h: [3600, 1],
+});
+
+/**
+ * 严格解析 Compose 时长（`30s` / `30000ms` / `0.5m` / `1m30s`），返回秒数；无法严格解析返回 `null`。
+ *
+ * 「严格」= 整串必须由**带单位**的时长项紧密拼接而成（`1m30s`），不允许：
+ *   - 裸数字（`30`）：Compose 对无单位值的解释无法从文件本身确定，属「不明确配置」；
+ *   - 插值（`${GRACE:-30s}`）：运行时才会确定，等于没有显式声明；
+ *   - 空格分隔（`30 s`）、未知单位（`30sec`）、大写单位（`30S`）：上游 `time.ParseDuration`
+ *     不接受这些写法，放行它们等于让门禁通过一份运行时会被 Compose 拒绝的编排；
+ *   - 负号/正号等其它前缀字符。
+ * 单位只认小写（与上游一致），因此不做大小写归一。
+ */
+export function parseDurationSeconds(value) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const text = value.trim();
+  if (text === '' || text.includes('$')) {
+    return null;
+  }
+  const token = /(\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)/gu;
+  let consumed = 0;
+  let seconds = 0;
+  let count = 0;
+  let match = token.exec(text);
+  while (match !== null) {
+    // 中间出现未被消费的字符（裸数字前缀、空格、未知单位）即判「不明确」
+    if (match.index !== consumed) {
+      return null;
+    }
+    const [numerator, denominator] = DURATION_UNITS[match[2]];
+    seconds += (Number(match[1]) * numerator) / denominator;
+    consumed = token.lastIndex;
+    count += 1;
+    match = token.exec(text);
+  }
+  return count > 0 && consumed === text.length ? seconds : null;
+}
+
+/**
+ * 计算生产档某个服务 `stop_grace_period` 的违规项（纯函数，供门禁与 --self-test 共用，不读磁盘）。
+ * 合规时返回 `null`，否则返回 `{ kind, ... }`：
+ *   - `missing`      ：未声明 / 空值 —— 会静默回落到 Compose 缺省的 10s，停机行为不可从文件读到；
+ *   - `non-numeric`  ：非数值或不明确配置（无法严格解析的时长、裸数字、`${VAR}` 插值、未知/大写单位）；
+ *   - `too-short`    ：解析后短于 30 秒（如 15s）—— 容器会被提前 SIGKILL，正是 shutdown BLOCK 的成因；
+ *   - `too-long`     ：解析后长于 30 秒 —— 要求是「恰好 30 秒」，多给的窗口同样是偏离基线的声明。
+ * 浮点比较用 1e-9 容差，使 `30000ms`、`0.5m`、`30000000us` 这些**语义等价**写法被接受。
+ */
+export function findStopGracePeriodIssues(value, expected = PROD_STOP_GRACE_PERIOD_SECONDS) {
+  const declared = value === null || value === undefined ? '' : String(value).trim();
+  if (declared === '') {
+    return { kind: 'missing', expected };
+  }
+  const seconds = parseDurationSeconds(declared);
+  if (seconds === null) {
+    return { kind: 'non-numeric', value: declared, expected };
+  }
+  if (Math.abs(seconds - expected) < 1e-9) {
+    return null;
+  }
+  return {
+    kind: seconds < expected ? 'too-short' : 'too-long',
+    seconds,
+    value: declared,
+    expected,
+  };
+}
+
+/** 把 stop_grace_period 违规项渲染成一条人类可读的失败原因（文件名由调用方补上） */
+function describeStopGracePeriodIssue(fileName, name, issue) {
+  const expected = `stop_grace_period: ${PROD_STOP_GRACE_PERIOD_SECONDS}s`;
+  switch (issue.kind) {
+    case 'missing':
+      return `${fileName}: ${name} 必须显式声明 ${expected}（当前未声明或为空值；Compose 缺省只有 10s，超时即 SIGKILL，属非优雅停止/shutdown BLOCK）`;
+    case 'non-numeric':
+      return `${fileName}: ${name} 的 stop_grace_period "${issue.value}" 是非数值或不明确配置，必须写成带单位的严格时长 ${expected}（裸数字与 \${VAR} 插值都会让停止窗口无法从文件确定）`;
+    case 'too-short':
+      return `${fileName}: ${name} 的 stop_grace_period ${issue.value} 解析后只有 ${issue.seconds} 秒，短于要求的 ${issue.expected} 秒：容器会被提前 SIGKILL，正是 shutdown BLOCK 的成因`;
+    default:
+      return `${fileName}: ${name} 的 stop_grace_period 必须是解析后恰好 ${issue.expected} 秒的时长，当前 ${issue.value}（= ${issue.seconds} 秒）偏长`;
+  }
+}
+
 /** postgres 在只读根下**仅允许**存在的 tmpfs 目标：一个不能少，一个不能多 */
 export const POSTGRES_TMPFS_TARGETS = ['/run/postgresql', '/tmp'];
 
@@ -793,7 +900,9 @@ function describeApiPortIssue(fileName, issue) {
  * 生产档容器加固 + 「禁止机密进日志」断言（本地开发档不受影响）。
  *
  * 加固基线（两个服务都必须显式声明，不接受「靠镜像默认」）：
- *   read_only: true / cap_drop: [ALL] / security_opt: no-new-privileges:true / user: 非 root。
+ *   read_only: true / cap_drop: [ALL] / security_opt: no-new-privileges:true / user: 非 root /
+ *   stop_grace_period 解析后恰好 30 秒（缺失、过短、过长、非数值或不明确配置一律失败——
+ *   Compose 缺省只有 10s，超时 SIGKILL 会让 postgres 的 smart shutdown 被腰斩，即 shutdown BLOCK）。
  * 可写路径必须是最小集：
  *   - api：运行时代码只读文件、只写 stdout，探针也不写文件 → **不许**声明 tmpfs；
  *   - api 的宿主端口必须**恰好一条**、用长语法且 `host_ip` **精确等于 127.0.0.1**（禁止 0.0.0.0 /
@@ -838,6 +947,12 @@ function checkProductionHardening(fileName, api, postgres) {
       restart !== null && restart !== 'no',
       `${fileName}: ${name} 必须保留重启策略（restart 缺失或为 no 会在故障后留下停摆容器）`,
     );
+    // 优雅停止窗口：必须显式声明且解析后恰好 30 秒（缺失/过短/过长/非数值或不明确一律失败）。
+    // 单一控制点 = findStopGracePeriodIssues，失败文案由 describeStopGracePeriodIssue 统一渲染。
+    const graceIssue = findStopGracePeriodIssues(readScalarField(block, 'stop_grace_period'));
+    if (graceIssue !== null) {
+      failures.push(describeStopGracePeriodIssue(fileName, name, graceIssue));
+    }
   }
 
   // api 的宿主端口绑定：必须**恰好一条**、长语法 + host_ip 精确 127.0.0.1
@@ -1528,8 +1643,66 @@ function selfTest() {
     [['missing'], ['missing']],
   );
 
+  // ---- stop_grace_period：必须是带单位的严格时长，且解析后恰好 30 秒 ----
+  expect(
+    'parseDurationSeconds 只接受带单位的严格时长（裸数字/插值/空格/未知或大写单位一律 null）',
+    [
+      '30s',
+      '30000ms',
+      '0.5m',
+      '1m30s',
+      '30000000us',
+      '15s',
+      '30',
+      '${GRACE:-30s}',
+      '30sec',
+      '30 s',
+      '30S',
+      '',
+    ].map(parseDurationSeconds),
+    [30, 30, 30, 90, 30, 15, null, null, null, null, null, null],
+  );
+  expect(
+    'findStopGracePeriodIssues 接受 30 秒的等价写法（含毫秒/小数分钟/微秒）',
+    ['30s', '30000ms', '0.5m', '30000000us', ' 30s '].map((value) =>
+      findStopGracePeriodIssues(value),
+    ),
+    [null, null, null, null, null],
+  );
+  expect(
+    'findStopGracePeriodIssues 拒绝缺失（未声明/null/空值）',
+    [null, undefined, '', '   '].map((value) => findStopGracePeriodIssues(value)?.kind),
+    ['missing', 'missing', 'missing', 'missing'],
+  );
+  expect(
+    'findStopGracePeriodIssues 拒绝过短（15s 反例）与过长',
+    [
+      findStopGracePeriodIssues('15s')?.kind,
+      findStopGracePeriodIssues('29s')?.kind,
+      findStopGracePeriodIssues('60s')?.kind,
+      findStopGracePeriodIssues('1m30s')?.kind,
+    ],
+    ['too-short', 'too-short', 'too-long', 'too-long'],
+  );
+  expect(
+    'findStopGracePeriodIssues 拒绝非数值/不明确配置（裸数字/插值/未知单位/空格/大写）',
+    ['30', '${GRACE:-30s}', '$GRACE', '30sec', '30 s', '30S', 'none'].map(
+      (value) => findStopGracePeriodIssues(value)?.kind,
+    ),
+    [
+      'non-numeric',
+      'non-numeric',
+      'non-numeric',
+      'non-numeric',
+      'non-numeric',
+      'non-numeric',
+      'non-numeric',
+    ],
+  );
+
   // 端到端合成反例：用一份其余加固项全部合规的服务块驱动真实门禁函数，
-  // 只改一个变量（tmpfs 或 api 端口声明），确认「违规就必然失败」——防止门禁自己坏掉却报通过。
+  // 只改一个变量（tmpfs、api 端口声明或 stop_grace_period），确认「违规就必然失败」——
+  // 防止门禁自己坏掉却报通过。
   const compliantApiPortLines = [
     '    ports:',
     '      - host_ip: 127.0.0.1',
@@ -1537,7 +1710,13 @@ function selfTest() {
     '        published: "${API_PORT:-3000}"',
     '        protocol: tcp',
   ];
-  const hardeningProbe = (tmpfsEntries, apiPortLines = compliantApiPortLines) => {
+  const hardeningProbe = (
+    tmpfsEntries,
+    apiPortLines = compliantApiPortLines,
+    grace = { api: '30s', postgres: '30s' },
+  ) => {
+    // null 表示「刻意不声明该键」，用于缺失反例
+    const graceLines = (value) => (value === null ? [] : [`    stop_grace_period: ${value}`]);
     const postgresBlock = [
       '    image: postgres:16-alpine',
       '    read_only: true',
@@ -1550,6 +1729,7 @@ function selfTest() {
       '      - rm-postgres-data:/var/lib/postgresql/data',
       '    tmpfs:',
       ...tmpfsEntries.map((entry) => `      - ${entry}`),
+      ...graceLines(grace.postgres),
       '    restart: always',
       '',
     ].join('\n');
@@ -1562,6 +1742,7 @@ function selfTest() {
       '    security_opt:',
       '      - no-new-privileges:true',
       ...apiPortLines,
+      ...graceLines(grace.api),
       '    restart: always',
       '',
     ].join('\n');
@@ -1581,6 +1762,51 @@ function selfTest() {
     'checkProductionHardening 通过：postgres tmpfs 恰好两个必需目录',
     hardeningProbe(['/run/postgresql', '/tmp']).count,
     0,
+  );
+  expect(
+    'checkProductionHardening 通过：两个服务 stop_grace_period 恰为 30s（端到端合成样本）',
+    hardeningProbe(['/run/postgresql', '/tmp']).messages.length,
+    0,
+  );
+  const missingGraceProbe = hardeningProbe(['/run/postgresql', '/tmp'], compliantApiPortLines, {
+    api: null,
+    postgres: null,
+  });
+  expect(
+    'checkProductionHardening 失败：两个服务都缺 stop_grace_period（端到端合成反例）',
+    [
+      missingGraceProbe.count,
+      missingGraceProbe.messages.filter((message) => message.includes('stop_grace_period')).length,
+    ],
+    [2, 2],
+  );
+  expect(
+    'checkProductionHardening 失败：只有一个服务缺 stop_grace_period（逐服务判定）',
+    hardeningProbe(['/run/postgresql', '/tmp'], compliantApiPortLines, {
+      api: null,
+      postgres: '30s',
+    }).count,
+    1,
+  );
+  const shortGraceProbe = hardeningProbe(['/run/postgresql', '/tmp'], compliantApiPortLines, {
+    api: '15s',
+    postgres: '15s',
+  });
+  expect(
+    'checkProductionHardening 失败：stop_grace_period 只有 15s（端到端合成反例）',
+    [
+      shortGraceProbe.count,
+      shortGraceProbe.messages.filter((message) => message.includes('短于要求的 30 秒')).length,
+    ],
+    [2, 2],
+  );
+  expect(
+    'checkProductionHardening 失败：stop_grace_period 是非数值/不明确配置（端到端合成反例）',
+    hardeningProbe(['/run/postgresql', '/tmp'], compliantApiPortLines, {
+      api: '${GRACE:-30s}',
+      postgres: '30',
+    }).count,
+    2,
   );
   const extraTmpfsProbe = hardeningProbe(['/run/postgresql', '/tmp', '/var/tmp']);
   expect(

@@ -53,6 +53,19 @@
 #   - postgres **不发布任何宿主端口**，只在编排网络内 expose 5432。
 #   该断言由 `pnpm verify:docker` 逐项复核（含通配/空/缺失反例，见 --self-test）。
 #
+# 【优雅停止（Compose shutdown BLOCK）】两个服务都**显式**声明 stop_grace_period: 30s：
+#   - Compose 的停止窗口缺省只有 10s（即 Docker 默认的 SIGTERM → SIGKILL 宽限期）。这个窗口对
+#     postgres 的 smart shutdown（等连接退出、把 checkpoint 与 WAL 收尾、清理共享内存）与 api 的
+#     请求收尾都偏短；一旦超时，容器收到 SIGKILL，属于**非优雅终止**：数据库可能留下需要崩溃恢复
+#     的现场，编排层表现为 `down` / 重建时卡在停止阶段（shutdown BLOCK）而不是干净退出。
+#   - 显式写 30s 让最终事实**可以从文件本身读到**，不再依赖 Compose 版本或镜像 STOPSIGNAL 的
+#     缺省推断——停机行为必须在评审时就能看到。
+#   - 该值必须是**带单位的严格时长**（30s / 30000ms / 0.5m 等等价写法都接受），且解析后**恰好**
+#     30 秒；裸数字（`30`）与 `${VAR}` 插值一律判失败：前者在 Compose 里的含义无法从文件确定，
+#     后者会让停止窗口在运行时漂移，等于没有显式声明。
+#   - `pnpm verify:docker` 对两个服务分别复核（缺失 / 过短 / 过长 / 非数值或不明确一律失败，
+#     合成反例见 `--self-test`）。
+#
 # 【运行身份没有变化，只是写显式了】加固前：api 已在 Dockerfile 里 `USER node`（uid 1000），
 # postgres 以 root 进入官方 entrypoint 后立刻 `exec gosu postgres`（uid 70）。加固后两者都以
 # 同一个 uid 直接启动，**有效运行身份不变**，因此证书可读性要求（DOCKER.md「证书准备」：
@@ -144,6 +157,9 @@ services:
     tmpfs:
       - /run/postgresql
       - /tmp
+    # 【优雅停止】显式 30s（Compose 缺省仅 10s，见文件头「优雅停止」）：必须带单位的严格时长，
+    # 解析后恰好 30 秒；缺省/裸数字/插值都会被 pnpm verify:docker 拦下。
+    stop_grace_period: 30s
     restart: always
 
   api:
@@ -221,4 +237,6 @@ services:
       - ALL
     # 刻意**不**声明 tmpfs / 可写卷：运行时代码只读文件、只写 stdout，探针不写文件也不打印
     # 环境变量取值，所以这里没有任何必要可写路径；多声明一个就是白送一个可写面。
+    # 【优雅停止】显式 30s（Compose 缺省仅 10s）：api 需要时间收尾在途请求，见文件头「优雅停止」。
+    stop_grace_period: 30s
     restart: always
